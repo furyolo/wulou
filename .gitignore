@@ -1,0 +1,7 @@
+# Local-only teaching materials and review artifacts
+/local-materials/
+
+# Local runtime and temporary artifacts
+/.venv/
+/.tmp/
+/tmp/
