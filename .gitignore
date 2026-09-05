@@ -1,7 +1,31 @@
 # Local-only teaching materials and review artifacts
 /local-materials/
 
+# Codex local workspaces and dated render artifacts
+/.codex-work/
+/.tmp-*/
+
 # Local runtime and temporary artifacts
 /.venv/
 /.tmp/
 /tmp/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local secrets and operating-system clutter
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

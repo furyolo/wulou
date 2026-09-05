@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         无漏 AI · 当前专题教师版 PDF 下载
 // @namespace    wulou-teacher-pdf-downloader
-// @version      1.1.0
+// @version      1.2.0
 // @description  下载当前专题下全部配套教师版 PDF，保存到同名文件夹。
 // @match        https://www.wulouai.com/user-center/course-wrong-learn/*
 // @grant        none
@@ -10,6 +10,10 @@
 
 (() => {
   'use strict';
+
+  const CONCURRENCY = 3;
+  const MAX_ATTEMPTS = 3;
+  const ITEM_TIMEOUT = 120000;
 
   function safeName(value) {
     const name = String(value).normalize('NFC').replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').replace(/[. ]+$/g, '').trim();
@@ -88,11 +92,51 @@
     return url.href;
   }
 
+  function retryDelay(error, attempt, now = Date.now()) {
+    const retryAfter = error.retryAfter;
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - now;
+      if (Number.isFinite(delay) && delay >= 0) return Math.min(delay, 30000);
+    }
+    return Math.min(1000 * (2 ** (attempt - 1)), 30000);
+  }
+
+  function wait(ms, signal) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(done, ms);
+      function done() {
+        signal?.removeEventListener('abort', abort);
+        resolve();
+      }
+      function abort() {
+        clearTimeout(timer);
+        reject(signal.reason || new DOMException('任务已取消', 'AbortError'));
+      }
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
+  }
+
+  // 只重试明确的临时服务错误；权限、参数和内容错误立即返回，避免重复施压。
   async function fetchChecked(url, signal) {
-    const response = await fetch(url, { credentials: 'same-origin', signal, redirect: 'follow' });
-    if (!response.ok) throw new Error(`服务器返回 HTTP ${response.status}`);
-    if (new URL(response.url).pathname.startsWith('/login')) throw new Error('登录已失效，请重新登录');
-    return response;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const response = await fetch(url, { credentials: 'same-origin', signal, redirect: 'follow' });
+      if (response.ok) {
+        if (new URL(response.url).pathname.startsWith('/login')) throw new Error('登录已失效，请重新登录');
+        return response;
+      }
+      const error = new Error(`服务器返回 HTTP ${response.status}`);
+      error.status = response.status;
+      error.retryAfter = response.headers.get('retry-after');
+      if (![429, 502, 503, 504].includes(response.status) || attempt === MAX_ATTEMPTS) throw error;
+      try { await response.body?.cancel(); }
+      catch (cancelError) { console.warn('[无漏 PDF] 释放失败响应失败', cancelError); }
+      const delay = retryDelay(error, attempt);
+      console.warn('[无漏 PDF] 临时请求失败，稍后重试', { url, status: response.status, attempt, delay });
+      await wait(delay, signal);
+    }
+    throw new Error('请求重试次数已用尽');
   }
 
   async function validPdf(blob) {
@@ -109,8 +153,25 @@
     return candidate;
   }
 
+  // 固定数量的工作协程从共享游标取任务；单项失败不会阻断其余项目。
+  async function runPool(items, concurrency, task, shouldStop = () => false) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    async function worker() {
+      while (!shouldStop()) {
+        const index = cursor++;
+        if (index >= items.length) return;
+        try { results[index] = { status: 'fulfilled', value: await task(items[index], index) }; }
+        catch (reason) { results[index] = { status: 'rejected', reason }; }
+      }
+    }
+    const count = Math.min(Math.max(1, concurrency), items.length);
+    await Promise.all(Array.from({ length: count }, worker));
+    return results;
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { safeName, responseName, collect, teacherUrl, validPdf, unusedName };
+    module.exports = { safeName, responseName, collect, teacherUrl, fetchChecked, validPdf, unusedName, retryDelay, runPool };
     return;
   }
   if (window.top !== window.self || document.getElementById('wulou-pdf-panel')) return;
@@ -160,11 +221,11 @@
     </button>
     <section class="panel" id="pdf-drawer" role="region" aria-labelledby="pdf-heading" inert>
       <header><h2 id="pdf-heading">教师版 PDF</h2><button class="close" aria-label="收起下载面板" title="收起 · Esc">›</button></header>
-      <div class="topic">当前专题</div><div class="meta">按专题自动归档</div>
+      <div class="topic">当前专题</div><div class="meta">${CONCURRENCY} 路并发 · 按专题自动归档</div>
       <div class="status" role="status" aria-live="polite">正在识别目录…</div>
       <progress value="0" max="1" aria-label="已处理子项" hidden></progress>
       <div class="actions"><button class="primary">选择文件夹并下载</button><button class="stop" disabled hidden>停止</button></div>
-      <p class="hint">选择归档根目录，自动建立专题文件夹。</p>
+      <p class="hint">选择归档根目录，自动建立专题文件夹；网络并行、文件安全落盘。</p>
       <details><summary>下载记录</summary><pre></pre></details>
     </section>`;
   document.body.append(host);
@@ -193,12 +254,12 @@
       setOpen(false);
     }
   });
-  let controller;
+  const controllers = new Set();
   let cancelled = false;
   try {
     const plan = collect(document, location.href);
     shadow.querySelector('.topic').textContent = plan.name;
-    shadow.querySelector('.meta').textContent = `${plan.items.length} 个子项 · 按专题自动归档`;
+    shadow.querySelector('.meta').textContent = `${plan.items.length} 个子项 · ${CONCURRENCY} 路并发归档`;
     status.textContent = '准备就绪';
     if (!window.showDirectoryPicker) throw new Error('请使用支持文件夹选择的 Chrome 或 Edge 浏览器');
   } catch (error) {
@@ -210,7 +271,7 @@
   }
   stop.onclick = () => {
     cancelled = true;
-    controller?.abort();
+    for (const activeController of controllers) activeController.abort();
     stop.disabled = true;
     status.textContent = '正在停止，已保存文件会保留';
   };
@@ -233,41 +294,81 @@
       progress.max = plan.items.length;
       progress.value = 0;
       progress.hidden = false;
-      console.info('[无漏 PDF] 开始', { topic: plan.name, count: plan.items.length, root: root.name });
-      for (const [index, item] of plan.items.entries()) {
-        if (cancelled) break;
-        controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 120000);
-        status.textContent = `${index + 1}/${plan.items.length} · ${item.title}`;
-        badge.textContent = `${index + 1}/${plan.items.length}`;
+      console.info('[无漏 PDF] 开始', { topic: plan.name, count: plan.items.length, concurrency: CONCURRENCY, root: root.name });
+      let active = 0;
+      let completed = 0;
+      let writeChain = Promise.resolve();
+      const updateProgress = () => {
+        if (cancelled) {
+          status.textContent = '正在停止，已保存文件会保留';
+          badge.textContent = '停止';
+          return;
+        }
+        const waiting = Math.max(0, plan.items.length - completed - active);
+        progress.value = completed;
+        status.textContent = `${completed}/${plan.items.length} 已完成 · ${active} 下载中 · ${waiting} 等待中`;
+        badge.textContent = `${completed}/${plan.items.length}`;
+      };
+      // 文件名检查与写入串行，避免并发任务选中同一个文件名。
+      const enqueueWrite = task => {
+        const current = writeChain.then(task, task);
+        writeChain = current.catch(() => {});
+        return current;
+      };
+      updateProgress();
+      await runPool(plan.items, CONCURRENCY, async item => {
+        if (cancelled) throw new DOMException('任务已取消', 'AbortError');
+        const itemController = new AbortController();
+        controllers.add(itemController);
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          itemController.abort();
+        }, ITEM_TIMEOUT);
+        active++;
+        updateProgress();
         try {
-          const page = await fetchChecked(item.page, controller.signal);
+          const page = await fetchChecked(item.page, itemController.signal);
           const doc = new DOMParser().parseFromString(await page.text(), 'text/html');
           const url = teacherUrl(doc, item.page);
           if (new URL(url).searchParams.get('catalogue_id') !== item.id) throw new Error('返回页面与目标目录项不一致');
-          const response = await fetchChecked(url, controller.signal);
+          const response = await fetchChecked(url, itemController.signal);
           const blob = await response.blob();
           if (!await validPdf(blob)) throw new Error('服务器未返回 PDF，可能是权限提示或生成失败');
-          if (cancelled) break;
-          const name = await unusedName(directory, responseName(response.headers.get('content-disposition'), `${item.title}-${item.id}(老师版).pdf`));
-          const file = await directory.getFileHandle(name, { create: true });
-          const writer = await file.createWritable();
-          try { await writer.write(blob); await writer.close(); }
-          catch (error) {
-            try { await writer.abort(); }
-            catch (abortError) { console.error('[无漏 PDF] 中止写入失败', abortError); }
-            throw error;
-          }
+          if (cancelled) throw new DOMException('任务已取消', 'AbortError');
+          const name = await enqueueWrite(async () => {
+            if (cancelled) throw new DOMException('任务已取消', 'AbortError');
+            const selectedName = await unusedName(directory, responseName(response.headers.get('content-disposition'), `${item.title}-${item.id}(老师版).pdf`));
+            const file = await directory.getFileHandle(selectedName, { create: true });
+            const writer = await file.createWritable();
+            try { await writer.write(blob); await writer.close(); }
+            catch (error) {
+              try { await writer.abort(); }
+              catch (abortError) { console.error('[无漏 PDF] 中止写入失败', abortError); }
+              throw error;
+            }
+            return selectedName;
+          });
           success++;
           log.textContent += `成功：${name}\n`;
+          return name;
         } catch (error) {
-          if (cancelled) break;
-          failed++;
-          log.textContent += `失败：${item.title}：${error.name === 'AbortError' ? '请求超时' : error.message}\n`;
-          console.error('[无漏 PDF] 下载失败', { id: item.id, error });
-        } finally { clearTimeout(timer); progress.value = success + failed; }
-        if (!cancelled) await new Promise(resolve => setTimeout(resolve, 800));
-      }
+          if (!cancelled) {
+            failed++;
+            const message = error.name === 'AbortError' && timedOut ? '请求超时' : error.message;
+            log.textContent += `失败：${item.title}：${message}\n`;
+            console.error('[无漏 PDF] 下载失败', { id: item.id, error });
+          }
+          throw error;
+        } finally {
+          clearTimeout(timer);
+          controllers.delete(itemController);
+          active--;
+          if (!cancelled) completed++;
+          updateProgress();
+        }
+      }, () => cancelled);
+      await writeChain;
       status.textContent = `${cancelled ? '已停止' : '已结束'}：成功 ${success}，失败 ${failed}，未处理 ${plan.items.length - success - failed}。保存到 ${root.name}/${plan.folder}`;
       badge.textContent = cancelled ? '已停' : failed ? '注意' : '完成';
       console.info('[无漏 PDF] 结束', { success, failed, cancelled });
@@ -277,7 +378,7 @@
       badge.hidden = error.name === 'AbortError';
       console.error('[无漏 PDF] 任务未完成', error);
     } finally {
-      controller = undefined;
+      controllers.clear();
       start.disabled = false;
       stop.disabled = true;
       stop.hidden = true;
