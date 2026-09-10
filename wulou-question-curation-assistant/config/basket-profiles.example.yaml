@@ -1,0 +1,21 @@
+profile_id: topic-01-large-a
+title: 专题一 实数 / 【大题】/ 分类组 A
+taxonomy_version: 2026-09-09.1
+scope:
+  topic_id: topic-01-real-numbers
+  level2_id: topic-01-large
+slots:
+  "1":
+    target_level3_id: real-number-application
+    label: 实数的应用
+  "2":
+    target_level3_id: real-number-calculation
+    target_level4_id: real-number-calculation-no-rationalization
+    label: 综合计算｜无有理化
+  "3":
+    target_level3_id: real-number-calculation
+    target_level4_id: real-number-calculation-rationalization
+    label: 综合计算｜含有理化
+  "12":
+    review_only: true
+    label: 待人工复核

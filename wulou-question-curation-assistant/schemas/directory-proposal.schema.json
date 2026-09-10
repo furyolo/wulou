@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "目录变更候选",
+  "type": "object",
+  "required": ["proposal_id", "scope", "kind", "exercise_ids", "distinct_question_count", "status"],
+  "properties": {
+    "proposal_id": { "type": "string" },
+    "scope": {
+      "type": "object",
+      "required": ["topic_id", "level2_id"],
+      "properties": {
+        "topic_id": { "type": "string" },
+        "level2_id": { "type": "string" },
+        "parent_level3_id": { "type": ["string", "null"] }
+      }
+    },
+    "kind": { "enum": ["new_level3", "new_level4", "rename", "merge", "split"] },
+    "exercise_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "distinct_question_count": { "type": "integer", "minimum": 1 },
+    "status": { "enum": ["observe", "candidate", "approved", "rejected"] },
+    "proposed_title": { "type": ["string", "null"] },
+    "evidence": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

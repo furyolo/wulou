@@ -1,27 +1,55 @@
 # Local-only teaching materials and review artifacts
 /local-materials/
 
+# Personal preview captures must never enter history
+/wulou-teacher-pdf-downloader/preview-mobile.png
+/wulou-teacher-pdf-downloader/preview-desktop.png
+
 # Codex local workspaces and dated render artifacts
 /.codex-work/
+/.codex-tmp/
 /.tmp-*/
 
 # Local runtime and temporary artifacts
 /.venv/
+/wulou-question-curation-assistant/.venv/
 /.tmp/
 /tmp/
+
+# Local state for the question-curation assistant
+/wulou-question-curation-assistant/.local-data/
+/wulou-question-curation-assistant/logs/
+/wulou-question-curation-assistant/config/settings.local.yaml
+/wulou-question-curation-assistant/config/settings.local.*
+/wulou-question-curation-assistant/**/*.sqlite3
+/wulou-question-curation-assistant/**/*.db
+*.sqlite3-*
+*.sqlite-*
+*.db-*
+*.db-journal
 
 # Python generated files
 __pycache__/
 *.py[cod]
 *.pyd
+.venv/
+node_modules/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.nox/
+.tox/
+.ipynb_checkpoints/
 .coverage
+.coverage.*
 htmlcov/
+coverage/
 build/
 dist/
 *.egg-info/
+*.log
+*.tmp
 
 # Local secrets and operating-system clutter
 .env

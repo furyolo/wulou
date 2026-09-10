@@ -1,0 +1,22 @@
+host: 127.0.0.1
+port: 3232
+
+taxonomy_path: taxonomy.example.yaml
+rules_path: classification-rules.yaml
+cache_path: ../.local-data/classification.sqlite3
+
+# 规则分类器默认保守复核。后续模型提供方会在此处增加独立配置。
+classifier:
+  mode: heuristic
+  auto_accept_min_confidence: 0.92
+  # 要启用云端分类时，将 mode 改为 cloud_hybrid，并在本机环境变量中设置 API 密钥。
+  # cloud:
+  #   model: 请填写支持 Responses 和结构化输出的目录分类模型名
+  #   routing_model: 可选；填写更快的云端模型名，用于第一阶段专题路由
+  #   reasoning_effort: high
+  #   routing_reasoning_effort: medium
+  #   api_key_env: OPENAI_API_KEY
+  #   base_url: https://api.openai.com/v1
+  #   timeout_seconds: 600
+  # batch:
+  #   storage_path: ../.local-data/batches

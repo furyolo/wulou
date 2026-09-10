@@ -1,0 +1,53 @@
+rule_version: math-exam-directory-curation-2026-09-10.2
+source_files:
+  - C:\Users\foogl\.codex\skills\math-exam-directory-curation\SKILL.md
+  - C:\Users\foogl\.codex\skills\math-exam-directory-curation\references\classification-and-writing-rules.md
+  - C:\Users\foogl\.codex\skills\math-exam-directory-curation\references\comparison-and-semantic-audit.md
+
+rules:
+  directory_hierarchy: Excel A列为一级专题，B列为二级目录，C列为三级目录，D列为四级目录
+  large_question_directory_is_level2: true
+  numbered_level2_is_not_topic: true
+  topic_order_first: true
+  page_scope_is_hint_only: true
+  actual_question_over_site_tags: true
+  question_text_is_primary: true
+  answer_is_auxiliary: true
+  ignore_unrelated_answer_material: true
+  latest_prerequisite_definition: 完整解答该题不可缺少、且在目录顺序中最靠后的知识专题
+  level3_axis: primary_object_or_context
+  level4_axis: main_question_or_decisive_condition
+  remove_story_background: true
+  require_unique_target: true
+  require_pairwise_level3_exclusivity: true
+  require_leaf_target_unique_match: true
+  require_level4_unique_match_when_available: true
+  parent_knowledge_point_protection: true
+  proposal_minimum_distinct_questions: 3
+  proposal_single_question_action: observe
+  proposal_two_question_action: observe_unless_existing_long_term_evidence
+
+decision_protocol:
+  - 检查题干、公式和答案信息是否足够；不足时必须复核，不得猜测。
+  - 以实际题干为分类主依据，答案只作补充验证；答案包含题干未出现的独立小题或数学对象时，忽略无关答案段落，不得让其改变题干可唯一确定的分类。
+  - 忽略网页当前目录的强制约束，只把它作为弱提示。
+  - 列出完整解题不可缺少的全部知识点，不得只看题目所在网页或已有标签。
+  - 按目录顺序选择最晚必备知识点所属专题；当前网页专题与其冲突时，以实际题目为准。
+  - 在选定专题内，以首要数学对象或情境确定三级目录。
+  - 以主问或决定性条件确定四级目录；常规步骤、故事背景和否定性宽泛描述不得压过关键知识特征。
+  - 对所有同级候选做两两排他检查；无法唯一命中时必须复核。若三级目录没有四级子目录，则三级即为末级；仅对实际存在四级子目录的三级目录执行四级唯一命中检查。
+  - 新目录只可作为候选，单道题不得创建新目录。
+
+hard_signals:
+  - id: trigonometry
+    pattern: '(?i)(?:(?<![A-Za-z])(?:sin|cos|tan|cot)(?![A-Za-z])|正弦|余弦|正切|余切|三角比)'
+    minimum_topic_title_contains: 三角函数
+    conflict_title_pattern: '不含三角(?:比|函数)'
+
+mandatory_review_when:
+  - target_topic_is_later_than_current_topic
+  - no_unique_target
+  - target_directory_does_not_exist
+  - parent_level3_has_knowledge_point_id
+  - requires_new_directory
+  - text_or_image_evidence_conflicts

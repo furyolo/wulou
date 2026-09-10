@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "题湖题目分类请求",
+  "type": "object",
+  "required": ["exercise_id", "scope"],
+  "properties": {
+    "exercise_id": { "type": "string", "minLength": 1 },
+    "stable_code": { "type": ["string", "null"] },
+    "catalogue_id": { "type": ["string", "null"] },
+    "question_press": { "type": "string" },
+    "answer_press": { "type": "string" },
+    "question_image_url": { "type": ["string", "null"], "format": "uri" },
+    "answer_image_url": { "type": ["string", "null"], "format": "uri" },
+    "scope": {
+      "type": "object",
+      "required": ["topic_id", "level2_id"],
+      "properties": {
+        "topic_id": { "type": "string", "minLength": 1 },
+        "level2_id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

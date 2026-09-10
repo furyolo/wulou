@@ -1,0 +1,30 @@
+taxonomy_version: 2026-09-09.1
+topics:
+  - id: topic-01-real-numbers
+    title: 专题一 实数
+    order: 1
+    level2:
+      - id: topic-01-large
+        title: 【大题】
+        level3:
+          - id: real-number-application
+            title: 实数的应用
+            knowledge_point_id: null
+            include_keywords: [实际, 应用, 数量, 单价, 路程, 费用]
+            exclude_keywords: [有理化, 分母有理化]
+            level4: []
+          - id: real-number-calculation
+            title: 实数综合计算
+            knowledge_point_id: null
+            include_keywords: [计算, 化简, 根式, 分式]
+            level4:
+              - id: real-number-calculation-no-rationalization
+                title: 考法1：不含分母有理化的实数综合计算
+                knowledge_point_id: null
+                include_keywords: [计算, 化简]
+                exclude_keywords: [有理化, 分母有理化]
+              - id: real-number-calculation-rationalization
+                title: 考法2：含分母有理化的实数综合计算
+                knowledge_point_id: null
+                include_keywords: [有理化, 分母有理化]
+                exclude_keywords: []

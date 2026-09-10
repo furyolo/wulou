@@ -1,0 +1,13 @@
+[project]
+name = "wulou-question-curation-assistant"
+version = "0.1.0"
+description = "题湖题库中考数学题分类助手的本地服务"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = []

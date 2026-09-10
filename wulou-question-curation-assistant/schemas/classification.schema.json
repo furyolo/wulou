@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "题目分类结果",
+  "type": "object",
+  "required": ["exercise_id", "taxonomy_version", "rule_version", "status", "needs_review", "reason"],
+  "properties": {
+    "exercise_id": { "type": "string" },
+    "taxonomy_version": { "type": "string" },
+    "rule_version": { "type": "string" },
+    "status": { "enum": ["suggested", "review"] },
+    "needs_review": { "type": "boolean" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "reason": { "type": "string" },
+    "review_reasons": { "type": "array", "items": { "type": "string" } },
+    "classification_method": { "enum": ["heuristic", "model", "manual"] },
+    "proposal_required": { "type": "boolean" },
+    "proposal_cluster_id": { "type": ["string", "null"] },
+    "target": {
+      "type": ["object", "null"],
+      "properties": {
+        "topic_id": { "type": "string" },
+        "level2_id": { "type": "string" },
+        "level3_id": { "type": "string" },
+        "level4_id": { "type": ["string", "null"] },
+        "path": { "type": "array", "items": { "type": "string" }, "minItems": 3 }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
