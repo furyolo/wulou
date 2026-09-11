@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 import sys
 
@@ -148,10 +149,45 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(result["target"]["path"][-1], "分母有理化")
         self.assertEqual(result["manual_override"]["source"], "manual")
 
+    def test_catalogue_move_history_reports_latest_confirmed_move(self) -> None:
+        first = {
+            "exercise_id": "move-history-1", "stable_code": "CS2026MOVE001",
+            "source_catalogue_id": "old-leaf", "target_catalogue_id": "middle-leaf",
+            "original_path": ["专题1：实数", "【大题】", "旧分类"],
+            "target_path": ["专题4：分式方程与不等式", "【大题】", "解不等式"],
+        }
+        second = {
+            **first,
+            "source_catalogue_id": "middle-leaf", "target_catalogue_id": "new-leaf",
+            "original_path": first["target_path"],
+            "target_path": ["专题10：三角形", "【大题】", "全等三角形", "考法2"],
+        }
+        self.assertEqual(self.request("POST", "/api/v1/history/catalogue-moves", first)[0], 201)
+        self.assertEqual(self.request("POST", "/api/v1/history/catalogue-moves", second)[0], 201)
+        status, report = self.request("GET", "/api/v1/history/catalogue-moves")
+        self.assertEqual(status, 200)
+        self.assertEqual(report["summary"]["classified_count"], 1)
+        self.assertEqual(report["summary"]["topics"], ["专题10：三角形"])
+        self.assertEqual(report["records"][0]["stable_code"], "CS2026MOVE001")
+        self.assertEqual(report["records"][0]["original_path"], first["target_path"])
+        self.assertEqual(report["records"][0]["target_path"], second["target_path"])
+
+    def test_catalogue_move_history_allows_unknown_original_path_but_not_missing_target(self) -> None:
+        body = {
+            "exercise_id": "move-history-unknown-source", "stable_code": "CS2026MOVE003",
+            "source_catalogue_id": "outside-page-tree", "target_catalogue_id": "level3-leaf",
+            "original_path": [],
+            "target_path": ["专题4：分式方程与不等式", "【大题】", "解不等式"],
+        }
+        status, saved = self.request("POST", "/api/v1/history/catalogue-moves", body)
+        self.assertEqual(status, 201)
+        self.assertEqual(saved["exercise_id"], body["exercise_id"])
+
     def test_cloud_settings_save_key_without_returning_it(self) -> None:
         status, payload = self.request("POST", "/api/v1/settings/cloud", {
             "model": "test-cloud-model", "routing_model": "test-routing-model",
             "reasoning_effort": "high", "routing_reasoning_effort": "medium",
+            "audit_mode": "conditional", "max_concurrent_requests": 5,
             "base_url": "https://api.example.test/v1", "api_key": "test-secret-key-123",
         })
         self.assertEqual(status, 200)
@@ -159,12 +195,28 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(payload["routing_model"], "test-routing-model")
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["routing_reasoning_effort"], "medium")
+        self.assertEqual(payload["audit_mode"], "conditional")
+        self.assertEqual(payload["max_concurrent_requests"], 5)
         self.assertTrue(payload["api_key_configured"])
         self.assertNotIn("api_key", payload)
         persisted = yaml.safe_load((self.temp_path / "settings.yaml").read_text(encoding="utf-8"))
         self.assertEqual(persisted["classifier"]["cloud"]["api_key"], "test-secret-key-123")
         self.assertEqual(persisted["classifier"]["cloud"]["routing_model"], "test-routing-model")
         self.assertEqual(persisted["classifier"]["cloud"]["routing_reasoning_effort"], "medium")
+        self.assertEqual(persisted["classifier"]["cloud"]["audit_mode"], "conditional")
+        self.assertEqual(persisted["classifier"]["cloud"]["max_concurrent_requests"], 5)
+
+    def test_conditional_audit_only_skips_low_risk_topic_after_self_check(self) -> None:
+        question = {"question_press": "已知函数关系，求对应值"}
+        decision = {"self_check": {"passed": True, "violations": [], "reason": "一致", "confidence": 0.98}}
+        low_risk_target = SimpleNamespace(topic_order=11, level2_title="【微专题】")
+        self.assertFalse(self.state._requires_independent_audit(question, decision, low_risk_target))
+        self.assertTrue(self.state._requires_independent_audit(
+            {**question, "question_latex": r"\frac{1{2}"}, decision, low_risk_target
+        ))
+        self.assertTrue(self.state._requires_independent_audit(
+            question, decision, SimpleNamespace(topic_order=10, level2_title="【大题】")
+        ))
 
     def test_interactive_job_returns_accepted_and_progress_can_be_polled(self) -> None:
         body = {
@@ -217,6 +269,13 @@ class HttpServiceTests(unittest.TestCase):
                     "routing": routings[str(question["exercise_id"])], "audit": None,
                 } for question in questions]
 
+            def audit_batch(self, items, taxonomy, rules):
+                self.calls.append("audit")
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "passed": True,
+                    "violations": [], "reason": "未发现冲突", "confidence": 0.95,
+                } for question, _routing, _decision, _target in items]
+
         cloud = StubCloud()
         # 供内部桩断言使用，避免闭包中依赖 unittest 的隐式绑定。
         cloud.assertEqual = self.assertEqual
@@ -231,7 +290,57 @@ class HttpServiceTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["results"][0]["target"]["level3_id"], target.level3_id)
-        self.assertEqual(cloud.calls, ["routing", f"topic:{target.topic_id}"])
+        self.assertEqual(cloud.calls, ["routing", f"topic:{target.topic_id}", "audit"])
+
+    def test_interactive_cloud_job_starts_topic_classification_before_all_routing_batches_finish(self) -> None:
+        target = self.state.taxonomy.all_targets()[0]
+        events: list[str] = []
+
+        class StubCloud:
+            configured = True
+            provider_name = "stub"
+            model = "fast-model"
+            reasoning_effort = "medium"
+
+            def route_fast_batch(self, questions, taxonomy, rules):
+                if any(question["exercise_id"] == "pipe-0" for question in questions):
+                    time.sleep(0.08)
+                    events.append("routing-long-finished")
+                else:
+                    events.append("routing-short-finished")
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "status": "routed",
+                    "required_knowledge_points": ["实数运算"], "latest_topic_id": target.topic_id,
+                    "confidence": 0.96, "reason": "路由完成", "review_reasons": [],
+                } for question in questions]
+
+            def classify_topic_batch(self, questions, topic_id, taxonomy, rules, routings):
+                events.append("classification-started")
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "status": "suggested",
+                    "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
+                    "confidence": 0.96, "reason": "唯一命中", "review_reasons": [],
+                    "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+                    "routing": routings[str(question["exercise_id"])], "audit": None,
+                } for question in questions]
+
+            def audit_batch(self, items, taxonomy, rules):
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "passed": True,
+                    "violations": [], "reason": "未发现冲突", "confidence": 0.95,
+                } for question, _routing, _decision, _target in items]
+
+        self.state.settings.setdefault("classifier", {}).setdefault("cloud", {})["max_concurrent_requests"] = 2
+        self.state.cloud = StubCloud()
+        questions = [{"exercise_id": f"pipe-{index}", "question_press": "分母有理化"} for index in range(11)]
+        _, submitted = self.request("POST", "/api/v1/classification-jobs", {"questions": questions})
+        for _ in range(100):
+            _, snapshot = self.request("GET", f"/api/v1/classification-jobs/{submitted['job_id']}")
+            if snapshot["status"] == "completed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertLess(events.index("classification-started"), events.index("routing-long-finished"))
 
 
 if __name__ == "__main__":

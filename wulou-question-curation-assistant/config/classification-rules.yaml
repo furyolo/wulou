@@ -1,4 +1,4 @@
-rule_version: math-exam-directory-curation-2026-09-10.2
+rule_version: math-exam-directory-curation-2026-09-11.3
 source_files:
   - C:\Users\foogl\.codex\skills\math-exam-directory-curation\SKILL.md
   - C:\Users\foogl\.codex\skills\math-exam-directory-curation\references\classification-and-writing-rules.md
@@ -8,13 +8,16 @@ rules:
   directory_hierarchy: Excel A列为一级专题，B列为二级目录，C列为三级目录，D列为四级目录
   large_question_directory_is_level2: true
   numbered_level2_is_not_topic: true
-  topic_order_first: true
+  topic_order_first: early_topics_only
+  large_question_core_topic_start_order: 10
+  large_question_core_topic_start_title: 三角形
   page_scope_is_hint_only: true
   actual_question_over_site_tags: true
   question_text_is_primary: true
   answer_is_auxiliary: true
   ignore_unrelated_answer_material: true
-  latest_prerequisite_definition: 完整解答该题不可缺少、且在目录顺序中最靠后的知识专题
+  latest_prerequisite_definition: 仅适用于专题10之前的基础或前置知识专题；完整解答该题不可缺少、且在目录顺序中最靠后的知识专题
+  large_question_core_topic_definition: 从专题10“三角形”起及后续专题的【大题】默认面向已学完全部知识点的初三学生，按最终解决问题的核心突破口、决定性性质或证明链主线归类
   level3_axis: primary_object_or_context
   level4_axis: main_question_or_decisive_condition
   remove_story_background: true
@@ -32,17 +35,12 @@ decision_protocol:
   - 以实际题干为分类主依据，答案只作补充验证；答案包含题干未出现的独立小题或数学对象时，忽略无关答案段落，不得让其改变题干可唯一确定的分类。
   - 忽略网页当前目录的强制约束，只把它作为弱提示。
   - 列出完整解题不可缺少的全部知识点，不得只看题目所在网页或已有标签。
-  - 按目录顺序选择最晚必备知识点所属专题；当前网页专题与其冲突时，以实际题目为准。
+  - 先按通行的中学数学运算优先级解释题干和答案：乘方优先于一元正负号，未用括号包住的正负号不自动并入幂底。可由标准规则唯一确定的表达式不得仅因未额外加括号而视为歧义；只有多个解释都符合题干且不能由答案或上下文排除时才可暂停分类。排版控制符夹在同一数字或标识符中时先清理为同一文本单元，其余未知控制符保留为输入风险。
+  - 先判定分类阶段：专题10之前的基础或前置知识专题，按目录顺序选择最晚必备知识点所属专题；从专题10“三角形”起及后续专题的【大题】，按最终解决问题的核心突破口、决定性性质或证明链主线选择专题。后者不得因扇形面积、旋转、坐标或代数运算等辅助步骤而改变专题归属。
   - 在选定专题内，以首要数学对象或情境确定三级目录。
-  - 以主问或决定性条件确定四级目录；常规步骤、故事背景和否定性宽泛描述不得压过关键知识特征。
+  - 对专题10及后续专题的【大题】，用反事实检查区分核心与辅助：去掉候选知识点后主结论的证明或求解主线仍成立时，它只是辅助步骤；主线失效，或该知识点就是最终主问/决定性条件时，才是核心考点。以主问或决定性条件确定四级目录；常规步骤、故事背景和否定性宽泛描述不得压过关键知识特征。
   - 对所有同级候选做两两排他检查；无法唯一命中时必须复核。若三级目录没有四级子目录，则三级即为末级；仅对实际存在四级子目录的三级目录执行四级唯一命中检查。
   - 新目录只可作为候选，单道题不得创建新目录。
-
-hard_signals:
-  - id: trigonometry
-    pattern: '(?i)(?:(?<![A-Za-z])(?:sin|cos|tan|cot)(?![A-Za-z])|正弦|余弦|正切|余切|三角比)'
-    minimum_topic_title_contains: 三角函数
-    conflict_title_pattern: '不含三角(?:比|函数)'
 
 mandatory_review_when:
   - target_topic_is_later_than_current_topic

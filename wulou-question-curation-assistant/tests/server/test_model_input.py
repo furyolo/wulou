@@ -46,16 +46,25 @@ class ModelInputSnapshotTests(unittest.TestCase):
         self.assertIn("((1)/(2))^(-1)", text)
         self.assertNotIn("question_unrecognized_typesetting", snapshot["warnings"])
 
-    def test_snapshot_omits_answer_with_parts_missing_from_question(self) -> None:
+    def test_snapshot_removes_inline_private_use_layout_separators(self) -> None:
+        snapshot = build_model_input_snapshot({
+            "question_press": "计算:-1^(2\ue5e6026)+√(9)-3tan\ue5e645°+((1)/(2))^(-1).",
+            "answer_press": "解: 原式=-1+3-3×1+2=1.",
+        })
+        self.assertEqual(snapshot["question"]["text"], "计算:-1^(2026)+√(9)-3tan45°+((1)/(2))^(-1).")
+        self.assertNotIn("question_unrecognized_typesetting", snapshot["warnings"])
+
+    def test_snapshot_keeps_answer_with_parts_missing_from_question_for_llm_review(self) -> None:
         snapshot = build_model_input_snapshot({
             "question_press": "计算：|√2-2|+(π-1)^0-(1/2)^(-1)",
             "answer_press": "(1) 原式=1-√2。(2) 化简 x²/(x-2)。",
         })
-        self.assertEqual(snapshot["answer"]["text"], "")
-        self.assertFalse(snapshot["answer"]["used_for_classification"])
-        self.assertEqual(snapshot["answer"]["omitted_reason"], "suspected_extra_parts")
+        self.assertEqual(snapshot["answer"]["text"], "(1) 原式=1-√2。(2) 化简 x²/(x-2)。")
+        self.assertTrue(snapshot["answer"]["used_for_classification"])
+        self.assertTrue(snapshot["answer"]["part_numbering_mismatch"])
+        self.assertIsNone(snapshot["answer"]["omitted_reason"])
         self.assertIn("(2)", snapshot["answer"]["captured_text"])
-        self.assertIn("answer_suspected_extra_parts", snapshot["warnings"])
+        self.assertIn("answer_part_numbering_mismatch", snapshot["warnings"])
 
     def test_formula_parentheses_are_not_mistaken_for_question_parts(self) -> None:
         snapshot = build_model_input_snapshot({
@@ -63,9 +72,9 @@ class ModelInputSnapshotTests(unittest.TestCase):
             "answer_press": "解: (1)原式=1-√(2). (2)原式=(x^(2))/((x-2)(x+2)).",
         })
         self.assertEqual(snapshot["question"]["text"], "计算: |√(2)-2|+(π-1)^(0)-((1)/(2))^(-1).")
-        self.assertEqual(snapshot["answer"]["text"], "")
-        self.assertFalse(snapshot["answer"]["used_for_classification"])
-        self.assertIn("answer_suspected_extra_parts", snapshot["warnings"])
+        self.assertEqual(snapshot["answer"]["text"], "解: (1)原式=1-√(2). (2)原式=(x^(2))/((x-2)(x+2)).")
+        self.assertTrue(snapshot["answer"]["used_for_classification"])
+        self.assertIn("answer_part_numbering_mismatch", snapshot["warnings"])
 
     def test_matching_question_parts_keep_the_answer(self) -> None:
         snapshot = build_model_input_snapshot({
@@ -74,7 +83,8 @@ class ModelInputSnapshotTests(unittest.TestCase):
         })
         self.assertTrue(snapshot["answer"]["used_for_classification"])
         self.assertEqual(snapshot["answer"]["text"], "解：（1）2；（2）2√2。")
-        self.assertNotIn("answer_suspected_extra_parts", snapshot["warnings"])
+        self.assertFalse(snapshot["answer"]["part_numbering_mismatch"])
+        self.assertNotIn("answer_part_numbering_mismatch", snapshot["warnings"])
 
 
 if __name__ == "__main__":

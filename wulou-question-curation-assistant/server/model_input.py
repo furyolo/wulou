@@ -7,11 +7,12 @@ import re
 from typing import Any
 
 
-SNAPSHOT_VERSION = "2026-09-10.3"
+SNAPSHOT_VERSION = "2026-09-11.2"
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE_RE = re.compile(r"<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>", re.IGNORECASE | re.DOTALL)
 _PRIVATE_USE_RE = re.compile(r"[\ue000-\uf8ff]")
+_INLINE_PRIVATE_USE_SEPARATOR_RE = re.compile(r"(?<=[0-9A-Za-z])[\ue000-\uf8ff]+(?=[0-9A-Za-z])")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
@@ -35,7 +36,10 @@ def _convert_fangzheng_typesetting(value: str) -> str:
     text = re.sub(r"〖SX\(〗(.*?)〖〗(.*?)〖SX\)〗", r"(\1)/(\2)", text)
     text = re.sub(r"\ue00b\ue008(.*?)\ue009", r"^(\1)", text)
     text = re.sub(r"\ue00b([+\-]?\d+)", r"^(\1)", text)
-    return text.replace("\ue008", "").replace("\ue009", "")
+    text = text.replace("\ue008", "").replace("\ue009", "")
+    # 私有区字符夹在同一数字或标识符中时是排版分隔符，不承载可见数学运算。
+    # 仅在两侧均为同类文本符号时移除；其余未知控制码仍保留并触发输入风险提示。
+    return _INLINE_PRIVATE_USE_SEPARATOR_RE.sub("", text)
 
 
 def _redact(value: str) -> str:
@@ -100,20 +104,16 @@ def build_model_input_snapshot(question: dict[str, Any]) -> dict[str, Any]:
     captured_answer = answer_field["text"]
     question_parts = _numbered_parts(question_field["text"])
     answer_parts = _numbered_parts(captured_answer)
-    # 题湖部分旧题的答案字段串入下一道题。题干没有多小题而答案同时出现（1）（2）时，
-    # 保留原文供人工审计，但不让污染答案改变清晰题干的分类结果。
+    # 答案编号与题干编号不一致只能说明排版可能损坏或答案可能串题，不能证明答案无关。
+    # 保留答案并把风险交给 LLM 结合数学连续性判断，避免方正排版标记导致可分类题被误丢答案。
     if {1, 2}.issubset(answer_parts) and not {1, 2}.issubset(question_parts) and question_field["text"]:
-        answer_field["captured_text"] = captured_answer
-        answer_field["text"] = ""
-        answer_field["supplemental_text"] = None
-        answer_field["latex"] = None
-        answer_field["used_for_classification"] = False
-        answer_field["omitted_reason"] = "suspected_extra_parts"
-        answer_warnings.append("answer_suspected_extra_parts")
+        answer_warnings.append("answer_part_numbering_mismatch")
+        answer_field["part_numbering_mismatch"] = True
     else:
-        answer_field["captured_text"] = captured_answer
-        answer_field["used_for_classification"] = True
-        answer_field["omitted_reason"] = None
+        answer_field["part_numbering_mismatch"] = False
+    answer_field["captured_text"] = captured_answer
+    answer_field["used_for_classification"] = True
+    answer_field["omitted_reason"] = None
     scope = question.get("scope") if isinstance(question.get("scope"), dict) else {}
     site_context = normalize_model_text(question.get("source", ""))
     if question_field["text"] and question_field["text"] in site_context:

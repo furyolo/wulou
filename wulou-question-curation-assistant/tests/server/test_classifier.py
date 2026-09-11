@@ -77,7 +77,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertFalse(result["needs_review"])
         self.assertEqual(result["target"]["level4_id"], None)
 
-    def test_trigonometry_cannot_be_classified_into_earlier_real_number_topic(self) -> None:
+    def test_validator_does_not_apply_hardcoded_prerequisite_rule(self) -> None:
         taxonomy = Taxonomy({
             "taxonomy_version": "regression-1",
             "topics": [
@@ -97,38 +97,52 @@ class ClassifierTests(unittest.TestCase):
                 },
             ],
         })
-        rules = {
-            "rule_version": "regression-rules",
-            "hard_signals": [{
-                "id": "trigonometry",
-                "pattern": r"(?i)(?:(?<![A-Za-z])(?:sin|cos|tan|cot)(?![A-Za-z])|三角比)",
-                "minimum_topic_title_contains": "三角函数",
-                "conflict_title_pattern": r"不含三角比",
-            }],
-        }
+        rules = {"rule_version": "regression-rules"}
         question = {
             "exercise_id": "first-question",
             "question_press": r"(-1)^3+2\tan 60^\circ-\sqrt{12}+(\pi-2)^0",
             "scope": {"topic_id": "topic-real", "level2_id": "real-large"},
         }
-        wrong = validate_model_decision(question, {
+        result = validate_model_decision(question, {
             "status": "suggested", "target_level3_id": "real-calc", "target_level4_id": None,
             "confidence": 0.99, "reason": "不含分母有理化", "review_reasons": [],
             "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
             "routing": {"latest_topic_id": "topic-real"}, "audit": {"passed": True},
         }, taxonomy, rules)
-        self.assertEqual(wrong["status"], "review")
-        self.assertEqual(wrong["review_reasons"], ["later_prerequisite:trigonometry"])
+        self.assertEqual(result["status"], "suggested")
+        self.assertEqual(result["target"]["topic_id"], "topic-real")
 
-        correct = validate_model_decision(question, {
-            "status": "suggested", "target_level3_id": "trig-calc", "target_level4_id": None,
-            "confidence": 0.95, "reason": "计算必须使用 tan60° 的特殊角三角函数值", "review_reasons": [],
+    def test_later_trigonometry_does_not_override_core_topic_routing(self) -> None:
+        taxonomy = Taxonomy({
+            "taxonomy_version": "regression-core-topic-1",
+            "topics": [
+                {
+                    "id": "topic-triangle", "title": "专题10：三角形", "order": 10,
+                    "level2": [{"id": "triangle-large", "title": "【大题】", "level3": [{
+                        "id": "triangle-congruence", "title": "三角形全等", "knowledge_point_id": None, "level4": [],
+                    }]}],
+                },
+                {
+                    "id": "topic-trig", "title": "专题12：锐角三角函数", "order": 12,
+                    "level2": [{"id": "trig-large", "title": "【大题】", "level3": [{
+                        "id": "trig-calc", "title": "三角函数计算", "knowledge_point_id": None, "level4": [],
+                    }]}],
+                },
+            ],
+        })
+        rules = {"rules": {"large_question_core_topic_start_order": 10}}
+        result = validate_model_decision({
+            "exercise_id": "core-question",
+            "question_press": "证明两个三角形全等，并计算 sin60° 对应的线段长度。",
+        }, {
+            "status": "suggested", "target_level3_id": "triangle-congruence", "target_level4_id": None,
+            "confidence": 0.99, "reason": "全等三角形是证明主线，sin60°仅用于中间计算", "review_reasons": [],
             "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
-            "routing": {"latest_topic_id": "topic-trig"}, "audit": {"passed": True},
+            "routing": {"latest_topic_id": "topic-triangle", "required_knowledge_points": ["三角形全等", "sin60°"]},
+            "audit": {"passed": True},
         }, taxonomy, rules)
-        self.assertEqual(correct["status"], "suggested")
-        self.assertEqual(correct["target"]["topic_id"], "topic-trig")
-        self.assertIn("page_scope_differs_from_latest_prerequisite", correct["review_reasons"])
+        self.assertEqual(result["status"], "suggested")
+        self.assertEqual(result["target"]["topic_id"], "topic-triangle")
 
 
 if __name__ == "__main__":

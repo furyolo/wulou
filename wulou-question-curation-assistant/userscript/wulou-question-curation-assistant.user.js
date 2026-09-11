@@ -70,6 +70,16 @@
     return params;
   }
 
+  // 题湖表单可能包含同名隐藏字段；URLSearchParams.set 会移除旧值，
+  // 确保服务端只接收到一个、且正是当前采纳目标的目录 ID。
+  function buildCatalogueMovePayload(form, targetCatalogueId) {
+    const targetId = normalizeWhitespace(targetCatalogueId);
+    if (!targetId) throw new Error('建议目录缺少可提交的内部 ID');
+    const params = serializeSuccessfulControls(form);
+    params.set('exercise_catalogue_id', targetId);
+    return params;
+  }
+
   function stableCodeFromText(value) {
     const match = normalizeWhitespace(value).match(/\b[A-Z]{2,}[A-Z0-9-]{4,}\b/);
     return match ? match[0] : null;
@@ -144,6 +154,63 @@
     };
   }
 
+  function navigationPathFromTreeRows(rows, selectedIndex) {
+    const stack = [];
+    for (let index = 0; index <= selectedIndex; index += 1) {
+      const row = rows[index];
+      if (!row?.name || !Number.isInteger(row.depth) || row.depth < 0) continue;
+      stack.length = row.depth;
+      stack[row.depth] = normalizeWhitespace(row.name);
+    }
+    let topicIndex = -1;
+    for (let index = stack.length - 1; index >= 0; index -= 1) {
+      if (/^专题\s*\d+\s*[：:]/.test(stack[index] || '')) {
+        topicIndex = index;
+        break;
+      }
+    }
+    return topicIndex >= 0 ? stack.slice(topicIndex).filter(Boolean) : [];
+  }
+
+  function escapeReportHtml(value) {
+    return String(value ?? '').replace(/[&<>'"]/g, character => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+    })[character]);
+  }
+
+  function compactHistoryPath(path) {
+    const parts = Array.isArray(path) ? path : [];
+    return parts.slice(0, 4).filter(Boolean).map(normalizeWhitespace).filter(Boolean).join(' / ') || '—';
+  }
+
+  function buildHistoryReportHtml(report) {
+    const summary = report?.summary || {};
+    const records = Array.isArray(report?.records) ? report.records : [];
+    const topics = Array.isArray(summary.topics) ? summary.topics : [];
+    const pathHtml = path => escapeReportHtml(compactHistoryPath(path));
+    const rows = records.map(record => `
+      <tr>
+        <td class="code">${escapeReportHtml(record.stable_code || '未提取 Stable Code')}</td>
+        <td>${pathHtml(record.original_path)}</td>
+        <td>${pathHtml(record.target_path)}</td>
+      </tr>`).join('') || '<tr><td colspan="3" class="empty">暂无已分类题目记录。</td></tr>';
+    const topicHtml = topics.map(topic => `<span>${escapeReportHtml(topic)}</span>`).join('') || '<span>暂无</span>';
+    return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>题目分类成果汇总</title><style>
+  :root { color: #1f2c2a; font: 14px/1.55 "Microsoft YaHei", "微软雅黑", sans-serif; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  body { max-width: 1280px; margin: 0 auto; padding: 20px; background: #f5f8f7; } main { padding: 24px; border: 1px solid #d7e1dd; border-radius: 14px; background: #fff; box-shadow: 0 14px 42px rgb(19 49 41 / .10); }
+  h1 { margin: 0; color: #126b5c; font-size: 24px; font-weight: 700; letter-spacing: .02em; } .summary { display: grid; grid-template-columns: 170px 1fr; gap: 12px; margin: 16px 0; }.summary-card { min-height: 74px; padding: 13px 15px; border: 1px solid #cfe2db; border-radius: 11px; background: linear-gradient(135deg, #f4faf7, #e7f2ee); }.metric-label, .topic-label { color: #4e6860; font-size: 12px; font-weight: 700; }.count { margin-top: 2px; color: #0d6858; font-size: 29px; font-weight: 800; line-height: 1.1; }.count-label { color: #526660; font-size: 12px; }.topic-card { min-height: 74px; padding: 13px 15px; border: 1px solid #dce7e3; border-radius: 11px; background: #fff; }.topics { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }.topics span { padding: 3px 8px; border-radius: 999px; background: #e7f2ee; color: #1d6554; font-size: 11px; font-weight: 650; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; line-height: 1.45; } th, td { padding: 7px 8px; border: 1px solid #dce7e3; vertical-align: top; text-align: left; } th { background: #eef4f1; color: #29453d; font-size: 11px; } td { color: #405650; overflow-wrap: anywhere; } th:first-child, .code { width: 23%; } .code { color: #29453d; font-weight: 700; word-break: break-all; } .empty { padding: 22px; color: #71827c; text-align: center; }
+  @page { size: A4 landscape; margin: 10mm; } @media print { body { max-width: none; padding: 0; background: #fff; } main { padding: 0; border: 0; box-shadow: none; } }
+</style></head><body><main>
+  <h1>题目分类成果汇总</h1>
+  <section class="summary"><div class="summary-card"><div class="metric-label">已分类题目</div><div class="count">${Number(summary.classified_count) || 0}</div></div><div class="topic-card"><div class="topic-label">涉及专题</div><div class="topics">${topicHtml}</div></div></section>
+  <table><thead><tr><th>Stable Code</th><th>原目录</th><th>现目录</th></tr></thead><tbody>${rows}</tbody></table>
+</main></body></html>`;
+  }
+
+
   function normalizeClassificationResult(value, fallbackExerciseId = '') {
     const input = value && typeof value === 'object' ? value : {};
     const status = input.status === 'suggested' ? 'suggested' : 'review';
@@ -171,6 +238,17 @@
     };
   }
 
+  // “待复核”只表示不能自动通过，不代表人工不能确认并写入。
+  // 采纳前仍要求模型给出的目录路径完整，避免把不确定或无效目标提交到题湖。
+  function canAcceptClassification(result) {
+    return Boolean(
+      result
+      && ['suggested', 'review'].includes(result.status)
+      && Array.isArray(result.target?.path)
+      && result.target.path.length,
+    );
+  }
+
   function inputWarningLabels(snapshot) {
     const labels = {
       question_text_missing: '题干文本为空',
@@ -179,7 +257,7 @@
       answer_unrecognized_typesetting: '答案含无法识别的排版字符',
       question_unbalanced_latex: '题干 LaTex 定界符不完整',
       answer_unbalanced_latex: '答案 LaTex 定界符不完整',
-      answer_suspected_extra_parts: '答案疑似混入题干不存在的额外小题，已从模型输入中排除',
+      answer_part_numbering_mismatch: '答案与题干的小题编号不一致，已交由模型核对数学连续性',
     };
     return [...new Set((snapshot?.warnings || []).map(item => labels[item] || normalizeWhitespace(item)).filter(Boolean))];
   }
@@ -211,8 +289,8 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, stableCodeFromText, runPool, chunkItems,
-      classificationPayload, normalizeClassificationResult, resolveCataloguePath,
-      serializeSuccessfulControls,
+      classificationPayload, normalizeClassificationResult, canAcceptClassification, resolveCataloguePath,
+      serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant,
     };
     return;
@@ -232,6 +310,8 @@
     cloudConfigured: false,
     cards: new Map(),
     accepting: new Set(),
+    confirmation: null,
+    historyReport: null,
   };
 
   const host = document.createElement('div');
@@ -239,7 +319,7 @@
   const shadow = host.attachShadow({ mode: 'open' });
   shadow.innerHTML = `
     <style>
-      :host { all: initial; color-scheme: light; font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; color: #1f2c2a; }
+      :host { all: initial; color-scheme: light; font: 14px/1.5 "Microsoft YaHei", "微软雅黑", sans-serif; color: #1f2c2a; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
       *, *::before, *::after { box-sizing: border-box; }
       button, input, select { font: inherit; }
       button { min-height: 38px; border: 1px solid #cfdad5; border-radius: 10px; background: #fff; color: #1f2c2a; cursor: pointer; padding: 8px 11px; transition: background .16s ease, border-color .16s ease, transform .16s ease; }
@@ -284,7 +364,35 @@
        .model-settings { display: grid; gap: 8px; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
        .model-settings h4 { margin: 0; color: #29453d; font-size: 12px; }
        .model-settings p { margin: -2px 0 0; color: #687a74; font-size: 11px; }
-       .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .history-view { display: grid; gap: 12px; }
+      .history-view[hidden] { display: none; }
+      .history-header { display: flex; align-items: center; gap: 8px; min-height: 34px; }
+      .history-header h3 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+      .back-history { min-height: 34px; padding: 6px 9px; border-color: transparent; background: #eef4f1; color: #39534c; font-size: 12px; font-weight: 650; }
+      .history-export-actions { display: flex; gap: 6px; margin-left: auto; }
+      .export-history { min-height: 34px; padding: 6px 9px; border-color: #126b5c; background: #126b5c; color: #fff; font-size: 12px; font-weight: 650; }
+      .export-history:hover { border-color: #0c5649; background: #0c5649; }
+      .capture-history { min-height: 34px; padding: 6px 9px; border-color: #8ba99f; background: #fff; color: #31574d; font-size: 12px; font-weight: 650; }
+      .history-summary { margin: 0; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #f6faf8; color: #405650; font-size: 12px; }
+      .history-topics { display: flex; flex-wrap: wrap; gap: 6px; }
+      .history-topic { padding: 3px 7px; border-radius: 999px; background: #e7f2ee; color: #266657; font-size: 11px; }
+      .history-list { display: grid; gap: 8px; max-height: min(48dvh, 420px); overflow: auto; }
+      .history-record { display: grid; gap: 7px; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
+      .history-code { color: #29453d; font-size: 12px; font-weight: 700; word-break: break-all; }
+      .history-change { display: grid; gap: 5px; }
+      .history-path { margin: 0; color: #526660; font-size: 11px; line-height: 1.6; }
+      .history-path strong { color: #39534c; }
+      .history-arrow { color: #126b5c; font-size: 11px; font-weight: 700; }
+      .history-empty { margin: 0; padding: 18px 10px; color: #687a74; font-size: 12px; text-align: center; }
+      .confirm-overlay[hidden] { display: none; }
+      .confirm-overlay { position: fixed; inset: 0; z-index: 2147483002; display: grid; place-items: center; padding: 18px; background: rgb(19 49 41 / .34); }
+      .confirm-dialog { width: min(352px, calc(100vw - 36px)); padding: 18px; border: 1px solid #d7e1dd; border-radius: 16px; background: #fff; box-shadow: 0 22px 56px rgb(19 49 41 / .26); }
+      .confirm-dialog h3 { margin: 0; color: #29453d; font-size: 16px; letter-spacing: -.02em; }
+      .confirm-dialog p { margin: 8px 0 0; color: #526660; font-size: 13px; }
+      .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+      .danger { border-color: #b43c35; background: #b43c35; color: #fff; font-weight: 650; }
+      .danger:hover { border-color: #8f2f2a; background: #8f2f2a; }
       @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
     </style>
@@ -293,11 +401,11 @@
       <span class="tab-text">分类</span>
       <span class="tab-status" aria-hidden="true"></span>
     </button>
-    <section class="panel" role="region" aria-label="题目分类助手" inert>
+      <section class="panel" role="region" aria-label="题目分类助手" inert>
       <section class="main-view" aria-label="分类助手主界面">
       <div class="header"><h2>题目分类助手</h2><div class="header-actions"><button class="settings" type="button" aria-expanded="false">设置</button><button class="close" type="button" aria-label="收起面板">›</button></div></div>
       <div class="actions"><button class="primary classify" type="button" disabled>识别当前页</button></div>
-      <div class="actions"><button class="clear-cache" type="button" disabled>清除本页缓存</button></div>
+      <div class="actions"><button class="history" type="button">工作成果</button><button class="clear-cache" type="button" disabled>清除本页缓存</button></div>
        <!-- 批处理仅适合数百题以上的离线任务；保留实现，暂不占用日常实时分类面板。 -->
        <section class="batch-actions" hidden aria-label="高级批处理操作">
          <div class="actions"><button class="export-batch" type="button" disabled>导出批处理</button><button class="submit-batch" type="button" disabled>提交云端批处理</button></div>
@@ -308,27 +416,46 @@
       </section>
       <section class="settings-drawer" hidden aria-label="云端模型设置">
         <div class="settings-header"><button class="back-settings" type="button">‹ 返回</button><h3>云端模型设置</h3></div>
-         <p class="settings-copy">专题路由先判断“最晚必备专题”，目录分类再选择该专题内的三级、四级目录。两者可分别设置推理强度。API 密钥留空会保留原密钥。</p>
+         <p class="settings-copy">专题10之前按“最晚必备专题”路由；从专题10“三角形”起的【大题】按压轴题核心考点路由，再选择该专题内的三级、四级目录。条件审核会先由第二轮自检，仅对高风险题追加独立审核。API 密钥留空会保留原密钥。</p>
          <div class="form">
            <section class="model-settings"><h4>目录分类</h4><p>决定最终三级、四级目录。建议“高”。</p><label>模型<input class="cloud-model" type="text" autocomplete="off" placeholder="例如你的模型部署名"></label><label>推理强度<select class="classification-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium">中（medium）</option><option value="high" selected>高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
-           <section class="model-settings"><h4>专题路由</h4><p>选择全局“最晚必备专题”。建议“中”。</p><label>模型（可选）<input class="routing-model" type="text" autocomplete="off" placeholder="留空则与目录分类模型相同"></label><label>推理强度<select class="routing-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium" selected>中（medium）</option><option value="high">高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
+           <section class="model-settings"><h4>专题路由</h4><p>按前置知识或压轴题核心考点选择全局专题。建议“中”。</p><label>模型（可选）<input class="routing-model" type="text" autocomplete="off" placeholder="留空则与目录分类模型相同"></label><label>推理强度<select class="routing-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium" selected>中（medium）</option><option value="high">高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
+           <section class="model-settings"><h4>审核策略</h4><p>条件审核可减少低风险题的等待；始终审核适合最高准确性要求。</p><label>策略<select class="audit-mode"><option value="conditional" selected>条件审核（推荐）</option><option value="always">始终独立审核</option></select></label></section>
+           <section class="model-settings"><h4>并发与流水线</h4><p>路由、分类与必要审核会共享总并发。题量较大时可提高到 4 或 5；出现限流则调低。</p><label>LLM 总并发<select class="max-concurrent-requests"><option value="1">1</option><option value="2">2</option><option value="3" selected>3（推荐）</option><option value="4">4</option><option value="5">5</option></select></label></section>
            <label>接口地址<input class="cloud-base-url" type="url" autocomplete="off" placeholder="https://api.openai.com/v1"></label>
           <label>API 密钥<input class="cloud-api-key" type="password" autocomplete="new-password" placeholder="留空则保留已保存的密钥"></label>
         </div>
         <div class="settings-actions"><button class="cancel-settings" type="button">取消</button><button class="primary save-cloud" type="button">保存设置</button></div>
+      </section>
+      <section class="history-view" hidden aria-label="工作成果">
+        <div class="history-header"><button class="back-history" type="button">‹ 返回</button><h3>工作成果</h3><div class="history-export-actions"><button class="capture-history" type="button" disabled>一键截图</button><button class="export-history" type="button" disabled>导出报告</button></div></div>
+        <p class="history-summary" aria-live="polite">正在加载移动记录…</p>
+        <div class="history-topics" aria-label="涉及专题"></div>
+        <div class="history-list" aria-live="polite"></div>
+      </section>
+      <section class="confirm-overlay" hidden aria-hidden="true">
+        <div class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+          <h3 id="confirm-title">确认操作</h3>
+          <p id="confirm-message"></p>
+          <div class="confirm-actions"><button class="confirm-cancel" type="button">取消</button><button class="confirm-accept danger" type="button">确认清除</button></div>
+        </div>
       </section>
     </section>`;
   document.body.append(host);
 
   const elements = {
     panel: shadow.querySelector('.panel'), tab: shadow.querySelector('.tab'), tabStatus: shadow.querySelector('.tab-status'), close: shadow.querySelector('.close'), mainView: shadow.querySelector('.main-view'), settings: shadow.querySelector('.settings'), settingsDrawer: shadow.querySelector('.settings-drawer'), backSettings: shadow.querySelector('.back-settings'),
-     cloudModel: shadow.querySelector('.cloud-model'), routingModel: shadow.querySelector('.routing-model'), classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), saveCloud: shadow.querySelector('.save-cloud'),
-    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
+     cloudModel: shadow.querySelector('.cloud-model'), routingModel: shadow.querySelector('.routing-model'), classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), auditMode: shadow.querySelector('.audit-mode'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), saveCloud: shadow.querySelector('.save-cloud'),
+    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), exportHistory: shadow.querySelector('.export-history'), captureHistory: shadow.querySelector('.capture-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
     legend: shadow.querySelector('.legend'), legendList: shadow.querySelector('.legend ul'),
+    confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'),
   };
 
   function setOpen(open) {
-    if (!open) closeSettings();
+    if (!open) {
+      closeSettings();
+      closeHistory();
+    }
     elements.panel.classList.toggle('open', open);
     elements.panel.inert = !open;
     elements.tab.hidden = open;
@@ -341,11 +468,39 @@
     elements.status.classList.toggle('error', isError);
   }
 
+  function confirmAction({ title, message, confirmLabel = '确认', destructive = false }) {
+    if (state.confirmation) return Promise.resolve(false);
+    const previousFocus = shadow.activeElement || document.activeElement;
+    elements.confirmTitle.textContent = title;
+    elements.confirmMessage.textContent = message;
+    elements.confirmAccept.textContent = confirmLabel;
+    elements.confirmAccept.classList.toggle('danger', destructive);
+    elements.confirmOverlay.hidden = false;
+    elements.confirmOverlay.setAttribute('aria-hidden', 'false');
+    elements.confirmAccept.focus({ preventScroll: true });
+    return new Promise(resolve => {
+      state.confirmation = { resolve, previousFocus };
+    });
+  }
+
+  function closeConfirmation(confirmed) {
+    const confirmation = state.confirmation;
+    if (!confirmation) return;
+    state.confirmation = null;
+    elements.confirmOverlay.hidden = true;
+    elements.confirmOverlay.setAttribute('aria-hidden', 'true');
+    if (confirmation.previousFocus?.focus) confirmation.previousFocus.focus({ preventScroll: true });
+    confirmation.resolve(confirmed);
+  }
+
   function setBusy(busy) {
     state.busy = busy;
     elements.settings.disabled = busy;
     elements.saveCloud.disabled = busy;
     elements.classify.disabled = busy || !state.taxonomy;
+    elements.history.disabled = busy;
+    elements.exportHistory.disabled = busy || !state.historyReport?.records?.length;
+    elements.captureHistory.disabled = busy || !state.historyReport?.records?.length;
     elements.clearCache.disabled = busy || !state.taxonomy;
     elements.exportBatch.disabled = busy || !state.cloudConfigured || !state.currentQuestions.length;
     elements.submitBatch.disabled = busy || !state.cloudConfigured || !state.batchJobId;
@@ -363,6 +518,278 @@
     elements.settingsDrawer.hidden = true;
     elements.mainView.hidden = false;
     elements.settings.setAttribute('aria-expanded', 'false');
+  }
+
+  function closeHistory() {
+    elements.historyView.hidden = true;
+    elements.mainView.hidden = false;
+  }
+
+  function formatHistoryPath(path) {
+    return (Array.isArray(path) ? path : []).slice(0, 4)
+      .map((item, index) => item ? `${DIRECTORY_LEVEL_LABELS[index]}：${item}` : '')
+      .filter(Boolean).join('　');
+  }
+
+  function renderHistory(report) {
+    const summary = report?.summary || {};
+    const records = Array.isArray(report?.records) ? report.records : [];
+    const topics = Array.isArray(summary.topics) ? summary.topics : [];
+    state.historyReport = { summary, records };
+    elements.exportHistory.disabled = !records.length;
+    elements.captureHistory.disabled = !records.length;
+    elements.historySummary.textContent = `已分类 ${Number(summary.classified_count) || 0} 道题目，涉及 ${topics.length} 个专题。`;
+    elements.historyTopics.replaceChildren(...topics.map(topic => {
+      const item = document.createElement('span');
+      item.className = 'history-topic';
+      item.textContent = topic;
+      return item;
+    }));
+    if (!records.length) {
+      const empty = document.createElement('p');
+      empty.className = 'history-empty';
+      empty.textContent = '暂无已分类题目记录。';
+      elements.historyList.replaceChildren(empty);
+      return;
+    }
+    elements.historyList.replaceChildren(...records.map(record => {
+      const item = document.createElement('article');
+      item.className = 'history-record';
+      const code = document.createElement('div');
+      code.className = 'history-code';
+      code.textContent = record.stable_code || '未提取 Stable Code';
+      const change = document.createElement('div');
+      change.className = 'history-change';
+      const original = document.createElement('p');
+      original.className = 'history-path';
+      const originalLabel = document.createElement('strong');
+      originalLabel.textContent = '原目录';
+      const originalPath = Array.isArray(record.original_path) ? record.original_path : [];
+      original.append(originalLabel, document.createTextNode(originalPath.length
+        ? `　${formatHistoryPath(originalPath)}`
+        : '　未能从当时页面加载的目录树读取'));
+      const arrow = document.createElement('div');
+      arrow.className = 'history-arrow';
+      arrow.textContent = '↓ 移动至';
+      const target = document.createElement('p');
+      target.className = 'history-path';
+      const targetLabel = document.createElement('strong');
+      targetLabel.textContent = '现目录';
+      target.append(targetLabel, document.createTextNode(`　${formatHistoryPath(record.target_path || [])}`));
+      change.append(original, arrow, target);
+      item.append(code, change);
+      return item;
+    }));
+  }
+
+  async function openHistory() {
+    if (state.busy) return;
+    closeSettings();
+    elements.mainView.hidden = true;
+    elements.historyView.hidden = false;
+    state.historyReport = null;
+    elements.exportHistory.disabled = true;
+    elements.captureHistory.disabled = true;
+    elements.historySummary.textContent = '正在加载移动记录…';
+    elements.historyTopics.replaceChildren();
+    elements.historyList.replaceChildren();
+    try {
+      renderHistory(await request('GET', '/api/v1/history/catalogue-moves'));
+    } catch (error) {
+      elements.historySummary.textContent = `无法加载工作成果：${error.message}`;
+    }
+  }
+
+  function exportHistoryReport() {
+    const records = state.historyReport?.records;
+    if (!Array.isArray(records) || !records.length) {
+      setStatus('暂无可导出的工作成果记录', true);
+      return;
+    }
+    const blob = new Blob([buildHistoryReportHtml(state.historyReport)], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `题目分类工作成果-${new Date().toISOString().slice(0, 10)}.html`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setStatus(`已导出 ${records.length} 道题的工作成果报告。`);
+  }
+
+  async function captureHistoryReport() {
+    const records = state.historyReport?.records;
+    if (!Array.isArray(records) || !records.length || elements.captureHistory.disabled) return;
+    elements.captureHistory.disabled = true;
+    try {
+      const width = 720;
+      const outerMargin = 22;
+      const cardInsetX = 36;
+      const cardInsetTop = 38;
+      const cardInsetBottom = 36;
+      const titleHeight = 30;
+      const titleGap = 22;
+      const sectionGap = 18;
+      const tableHeaderHeight = 32;
+      const cardWidth = width - outerMargin * 2;
+      const contentWidth = cardWidth - cardInsetX * 2;
+      const columnWidths = [140, 232, 232];
+      const summary = state.historyReport.summary || {};
+      const topics = Array.isArray(summary.topics) ? summary.topics : [];
+      const fontFamily = '"Microsoft YaHei", "微软雅黑", sans-serif';
+      const measureCanvas = document.createElement('canvas');
+      const measure = measureCanvas.getContext('2d');
+      if (!measure) throw new Error('浏览器不支持截图渲染');
+      const wrap = (value, maxWidth) => {
+        const source = String(value || '—');
+        const lines = [];
+        let line = '';
+        for (const character of source) {
+          const candidate = line + character;
+          if (line && measure.measureText(candidate).width > maxWidth) {
+            lines.push(line);
+            line = character;
+          } else {
+            line = candidate;
+          }
+        }
+        if (line) lines.push(line);
+        return lines;
+      };
+      measure.font = `600 12px ${fontFamily}`;
+      const topicLines = wrap(topics.join(' · ') || '暂无', contentWidth - 206);
+      measure.font = `700 11px ${fontFamily}`;
+      const tableRows = records.map(record => {
+        const cells = [
+          wrap(record.stable_code || '未提取 Stable Code', columnWidths[0] - 16),
+          wrap(compactHistoryPath(record.original_path), columnWidths[1] - 16),
+          wrap(compactHistoryPath(record.target_path), columnWidths[2] - 16),
+        ];
+        return { cells, height: Math.max(34, Math.max(...cells.map(lines => lines.length)) * 17 + 14) };
+      });
+      const summaryHeight = Math.max(78, topicLines.length * 18 + 36);
+      const tableRowsHeight = tableRows.reduce((total, row) => total + row.height, 0);
+      const cardHeight = cardInsetTop + titleHeight + titleGap + summaryHeight
+        + sectionGap + tableHeaderHeight + tableRowsHeight + cardInsetBottom;
+      const height = outerMargin * 2 + cardHeight;
+      const scale = Math.min(2, 30000 / height);
+      if (height < 1 || scale < 0.5) throw new Error('记录过多，无法安全生成单张长图；请改用导出报告');
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(width * scale);
+      canvas.height = Math.round(height * scale);
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('浏览器不支持截图渲染');
+      context.scale(scale, scale);
+      const roundRect = (x, y, rectWidth, rectHeight, radius) => {
+        const r = Math.min(radius, rectWidth / 2, rectHeight / 2);
+        context.beginPath();
+        context.moveTo(x + r, y);
+        context.arcTo(x + rectWidth, y, x + rectWidth, y + rectHeight, r);
+        context.arcTo(x + rectWidth, y + rectHeight, x, y + rectHeight, r);
+        context.arcTo(x, y + rectHeight, x, y, r);
+        context.arcTo(x, y, x + rectWidth, y, r);
+        context.closePath();
+      };
+      const drawLines = (lines, x, y, lineHeight) => lines.forEach((line, index) => context.fillText(line, x, y + index * lineHeight));
+
+      context.fillStyle = '#f5f8f7';
+      context.fillRect(0, 0, width, height);
+      roundRect(outerMargin, outerMargin, cardWidth, cardHeight, 14);
+      context.fillStyle = '#ffffff';
+      context.fill();
+      context.strokeStyle = '#d7e1dd';
+      context.lineWidth = 1;
+      context.stroke();
+
+      const contentX = outerMargin + cardInsetX;
+      context.fillStyle = '#126b5c';
+      context.font = `700 24px ${fontFamily}`;
+      context.fillText('题目分类成果汇总', contentX, outerMargin + cardInsetTop + 26);
+
+      const summaryX = contentX;
+      const summaryWidth = contentWidth;
+      const countWidth = 148;
+      let y = outerMargin + cardInsetTop + titleHeight + titleGap;
+      roundRect(summaryX, y, countWidth, summaryHeight, 10);
+      context.fillStyle = '#e7f2ee';
+      context.fill();
+      context.strokeStyle = '#cfe2db';
+      context.stroke();
+      roundRect(summaryX + countWidth + 12, y, summaryWidth - countWidth - 12, summaryHeight, 10);
+      context.fillStyle = '#ffffff';
+      context.fill();
+      context.strokeStyle = '#dce7e3';
+      context.stroke();
+      context.fillStyle = '#4e6860';
+      context.font = `700 12px ${fontFamily}`;
+      context.fillText('已分类题目', summaryX + 13, y + 20);
+      context.fillStyle = '#0d6858';
+      context.font = `800 28px ${fontFamily}`;
+      context.fillText(String(Number(summary.classified_count) || 0), summaryX + 13, y + 52);
+      context.fillStyle = '#4e6860';
+      context.font = `700 12px ${fontFamily}`;
+      context.fillText('涉及专题', summaryX + countWidth + 25, y + 20);
+      context.fillStyle = '#1d6554';
+      context.font = `600 12px ${fontFamily}`;
+      drawLines(topicLines, summaryX + countWidth + 25, y + 43, 18);
+      y += summaryHeight + sectionGap;
+
+      const tableX = summaryX;
+      const tableWidth = summaryWidth;
+      context.fillStyle = '#eef4f1';
+      context.fillRect(tableX, y, tableWidth, tableHeaderHeight);
+      context.strokeStyle = '#dce7e3';
+      context.strokeRect(tableX, y, tableWidth, tableHeaderHeight);
+      context.beginPath();
+      context.moveTo(tableX + columnWidths[0], y);
+      context.lineTo(tableX + columnWidths[0], y + tableHeaderHeight);
+      context.moveTo(tableX + columnWidths[0] + columnWidths[1], y);
+      context.lineTo(tableX + columnWidths[0] + columnWidths[1], y + tableHeaderHeight);
+      context.stroke();
+      context.fillStyle = '#29453d';
+      context.font = `700 11px ${fontFamily}`;
+      context.fillText('Stable Code', tableX + 8, y + 20);
+      context.fillText('原目录', tableX + columnWidths[0] + 8, y + 20);
+      context.fillText('现目录', tableX + columnWidths[0] + columnWidths[1] + 8, y + 20);
+      y += tableHeaderHeight;
+
+      context.font = `600 11px ${fontFamily}`;
+      tableRows.forEach(row => {
+        context.fillStyle = '#ffffff';
+        context.fillRect(tableX, y, tableWidth, row.height);
+        context.strokeStyle = '#dce7e3';
+        context.strokeRect(tableX, y, tableWidth, row.height);
+        context.beginPath();
+        context.moveTo(tableX + columnWidths[0], y);
+        context.lineTo(tableX + columnWidths[0], y + row.height);
+        context.moveTo(tableX + columnWidths[0] + columnWidths[1], y);
+        context.lineTo(tableX + columnWidths[0] + columnWidths[1], y + row.height);
+        context.stroke();
+        context.fillStyle = '#29453d';
+        drawLines(row.cells[0], tableX + 8, y + 19, 17);
+        context.fillStyle = '#405650';
+        drawLines(row.cells[1], tableX + columnWidths[0] + 8, y + 19, 17);
+        drawLines(row.cells[2], tableX + columnWidths[0] + columnWidths[1] + 8, y + 19, 17);
+        y += row.height;
+      });
+      const png = await new Promise((resolve, reject) => canvas.toBlob(
+        blob => blob ? resolve(blob) : reject(new Error('截图编码失败')), 'image/png'
+      ));
+      const downloadUrl = URL.createObjectURL(png);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `题目分类成果汇总-${new Date().toISOString().slice(0, 10)}.png`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 0);
+      setStatus(`已生成 ${records.length} 道题的窄版高清长图。`);
+    } catch (error) {
+      setStatus(`一键截图失败：${error.message}`, true);
+    } finally {
+      elements.captureHistory.disabled = !state.historyReport?.records?.length;
+    }
   }
 
   function request(method, path, body, { timeoutMs = LOCAL_REQUEST_TIMEOUT_MS } = {}) {
@@ -428,6 +855,8 @@
       elements.routingModel.value = cloud.routing_model || '';
       elements.classificationReasoningEffort.value = cloud.reasoning_effort || 'high';
       elements.routingReasoningEffort.value = cloud.routing_reasoning_effort || 'medium';
+      elements.auditMode.value = cloud.audit_mode || 'conditional';
+      elements.maxConcurrentRequests.value = String(cloud.max_concurrent_requests || 3);
       elements.cloudBaseUrl.value = cloud.base_url || 'https://api.openai.com/v1';
       elements.cloudApiKey.value = '';
       const pageScope = detectPageScope(state.taxonomy);
@@ -466,6 +895,8 @@
         routing_model: normalizeWhitespace(elements.routingModel.value),
         reasoning_effort: elements.classificationReasoningEffort.value,
         routing_reasoning_effort: elements.routingReasoningEffort.value,
+        audit_mode: elements.auditMode.value,
+        max_concurrent_requests: Number(elements.maxConcurrentRequests.value),
         base_url: normalizeWhitespace(elements.cloudBaseUrl.value) || 'https://api.openai.com/v1',
       };
       const key = elements.cloudApiKey.value.trim();
@@ -481,7 +912,9 @@
   }
 
   async function fetchAttributeDocument(question) {
-    const response = await fetch(question.attributeUrl, { credentials: 'same-origin' });
+    // 用户脚本处于浏览器扩展隔离环境时，same-origin 可能不能稳定携带网页登录态。
+    // attributeUrl 已在采集时校验为题湖同源地址，因此可显式携带站点凭据；同时禁止复用旧属性响应。
+    const response = await fetch(question.attributeUrl, { credentials: 'include', cache: 'no-store' });
     if (!response.ok) throw new Error(`题目 ${question.exerciseId} 属性接口返回 HTTP ${response.status}`);
     const payload = await response.json();
     if (!payload || typeof payload.html !== 'string') throw new Error(`题目 ${question.exerciseId} 属性内容缺失`);
@@ -551,6 +984,19 @@
       nodes = Array.isArray(matched.child) ? matched.child : [];
     }
     return matched;
+  }
+
+  function currentNavigationCataloguePath() {
+    const selected = document.querySelector('.list-group .node-tree.node-selected');
+    const tree = selected?.closest('.list-group');
+    if (!selected || !tree) return [];
+    const nodes = [...tree.querySelectorAll('li.node-tree')];
+    const selectedIndex = nodes.indexOf(selected);
+    if (selectedIndex < 0) return [];
+    return navigationPathFromTreeRows(nodes.map(node => ({
+      name: node.querySelector(':scope > a')?.textContent || '',
+      depth: node.querySelectorAll(':scope > .indent').length,
+    })), selectedIndex);
   }
 
   function existingPathPrefix(path) {
@@ -709,7 +1155,7 @@
       event.stopPropagation();
       openManualEditor(result.exercise_id, badge);
     });
-    const routedTopic = result.routing?.latest_topic_title;
+    const routedTopic = result.routing?.routed_topic_title || result.routing?.latest_topic_title;
     const meta = document.createElement('small');
     meta.className = 'badge-meta';
     meta.textContent = result.accepted
@@ -718,11 +1164,11 @@
       ? '人工选择 · 待采纳'
       : result.status === 'review'
       ? result.review_reasons.join(' · ')
-      : `${routedTopic ? `最晚必备：${routedTopic} · ` : ''}置信度 ${Math.round(result.confidence * 100)}% · 待确认`;
+      : `${routedTopic ? `路由专题：${routedTopic} · ` : ''}置信度 ${Math.round(result.confidence * 100)}% · 待确认`;
     badge.append(header, path, meta);
     if (result.status === 'review') appendModelInputSnapshot(badge, result.model_input_snapshot);
 
-    if (result.status === 'suggested') {
+    if (canAcceptClassification(result)) {
       const action = document.createElement('button');
       action.className = 'badge-action';
       action.type = 'button';
@@ -743,7 +1189,7 @@
     if (state.accepting.has(exerciseId)) return;
     const result = state.results.get(exerciseId);
     const question = state.cards.get(exerciseId);
-    if (!result || result.status !== 'suggested' || !result.target?.path?.length) {
+    if (!canAcceptClassification(result)) {
       setStatus(`题目 ${exerciseId} 没有可采纳的完整建议路径`, true);
       return;
     }
@@ -753,7 +1199,6 @@
     }
 
     const isManual = result.manual_override?.source === 'manual';
-    const sourceCatalogueId = question.currentCatalogueId || '__uncategorized__';
     state.accepting.add(exerciseId);
     renderBadge(question.card, result);
     try {
@@ -765,9 +1210,15 @@
         throw new Error('属性表单题目 ID 与当前题卡不一致');
       }
       if (!catalogueField) throw new Error('属性表单缺少可视化分类字段');
+      const sourceCatalogueId = String(catalogueField.value || '').trim();
+      if (!sourceCatalogueId) throw new Error('属性表单缺少当前目录值');
+      const moved = sourceCatalogueId !== String(target.id);
+      // 工作成果描述的是人工从当前页面导航目录执行移动的过程，不使用题目内部目录 ID 反查名称。
+      const originalPath = moved ? currentNavigationCataloguePath() : [];
 
-      if (String(catalogueField.value) !== target.id) {
+      if (moved) {
         catalogueField.value = target.id;
+        const formPayload = buildCatalogueMovePayload(attribute.form, target.id);
         const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
         const headers = {
           Accept: 'application/json',
@@ -776,8 +1227,8 @@
         };
         if (csrfToken) headers['X-CSRF-TOKEN'] = csrfToken;
         const response = await fetch(sameOriginUrl(MODIFY_ENDPOINT), {
-          method: 'POST', credentials: 'same-origin', headers,
-          body: serializeSuccessfulControls(attribute.form).toString(),
+          method: 'POST', credentials: 'include', cache: 'no-store', headers,
+          body: formPayload.toString(),
         });
         const responseText = await response.text();
         let payload;
@@ -787,10 +1238,8 @@
           throw new Error(normalizeWhitespace(payload?.text) || `题湖提交失败（HTTP ${response.status}）`);
         }
       }
-
-      const verified = await fetchAttribute(question);
-      if (String(verified.currentCatalogueId) !== target.id) throw new Error('提交后回读的目录与建议目录不一致');
       let manualPersistenceError = '';
+      let historyPersistenceError = '';
       if (isManual) {
         try {
           await request('POST', '/api/v1/manual-classifications', {
@@ -801,8 +1250,23 @@
             target_path: result.target.path,
           });
         } catch (error) {
-          // 题湖已完成回读确认；本地审计失败不能把真实提交误报为失败。
+          // 题湖已返回修改成功；本地审计失败不能把真实提交误报为失败。
           manualPersistenceError = error.message;
+        }
+      }
+      if (moved) {
+        try {
+          await request('POST', '/api/v1/history/catalogue-moves', {
+            exercise_id: exerciseId,
+            stable_code: question.stableCode || '',
+            source_catalogue_id: sourceCatalogueId,
+            target_catalogue_id: String(target.id),
+            original_path: originalPath,
+            target_path: result.target.path,
+          });
+        } catch (error) {
+          // 题湖已返回修改成功，历史记录失败必须明确告知，但不能把真实移动误报为失败。
+          historyPersistenceError = error.message;
         }
       }
       state.cards.set(exerciseId, { ...question, currentCatalogueId: target.id });
@@ -815,8 +1279,12 @@
           ? { ...result.manual_override, pending: false, accepted_at: new Date().toISOString() }
           : result.manual_override,
       });
-      if (manualPersistenceError) {
-        setStatus(`题目 ${exerciseId} 已写入题湖，但人工修正记录保存失败：${manualPersistenceError}`, true);
+      if (manualPersistenceError || historyPersistenceError) {
+        const errors = [
+          manualPersistenceError && `人工修正记录保存失败：${manualPersistenceError}`,
+          historyPersistenceError && `工作成果记录保存失败：${historyPersistenceError}`,
+        ].filter(Boolean).join('；');
+        setStatus(`题目 ${exerciseId} 已写入题湖，但${errors}`, true);
       } else {
         setStatus(`题目 ${exerciseId} 已采纳建议并写入题湖可视化分类。`);
       }
@@ -931,7 +1399,7 @@
   }
 
   function classificationStageLabel(stage) {
-    return ({ queued: '建立本地作业', routing: '判断最晚必备专题', classifying: '专题内目录分类', completed: '整理结果' })[stage] || '分类';
+    return ({ queued: '建立本地作业', routing: '判断最终归属专题', classifying: '专题内目录分类', auditing: '独立审核分类依据', completed: '整理结果' })[stage] || '分类';
   }
 
   function applyClassificationJobSnapshot(job, cardById) {
@@ -1004,7 +1472,13 @@
     try {
       const cards = collectCards();
       const exerciseIds = [...new Set(cards.map(card => card.exerciseId))];
-      if (!window.confirm(`将清除当前页 ${exerciseIds.length} 道题目的本地分类缓存。下次识别会重新调用云端模型。确定继续吗？`)) return;
+      const confirmed = await confirmAction({
+        title: '清除本页缓存？',
+        message: `将清除当前页 ${exerciseIds.length} 道题目的本地分类缓存。下次识别会重新调用云端模型。`,
+        confirmLabel: '确认清除',
+        destructive: true,
+      });
+      if (!confirmed) return;
       state.cacheRestoreId += 1;
       setBusy(true);
       const response = await request('POST', '/api/v1/cache/classifications/delete', { exercise_ids: exerciseIds });
@@ -1033,7 +1507,12 @@
 
   async function submitBatch() {
     if (!state.batchJobId) return;
-    if (!window.confirm('将提交当前 JSONL 到云端模型并产生费用。确定继续吗？')) return;
+    const confirmed = await confirmAction({
+      title: '提交云端批处理？',
+      message: '将提交当前 JSONL 到云端模型并产生费用。',
+      confirmLabel: '确认提交',
+    });
+    if (!confirmed) return;
     setBusy(true);
     try {
       const job = await request('POST', '/api/v1/batches/submit', { job_id: state.batchJobId });
@@ -1066,8 +1545,22 @@
     elements.settings.focus({ preventScroll: true });
   });
   shadow.addEventListener('keydown', event => {
+    if (state.confirmation && event.key === 'Tab') {
+      event.preventDefault();
+      (event.shiftKey ? elements.confirmAccept : elements.confirmCancel).focus({ preventScroll: true });
+      return;
+    }
     if (event.key !== 'Escape') return;
-    if (!elements.settingsDrawer.hidden) {
+    if (state.confirmation) {
+      event.preventDefault();
+      closeConfirmation(false);
+      return;
+    }
+    if (!elements.historyView.hidden) {
+      closeHistory();
+      elements.history.focus({ preventScroll: true });
+    }
+    else if (!elements.settingsDrawer.hidden) {
       closeSettings();
       elements.settings.focus({ preventScroll: true });
     }
@@ -1075,7 +1568,19 @@
   });
   elements.saveCloud.addEventListener('click', saveCloudSettings);
   elements.classify.addEventListener('click', classifyPage);
+  elements.history.addEventListener('click', openHistory);
+  elements.backHistory.addEventListener('click', () => {
+    closeHistory();
+    elements.history.focus({ preventScroll: true });
+  });
+  elements.captureHistory.addEventListener('click', captureHistoryReport);
+  elements.exportHistory.addEventListener('click', exportHistoryReport);
   elements.clearCache.addEventListener('click', clearCurrentPageCache);
+  elements.confirmCancel.addEventListener('click', () => closeConfirmation(false));
+  elements.confirmAccept.addEventListener('click', () => closeConfirmation(true));
+  elements.confirmOverlay.addEventListener('click', event => {
+    if (event.target === elements.confirmOverlay) closeConfirmation(false);
+  });
   elements.exportBatch.addEventListener('click', exportBatch);
   elements.submitBatch.addEventListener('click', submitBatch);
   elements.syncBatch.addEventListener('click', syncBatch);

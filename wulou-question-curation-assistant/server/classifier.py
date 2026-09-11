@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import re
 from dataclasses import asdict
 from typing import Any
@@ -39,37 +38,6 @@ def _score(text: str, target: Target) -> int:
     if any(keyword and keyword in text for keyword in target.exclude_keywords):
         return -1
     return sum(1 for keyword in target.include_keywords if keyword and keyword in text)
-
-
-def _question_evidence(question: dict[str, Any]) -> str:
-    raw = "\n".join([
-        str(question.get("question_press", "")),
-        str(question.get("answer_press", "")),
-    ])
-    # 属性接口常返回 HTML；去掉标签后再做显式数学信号校验。
-    return normalize_text(html.unescape(re.sub(r"<[^>]+>", " ", raw)))
-
-
-def hard_signal_conflicts(
-    question: dict[str, Any], target: Target, taxonomy: Taxonomy, rules: dict[str, Any]
-) -> list[str]:
-    """拦截可由程序确定的 Skill 冲突，避免模型置信度掩盖明显错误。"""
-    evidence = _question_evidence(question)
-    target_text = " / ".join(filter(None, [target.topic_title, target.level2_title, target.level3_title, target.level4_title]))
-    conflicts: list[str] = []
-    for signal in rules.get("hard_signals") or []:
-        pattern = str(signal.get("pattern", ""))
-        if not pattern or not re.search(pattern, evidence):
-            continue
-        signal_id = str(signal.get("id", "unknown"))
-        minimum_marker = str(signal.get("minimum_topic_title_contains", ""))
-        minimum_order = taxonomy.minimum_topic_order_containing(minimum_marker) if minimum_marker else None
-        if minimum_order is not None and target.topic_order < minimum_order:
-            conflicts.append(f"later_prerequisite:{signal_id}")
-        conflict_pattern = str(signal.get("conflict_title_pattern", ""))
-        if conflict_pattern and re.search(conflict_pattern, target_text):
-            conflicts.append(f"directory_semantic_conflict:{signal_id}")
-    return conflicts
 
 
 def classify(question: dict[str, Any], taxonomy: Taxonomy, rules: dict[str, Any]) -> dict[str, Any]:
@@ -107,7 +75,7 @@ def classify(question: dict[str, Any], taxonomy: Taxonomy, rules: dict[str, Any]
         "review_reasons": ["cloud_model_required_for_skill_protocol"],
         "classification_method": "heuristic",
         "confidence": 0.0,
-        "reason": "规则关键词只能提供候选，未执行最晚必备知识点和语义审核",
+        "reason": "规则关键词只能提供候选，未执行专题路由和语义审核",
         "target": _target_payload(target),
         "proposal_required": False,
         "proposal_cluster_id": None,
@@ -138,13 +106,11 @@ def validate_model_decision(question: dict[str, Any], decision: dict[str, Any], 
     if routing:
         routing = dict(routing)
         routed_topic = taxonomy.topic(str(routing.get("latest_topic_id")))
-        routing["latest_topic_title"] = routed_topic["title"] if routed_topic else None
+        routing["routed_topic_title"] = routed_topic["title"] if routed_topic else None
+        # 兼容已缓存结果和旧版油猴脚本；新界面使用 routed_topic_title。
+        routing["latest_topic_title"] = routing["routed_topic_title"]
     if target and routing and routing.get("latest_topic_id") != target.topic_id:
         return _review_result(exercise_id, taxonomy, "专题路由与最终目录不一致", "routing_target_mismatch")
-    if target:
-        conflicts = hard_signal_conflicts(question, target, taxonomy, rules)
-        if conflicts:
-            return _review_result(exercise_id, taxonomy, "题目显式知识特征与建议目录冲突", conflicts[0])
     if target and target.level4_id and target.level3_knowledge_point_id:
         return _review_result(exercise_id, taxonomy, "父三级目录已有知识点编号，不能临时细分四级目录", "parent_knowledge_point_protection")
     proposal = decision.get("proposal") or {}
@@ -164,7 +130,7 @@ def validate_model_decision(question: dict[str, Any], decision: dict[str, Any], 
         review_reasons = review_reasons or ["model_review"]
     scope = question.get("scope") or {}
     if target and scope.get("topic_id") and scope.get("topic_id") != target.topic_id:
-        review_reasons.append("page_scope_differs_from_latest_prerequisite")
+        review_reasons.append("page_scope_differs_from_routed_topic")
     audit = decision.get("audit") if isinstance(decision.get("audit"), dict) else None
     if audit is not None and not audit.get("passed"):
         review_reasons.append("skill_audit_failed")

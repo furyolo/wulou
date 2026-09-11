@@ -58,6 +58,15 @@ class OpenAIChatCompletionsProvider:
         }
 
     @staticmethod
+    def _notation_instruction() -> str:
+        """统一数学表达式可判定性，避免把标准优先级误报为括号歧义。"""
+        return (
+            "按通行的中学数学运算优先级解释题干和答案：乘方优先于一元正负号，"
+            "未写括号的正负号不自动并入幂底。可由标准优先级唯一确定的表达式不得仅因未额外加括号而返回 review；"
+            "只有存在两个均符合题干、且不能由答案或上下文排除的解释时，才可判为表达式歧义。"
+        )
+
+    @staticmethod
     def _question(question: dict[str, Any]) -> dict[str, Any]:
         snapshot = build_model_input_snapshot(question)
         question_input = snapshot["question"]
@@ -74,6 +83,7 @@ class OpenAIChatCompletionsProvider:
             "answer_supplemental_text": answer_input["supplemental_text"],
             "answer_latex": answer_input["latex"],
             "answer_omitted_reason": answer_input.get("omitted_reason"),
+            "answer_part_numbering_mismatch": bool(answer_input.get("part_numbering_mismatch")),
             "input_warnings": snapshot["warnings"],
             "page_scope_hint": snapshot["page_scope_hint"],
             # 页面卡片文本通常重复题干，只保留少量网站标签作为弱证据。
@@ -97,6 +107,18 @@ class OpenAIChatCompletionsProvider:
             item.pop("exclude_keywords", None)
             rows.append(item)
         return rows
+
+    @staticmethod
+    def _candidate_id_schema(candidates: list[Target], attribute: str) -> dict[str, Any]:
+        """将目录目标限制为当前候选集合，禁止模型生成不存在的 ID。"""
+        valid_ids = sorted(
+            {
+                value
+                for target in candidates
+                if (value := getattr(target, attribute)) is not None
+            }
+        )
+        return {"type": ["string", "null"], "enum": [*valid_ids, None]}
 
     @staticmethod
     def _string_list(value: Any, fallback: list[str] | None = None) -> list[str]:
@@ -136,12 +158,13 @@ class OpenAIChatCompletionsProvider:
                 "topic_routing 不存在时，必须先在内部按相同规则完成全局专题判断。",
                 "信息不足、候选不唯一或需要图片时，status 必须为 review。",
                 "site_context 中的已贴知识点分组可作辅助证据；题干和答案与其冲突时，以题干和答案为准。",
-                "实际题干是分类主依据，答案只用于补充验证；答案被标记为疑似混入额外小题时必须忽略。",
+                "实际题干是分类主依据，答案用于补充验证。若答案编号与题干不一致，须判断答案的算式、变量、条件和结论是否与题干连续；只有明确属于独立题目时才忽略对应答案段落。",
                 "target_level3_id 必须来自 candidates；没有四级目录时 target_level4_id 为 null。",
                 "仅当命中的三级目录实际提供四级子目录时，才要求唯一匹配四级；三级没有四级子目录时，三级就是末级，不得因此返回 review。",
                 "input_warnings 表示排版可能不完整；只有缺失部分影响分类时才 review，不得凭此臆造答案含有另一道题。",
-                "answer_omitted_reason 为 suspected_extra_parts 且题干足以唯一分类时，不得仅因此返回 review。",
+                "不得只因编号结构不一致就丢弃答案或返回 review；题干公式在图片中缺失但答案可还原关键关系时，应使用该答案完成判断。",
                 "proposal 只可提出候选，不会创建目录；单题不应形成新目录。",
+                self._notation_instruction(),
             ],
         }
         schema = {
@@ -149,8 +172,8 @@ class OpenAIChatCompletionsProvider:
             "required": ["status", "target_level3_id", "target_level4_id", "confidence", "reason", "review_reasons", "proposal"],
             "properties": {
                 "status": {"type": "string", "enum": ["suggested", "review"]},
-                "target_level3_id": {"type": ["string", "null"]},
-                "target_level4_id": {"type": ["string", "null"]},
+                "target_level3_id": self._candidate_id_schema(candidates, "level3_id"),
+                "target_level4_id": self._candidate_id_schema(candidates, "level4_id"),
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "reason": {"type": "string"},
                 "review_reasons": {"type": "array", "items": {"type": "string"}},
@@ -173,16 +196,17 @@ class OpenAIChatCompletionsProvider:
         topics = taxonomy.topic_catalog()
         topic_ids = [item["id"] for item in topics]
         prompt = {
-            "task": "列出完整解题所需知识点，并选择目录顺序中最晚的必备专题。",
+            "task": "列出完整解题所需知识点，并按专题阶段规则选择最终归属专题。",
             "policy": self._policy(rules),
             "question": self._question(question),
             "all_topics_in_order": topics,
             "instructions": [
-                "先分析，再选专题；不得从 page_scope_hint 直接抄专题。",
+                "先分析，再选专题；不得从 page_scope_hint 直接抄专题。专题10之前的基础或前置知识专题按最晚必备知识点路由；从专题10“三角形”起及后续专题的【大题】按最终解题核心突破口路由。",
                 "all_topics_in_order 是完整候选范围。",
                 "含 sin、cos、tan、cot 或特殊角三角函数值时，必须把三角函数列为必备知识点。",
                 "题干、公式或答案不足时返回 review，不得猜测。",
-                "实际题干是专题路由主依据；疑似混入额外小题而被省略的答案不得改变专题，也不得单独触发 review。",
+                "实际题干是专题路由主依据；答案编号与题干不一致时，须检查算式、变量、条件和结论的数学连续性。答案可还原题干缺失公式时应使用；仅明确独立的答案段落才忽略。",
+                self._notation_instruction(),
             ],
         }
         schema = {
@@ -206,21 +230,22 @@ class OpenAIChatCompletionsProvider:
     def build_batch_routing_request(
         self, questions: list[dict[str, Any]], taxonomy: Any, rules: dict[str, Any]
     ) -> dict[str, Any]:
-        """第一阶段只判断最晚必备专题，固定目录内容位于动态题目前以便命中提示词缓存。"""
+        """第一阶段确定最终归属专题，固定目录内容位于动态题目前以便命中提示词缓存。"""
         if not questions or len(questions) > 10:
             raise ValueError("专题路由每次必须包含 1-10 道题")
         topics = taxonomy.topic_catalog()
         topic_ids = [item["id"] for item in topics]
         static_context = {
-            "task": "批量判断中考数学题的最晚必备专题。逐题独立执行 Skill 的专题顺序优先规则。",
+            "task": "批量确定中考数学题的最终归属专题。逐题独立执行 Skill 的分阶段路由规则。",
             "policy": self._policy(rules),
             "all_topics_in_order": topics,
             "instructions": [
-                "列出完整解题不可缺少的知识点，选择目录顺序中最晚的必备专题。",
+                "列出完整解题不可缺少的知识点。专题10之前的基础或前置知识专题选择目录顺序中最晚的必备专题；从专题10“三角形”起及后续专题的【大题】选择最终解题的核心突破口所属专题，不能因扇形面积、旋转、坐标或代数运算等辅助步骤改变归属。",
                 "网页目录只是弱提示；不得从 page_scope_hint 直接抄专题。",
                 "含 sin、cos、tan、cot 或特殊角三角函数值时，必须把三角函数列为必备知识点。",
                 "题干、公式或答案不足时返回 review，不得猜测；reason 仅保留短句。",
                 "input_warnings 仅用于判断信息是否足够；不得把排版警告误写成题干、答案存在另一道题。",
+                self._notation_instruction(),
             ],
         }
         dynamic_context = {"questions": [self._question(question) for question in questions]}
@@ -261,18 +286,22 @@ class OpenAIChatCompletionsProvider:
         if not questions or len(questions) > 10:
             raise ValueError("专题内分类每次必须包含 1-10 道题")
         catalog = taxonomy.classification_catalog_for_topic(topic_id)
+        candidates = taxonomy.candidates(topic_id, None)
         if len(catalog) != 1:
             raise ValueError("专题路由没有对应的可分类目录")
         static_context = {
-            "task": "将题目归入已确定专题的现有大题目录。只能选择给定目录，不能臆造已生效目录。",
+            "task": "复核专题路由后，将题目归入已确定专题的现有大题目录。只能选择给定目录，不能臆造已生效目录。",
             "policy": self._policy(rules),
+            "all_topics_in_order": taxonomy.topic_catalog(),
             "directory_catalog": catalog,
             "instructions": [
-                "专题已按最晚必备知识点确定，本步只在该专题内按首要数学对象确定三级、按主问或决定性条件确定四级。",
+                "先独立复核 topic_routing 是否符合分阶段规则：专题10之前检查是否遗漏更晚的必备专题；专题10及后续的【大题】检查是否把辅助步骤误作核心考点。发现任何疑点时 self_check_passed=false 并写明原因。",
+                "自检通过后，只在已路由专题内按首要数学对象确定三级、按主问或决定性条件确定四级。",
                 "显式符号与目录的含/不含语义冲突、候选不唯一或信息不足时必须返回 review。",
                 "仅当命中的三级目录有四级子目录时才匹配四级；没有四级子目录时三级即末级，target_level4_id 必须为 null。",
-                "input_warnings 仅用于判断信息是否足够；不得据此臆造题干、答案含有另一道题。",
+                "input_warnings 仅提示输入风险；答案编号与题干不一致时，须依据数学连续性判断是否属于同一道题，不得直接丢弃答案。",
                 "新目录只能作为候选，单道题不得创建新目录；reason 仅保留短句。",
+                self._notation_instruction(),
             ],
         }
         dynamic_context = {
@@ -298,16 +327,20 @@ class OpenAIChatCompletionsProvider:
         }
         item_schema = {
             "type": "object", "additionalProperties": False,
-            "required": ["exercise_id", "status", "target_level3_id", "target_level4_id", "confidence", "reason", "review_reasons", "proposal"],
+            "required": ["exercise_id", "status", "target_level3_id", "target_level4_id", "confidence", "reason", "review_reasons", "proposal", "self_check_passed", "self_check_violations", "self_check_reason", "self_check_confidence"],
             "properties": {
                 "exercise_id": {"type": "string"},
                 "status": {"type": "string", "enum": ["suggested", "review"]},
-                "target_level3_id": {"type": ["string", "null"]},
-                "target_level4_id": {"type": ["string", "null"]},
+                "target_level3_id": self._candidate_id_schema(candidates, "level3_id"),
+                "target_level4_id": self._candidate_id_schema(candidates, "level4_id"),
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "reason": {"type": "string"},
                 "review_reasons": {"type": "array", "items": {"type": "string"}},
                 "proposal": proposal_schema,
+                "self_check_passed": {"type": "boolean"},
+                "self_check_violations": {"type": "array", "items": {"type": "string"}},
+                "self_check_reason": {"type": "string"},
+                "self_check_confidence": {"type": "number", "minimum": 0, "maximum": 1},
             },
         }
         schema = {
@@ -328,26 +361,35 @@ class OpenAIChatCompletionsProvider:
         rows = self._batch_rows(self._decode(self._request("POST", "/responses", request)), questions, "专题内分类")
         for row in rows:
             row["routing"] = routings[str(row["exercise_id"])]
+            row["self_check"] = {
+                "passed": self._boolean(row.pop("self_check_passed"), "self_check_passed"),
+                "violations": self._string_list(row.pop("self_check_violations")),
+                "reason": str(row.pop("self_check_reason")),
+                "confidence": self._confidence(row.pop("self_check_confidence")),
+            }
             row["audit"] = None
         return rows
 
     def build_audit_request(
-        self, question: dict[str, Any], routing: dict[str, Any], decision: dict[str, Any], target: Target, rules: dict[str, Any]
+        self, question: dict[str, Any], routing: dict[str, Any], decision: dict[str, Any], target: Target,
+        taxonomy: Any, rules: dict[str, Any]
     ) -> dict[str, Any]:
-        """让独立一次模型调用主动寻找能推翻建议分类的证据。"""
+        """让独立一次模型调用从全量专题中寻找能推翻建议分类的证据。"""
         prompt = {
-            "task": "独立审核建议分类是否严格符合 Skill；重点寻找反例和遗漏的更晚必备知识点。",
+            "task": "独立审核建议分类是否严格符合 Skill；重点寻找错判分类阶段、错误核心考点或遗漏的前置知识。",
             "policy": self._policy(rules),
             "question": self._question(question),
+            "all_topics_in_order": taxonomy.topic_catalog(),
             "topic_routing": routing,
             "proposed_decision": decision,
             "proposed_target": self._candidate_rows([target])[0],
             "checks": [
-                "是否遗漏目录顺序更靠后的必备专题",
+                "基础或前置知识专题是否遗漏目录顺序更靠后的必备专题；专题10及后续专题的【大题】是否错误地把辅助步骤当成核心考点",
                 "三级是否按首要数学对象或情境划分",
                 "四级是否按主问或决定性条件划分",
                 "显式符号或运算是否与目录的含/不含语义冲突",
                 "是否能够唯一命中",
+                self._notation_instruction(),
             ],
         }
         schema = {
@@ -362,23 +404,81 @@ class OpenAIChatCompletionsProvider:
         }
         return self._structured_request("math_classification_audit", prompt, schema)
 
+    def build_batch_audit_request(
+        self, items: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Target]], taxonomy: Any, rules: dict[str, Any]
+    ) -> dict[str, Any]:
+        """批量独立审核路由和专题内分类，避免把数学语义写死为本地特判。"""
+        if not items or len(items) > 10:
+            raise ValueError("独立审核每次必须包含 1-10 道题")
+        static_context = {
+            "task": "独立审核中考数学题的专题与目录建议。逐题从完整专题目录和实际题干出发，不得依赖任何硬编码知识点特判。",
+            "policy": self._policy(rules),
+            "all_topics_in_order": taxonomy.topic_catalog(),
+            "checks": [
+                "完整列举并核对必备知识点，而非仅检查预设知识词",
+                "专题10之前的基础或前置知识专题是否遗漏最晚必备知识点",
+                "专题10及后续专题的【大题】是否把扇形面积、旋转、坐标或代数运算等辅助步骤误当成核心考点",
+                "去掉候选核心知识点后，主结论的证明或求解主线是否失效",
+                "三级是否按首要数学对象或情境划分，四级是否按主问或决定性条件划分，且是否唯一命中",
+                self._notation_instruction(),
+            ],
+        }
+        dynamic_context = {
+            "items": [
+                {
+                    "exercise_id": str(question["exercise_id"]),
+                    "question": self._question(question),
+                    "topic_routing": routing,
+                    "proposed_decision": decision,
+                    "proposed_target": self._candidate_rows([target])[0],
+                }
+                for question, routing, decision, target in items
+            ],
+        }
+        item_schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["exercise_id", "passed", "violations", "reason", "confidence"],
+            "properties": {
+                "exercise_id": {"type": "string"},
+                "passed": {"type": "boolean"},
+                "violations": {"type": "array", "items": {"type": "string"}},
+                "reason": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        }
+        schema = {
+            "type": "object", "additionalProperties": False, "required": ["results"],
+            "properties": {"results": {"type": "array", "minItems": len(items), "maxItems": len(items), "items": item_schema}},
+        }
+        return self._staged_structured_request("math_batch_classification_audit", static_context, dynamic_context, schema)
+
+    def audit_batch(
+        self, items: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Target]], taxonomy: Any, rules: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        request = self.build_batch_audit_request(items, taxonomy, rules)
+        payload = self._decode(self._request("POST", "/responses", request))
+        return self._batch_rows(payload, [item[0] for item in items], "独立审核")
+
     def build_fast_batch_request(
         self, questions: list[dict[str, Any]], taxonomy: Any, rules: dict[str, Any]
     ) -> dict[str, Any]:
         """构造整页快速模式请求；每道题仍需独立给出知识分析和自审结果。"""
+        candidates = taxonomy.all_targets()
+        topic_ids = [item["id"] for item in taxonomy.topic_catalog()]
         prompt = {
             "task": "批量分类中考数学题。逐题独立执行完整 Skill 决策协议并返回结果，不得让相邻题目互相影响。",
             "policy": self._policy(rules),
             "directory_catalog": taxonomy.classification_catalog(),
             "instructions": [
-                "每题先列出完整必备知识点，再选择目录顺序中最晚的必备专题。",
+                "每题先列出完整必备知识点，再按分阶段规则选专题：专题10之前按最晚必备知识点；从专题10“三角形”起及后续专题的【大题】按最终解题核心突破口，辅助的扇形面积、旋转、坐标或代数运算不得改变归属。",
                 "page_scope_hint 和 site_context 只作弱提示；与实际题目冲突时必须忽略。",
                 "在选定专题内，按首要数学对象确定三级，按主问或决定性条件确定四级。",
                 "逐题检查显式符号与目录的含/不含语义；无法唯一命中时返回 review。",
                 "仅对存在四级子目录的三级目录执行四级唯一匹配；无四级子目录时三级即末级，不得作为复核理由。",
-                "input_warnings 表示排版风险；不得据此臆造题干、答案含有另一道题。",
-                "实际题干是分类主依据；answer_omitted_reason 为 suspected_extra_parts 时忽略被污染答案，题干足够时继续分类。",
+                "input_warnings 表示排版风险；答案编号与题干不一致时，须依据数学连续性判断是否属于同一道题，不得直接丢弃答案。",
+                "实际题干是分类主依据；题干公式缺失但答案能还原关键关系时，可使用对应答案完成分类；答案明确属于独立题目时才忽略该段。",
                 "只返回 JSON；知识点和说明使用短语，reason 限一短句，不输出推理过程。",
+                self._notation_instruction(),
                 "results 必须恰好包含每个 exercise_id 一次。",
             ],
             # 目录和规则在前、动态题目在后，使支持精确前缀缓存的兼容网关可以复用固定上下文。
@@ -396,13 +496,12 @@ class OpenAIChatCompletionsProvider:
                 "exercise_id": {"type": "string"},
                 "status": {"type": "string", "enum": ["suggested", "review"]},
                 "required_knowledge_points": {"type": "array", "items": {"type": "string"}},
-                # 合法 ID 在服务端按真实目录二次校验，避免把全部 ID 再复制进 Schema。
-                "latest_topic_id": {"type": ["string", "null"]},
+                "latest_topic_id": {"type": ["string", "null"], "enum": [*topic_ids, None]},
                 "primary_object": {"type": "string"},
                 "main_question": {"type": "string"},
                 "decisive_condition": {"type": "string"},
-                "target_level3_id": {"type": ["string", "null"]},
-                "target_level4_id": {"type": ["string", "null"]},
+                "target_level3_id": self._candidate_id_schema(candidates, "level3_id"),
+                "target_level4_id": self._candidate_id_schema(candidates, "level4_id"),
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "reason": {"type": "string"},
                 "review_reasons": {"type": "array", "items": {"type": "string"}},
@@ -509,27 +608,60 @@ class OpenAIChatCompletionsProvider:
             raise CloudProviderError(f"云端模型没有返回全部{label}结果")
         return [by_id[exercise_id] for exercise_id in expected_ids]
 
-    def classify(self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any]) -> dict[str, Any]:
-        """实时精准分类：全局路由、专题内分类、独立审核。"""
+    def _requires_independent_audit(
+        self, question: dict[str, Any], decision: dict[str, Any], target: Target, rules: dict[str, Any], audit_mode: str
+    ) -> bool:
+        """兼容单题接口的条件审核判断，与交互式作业保持相同的风险边界。"""
+        if audit_mode == "always":
+            return True
+        self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else None
+        if not self_check or self_check.get("passed") is not True:
+            return True
+        warnings = set(self._question(question).get("input_warnings") or [])
+        if warnings - {"answer_text_missing"}:
+            return True
+        core_start = int((rules.get("rules") or {}).get("large_question_core_topic_start_order", 10))
+        return target.topic_order < core_start or (
+            target.topic_order >= core_start and str(target.level2_title) == "【大题】"
+        )
+
+    @staticmethod
+    def _self_check_audit(decision: dict[str, Any]) -> dict[str, Any]:
+        self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else {}
+        return {
+            "mode": "second_stage_self_check",
+            "passed": self_check.get("passed") is True,
+            "violations": list(self_check.get("violations") or []),
+            "reason": str(self_check.get("reason") or "第二阶段自检通过，未触发独立审核"),
+            "confidence": self_check.get("confidence"),
+        }
+
+    def classify(
+        self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any], audit_mode: str = "conditional"
+    ) -> dict[str, Any]:
+        """实时精准分类：全局路由、专题内分类与自检，必要时独立审核。"""
         routing = self._decode(self._request("POST", "/responses", self.build_routing_request(question, taxonomy, rules)))
         topic_id = routing.get("latest_topic_id")
         if routing.get("status") != "routed" or not taxonomy.topic(str(topic_id)):
             return {
                 "status": "review", "target_level3_id": None, "target_level4_id": None,
-                "confidence": 0.0, "reason": str(routing.get("reason") or "无法确定最晚必备专题"),
+                "confidence": 0.0, "reason": str(routing.get("reason") or "无法确定最终归属专题"),
                 "review_reasons": self._string_list(routing.get("review_reasons")) or ["topic_routing_failed"],
                 "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
                 "routing": routing, "audit": None,
             }
-        candidates = taxonomy.candidates(str(topic_id), None)
-        decision = self._decode(self._request("POST", "/responses", self.build_request(question, candidates, rules, routing)))
-        decision["routing"] = routing
+        decision = self.classify_topic_batch(
+            [question], str(topic_id), taxonomy, rules, {str(question["exercise_id"]): routing}
+        )[0]
         target = taxonomy.global_target(str(decision.get("target_level3_id")), decision.get("target_level4_id")) if decision.get("target_level3_id") else None
         if decision.get("status") != "suggested" or not target or target.topic_id != str(topic_id):
             decision["audit"] = None
             return decision
+        if not self._requires_independent_audit(question, decision, target, rules, audit_mode):
+            decision["audit"] = self._self_check_audit(decision)
+            return decision
         try:
-            audit = self._decode(self._request("POST", "/responses", self.build_audit_request(question, routing, decision, target, rules)))
+            audit = self._decode(self._request("POST", "/responses", self.build_audit_request(question, routing, decision, target, taxonomy, rules)))
         except CloudProviderError as error:
             # 前两阶段已有可检查的候选时，审核服务失败不应把整题变成 500 或丢失候选。
             decision["status"] = "review"

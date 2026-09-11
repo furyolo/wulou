@@ -87,6 +87,38 @@ class ResultCacheTests(unittest.TestCase):
             self.assertIsNotNone(cache.get_manual_override("exercise-1", "level4-a"))
             cache.close()
 
+    def test_catalogue_move_report_keeps_only_latest_move_per_question(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ResultCache(Path(directory) / "cache.sqlite3")
+            cache.record_catalogue_move(
+                exercise_id="exercise-1", stable_code="CS2026MOVE001",
+                source_catalogue_id="old-leaf", target_catalogue_id="middle-leaf",
+                original_path=["专题1：实数", "【大题】", "旧三级", "旧四级"],
+                target_path=["专题4：分式方程与不等式", "【大题】", "解不等式", "考法1"],
+            )
+            cache.record_catalogue_move(
+                exercise_id="exercise-1", stable_code="CS2026MOVE001",
+                source_catalogue_id="middle-leaf", target_catalogue_id="new-leaf",
+                original_path=["专题4：分式方程与不等式", "【大题】", "解不等式", "考法1"],
+                target_path=["专题10：三角形", "【大题】", "全等三角形", "考法2"],
+            )
+            cache.record_catalogue_move(
+                exercise_id="exercise-2", stable_code="CS2026MOVE002",
+                source_catalogue_id="old-leaf-2", target_catalogue_id="new-leaf-2",
+                original_path=["专题1：实数", "【大题】", "旧三级"],
+                target_path=["专题4：分式方程与不等式", "【大题】", "解不等式"],
+            )
+
+            report = cache.catalogue_move_report()
+            self.assertEqual(report["summary"]["classified_count"], 2)
+            self.assertEqual(report["summary"]["topics"], ["专题10：三角形", "专题4：分式方程与不等式"])
+            latest = next(item for item in report["records"] if item["stable_code"] == "CS2026MOVE001")
+            self.assertEqual(latest["original_path"][0], "专题4：分式方程与不等式")
+            self.assertEqual(latest["target_path"][0], "专题10：三角形")
+            self.assertEqual(cache.delete_by_exercise_ids(["exercise-1", "exercise-2"]), 0)
+            self.assertEqual(cache.catalogue_move_report()["summary"]["classified_count"], 2)
+            cache.close()
+
     def test_legacy_cache_table_is_preserved_during_schema_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.sqlite3"

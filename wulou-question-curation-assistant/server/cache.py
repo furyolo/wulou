@@ -16,6 +16,7 @@ class ResultCache:
     _LEGACY_TABLE = "classification_results_legacy_v1"
     _MANUAL_TABLE = "manual_classification_overrides"
     _MANUAL_AUDIT_TABLE = "manual_classification_audit"
+    _MOVE_HISTORY_TABLE = "catalogue_move_history"
 
     def __init__(self, database_path: Path) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +94,25 @@ class ResultCache:
             )
             self._connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_stable_code ON {self._MANUAL_TABLE}(stable_code)"
+            )
+            # 工作成果只记录题湖已经回读确认的真实移动，独立于可清除的模型缓存。
+            self._connection.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._MOVE_HISTORY_TABLE} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exercise_id TEXT NOT NULL,
+                    stable_code TEXT,
+                    source_catalogue_id TEXT NOT NULL,
+                    target_catalogue_id TEXT NOT NULL,
+                    original_path_json TEXT NOT NULL,
+                    target_path_json TEXT NOT NULL,
+                    moved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            self._connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self._MOVE_HISTORY_TABLE}_exercise_moved "
+                f"ON {self._MOVE_HISTORY_TABLE}(exercise_id, moved_at DESC, id DESC)"
             )
             self._connection.commit()
 
@@ -214,6 +234,69 @@ class ResultCache:
         if not override:
             raise RuntimeError("人工修正保存后无法读取")
         return override
+
+    def record_catalogue_move(
+        self,
+        *,
+        exercise_id: str,
+        stable_code: str,
+        source_catalogue_id: str,
+        target_catalogue_id: str,
+        original_path: list[str],
+        target_path: list[str],
+    ) -> dict[str, Any]:
+        """追加一次已由题湖回读确认的目录移动，不受缓存清理影响。"""
+        if source_catalogue_id == target_catalogue_id:
+            raise ValueError("原目录与目标目录相同，不应记录为移动")
+        with self._lock:
+            cursor = self._connection.execute(
+                f"""
+                INSERT INTO {self._MOVE_HISTORY_TABLE} (
+                    exercise_id, stable_code, source_catalogue_id, target_catalogue_id,
+                    original_path_json, target_path_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    exercise_id,
+                    stable_code.strip() or None,
+                    source_catalogue_id,
+                    target_catalogue_id,
+                    json.dumps(original_path, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(target_path, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                f"SELECT moved_at FROM {self._MOVE_HISTORY_TABLE} WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        return {"record_id": cursor.lastrowid, "moved_at": row[0]}
+
+    def catalogue_move_report(self) -> dict[str, Any]:
+        """按题目保留最近一次移动，用于工作成果汇报。"""
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT exercise_id, stable_code, original_path_json, target_path_json, moved_at
+                FROM {self._MOVE_HISTORY_TABLE}
+                ORDER BY moved_at DESC, id DESC
+                """
+            ).fetchall()
+        latest_by_exercise: dict[str, dict[str, Any]] = {}
+        for exercise_id, stable_code, original_json, target_json, moved_at in rows:
+            if exercise_id in latest_by_exercise:
+                continue
+            latest_by_exercise[exercise_id] = {
+                "stable_code": stable_code or "",
+                "original_path": json.loads(original_json),
+                "target_path": json.loads(target_json),
+                "moved_at": moved_at,
+            }
+        records = list(latest_by_exercise.values())
+        topics = sorted({record["target_path"][0] for record in records if record["target_path"]})
+        return {
+            "summary": {"classified_count": len(records), "topics": topics},
+            "records": records,
+        }
 
     def close(self) -> None:
         with self._lock:
