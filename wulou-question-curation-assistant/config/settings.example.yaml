@@ -15,8 +15,8 @@ classifier:
   #   routing_model: 可选；填写更快的云端模型名，用于第一阶段专题路由
   #   reasoning_effort: high
   #   routing_reasoning_effort: medium
-  #   audit_mode: conditional  # conditional（推荐）或 always
-  #   max_concurrent_requests: 3  # 1–5；路由、分类与审核共享总并发
+  #   audit_mode: disabled  # disabled（默认）、conditional 或 always
+  #   max_concurrent_requests: 3  # 1–5；路由、分类与按需审核共享总并发
   #   api_key_env: OPENAI_API_KEY
   #   base_url: https://api.openai.com/v1
   #   timeout_seconds: 600

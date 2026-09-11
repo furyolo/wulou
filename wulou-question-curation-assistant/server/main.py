@@ -264,7 +264,7 @@ class ServiceState:
         routing_model = str(payload.get("routing_model", "")).strip()
         reasoning_effort = str(payload.get("reasoning_effort", "high")).strip().lower()
         routing_reasoning_effort = str(payload.get("routing_reasoning_effort", "medium")).strip().lower()
-        audit_mode = str(payload.get("audit_mode", "conditional")).strip().lower()
+        audit_mode = str(payload.get("audit_mode", "disabled")).strip().lower()
         try:
             max_concurrent_requests = int(payload.get("max_concurrent_requests", existing_cloud.get("max_concurrent_requests", 3)))
         except (TypeError, ValueError) as error:
@@ -278,8 +278,8 @@ class ServiceState:
             raise ValueError("目录分类推理强度必须是 none、low、medium、high、xhigh 或 max")
         if routing_reasoning_effort not in allowed_efforts:
             raise ValueError("专题路由推理强度必须是 none、low、medium、high、xhigh 或 max")
-        if audit_mode not in {"conditional", "always"}:
-            raise ValueError("审核策略必须是 conditional 或 always")
+        if audit_mode not in {"disabled", "conditional", "always"}:
+            raise ValueError("审核策略必须是 disabled、conditional 或 always")
         if not 1 <= max_concurrent_requests <= 5:
             raise ValueError("LLM 并发数必须是 1 到 5")
         if not base_url.startswith(("https://", "http://")): raise ValueError("接口地址必须以 http:// 或 https:// 开头")
@@ -325,10 +325,10 @@ class ServiceState:
         return OpenAIChatCompletionsProvider(routing_settings)
 
     def audit_mode(self) -> str:
-        """条件审核为默认值；未知旧配置也安全降级为条件审核。"""
+        """默认只执行前两阶段；旧配置缺失时同样不额外产生第三次模型请求。"""
         cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
-        mode = str(cloud_settings.get("audit_mode", "conditional")).strip().lower()
-        return mode if mode in {"conditional", "always"} else "conditional"
+        mode = str(cloud_settings.get("audit_mode", "disabled")).strip().lower()
+        return mode if mode in {"disabled", "conditional", "always"} else "disabled"
 
     def llm_concurrency(self) -> int:
         """限制整条实时流水线的总在途请求数，保护网关免受突发并发冲击。"""
@@ -343,6 +343,8 @@ class ServiceState:
         self, question: dict[str, Any], decision: dict[str, Any], target: Any
     ) -> bool:
         """只以 Skill 定义的高风险结构和 LLM 自检结果决定是否追加独立审核。"""
+        if self.audit_mode() == "disabled":
+            return False
         if self.audit_mode() == "always":
             return True
         self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else None
@@ -368,6 +370,17 @@ class ServiceState:
             "violations": list(self_check.get("violations") or []),
             "reason": str(self_check.get("reason") or "第二阶段自检通过，未触发独立审核"),
             "confidence": self_check.get("confidence"),
+        }
+
+    @staticmethod
+    def _disabled_audit() -> dict[str, Any]:
+        """显式标记用户关闭了第三阶段，避免将其误读成一次审核通过。"""
+        return {
+            "mode": "disabled",
+            "passed": None,
+            "violations": [],
+            "reason": "独立审核已关闭；当前仅执行专题路由与目录分类自检",
+            "confidence": None,
         }
 
     def create_classification_job(self, questions: Any) -> dict[str, Any]:
@@ -539,7 +552,10 @@ class ServiceState:
                                             routing = decision.get("routing") if isinstance(decision.get("routing"), dict) else {}
                                             audit_items.append((question, routing, decision, target))
                                         else:
-                                            decision["audit"] = self._self_check_audit(decision)
+                                            decision["audit"] = (
+                                                self._disabled_audit() if self.audit_mode() == "disabled"
+                                                else self._self_check_audit(decision)
+                                            )
                                 if audit_items:
                                     audit_queue.append((batch, decisions, audit_items))
                                 else:

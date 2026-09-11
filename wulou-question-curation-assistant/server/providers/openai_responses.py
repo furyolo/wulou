@@ -612,6 +612,8 @@ class OpenAIChatCompletionsProvider:
         self, question: dict[str, Any], decision: dict[str, Any], target: Target, rules: dict[str, Any], audit_mode: str
     ) -> bool:
         """兼容单题接口的条件审核判断，与交互式作业保持相同的风险边界。"""
+        if audit_mode == "disabled":
+            return False
         if audit_mode == "always":
             return True
         self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else None
@@ -636,8 +638,18 @@ class OpenAIChatCompletionsProvider:
             "confidence": self_check.get("confidence"),
         }
 
+    @staticmethod
+    def _disabled_audit() -> dict[str, Any]:
+        return {
+            "mode": "disabled",
+            "passed": None,
+            "violations": [],
+            "reason": "独立审核已关闭；当前仅执行专题路由与目录分类自检",
+            "confidence": None,
+        }
+
     def classify(
-        self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any], audit_mode: str = "conditional"
+        self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any], audit_mode: str = "disabled"
     ) -> dict[str, Any]:
         """实时精准分类：全局路由、专题内分类与自检，必要时独立审核。"""
         routing = self._decode(self._request("POST", "/responses", self.build_routing_request(question, taxonomy, rules)))
@@ -658,7 +670,7 @@ class OpenAIChatCompletionsProvider:
             decision["audit"] = None
             return decision
         if not self._requires_independent_audit(question, decision, target, rules, audit_mode):
-            decision["audit"] = self._self_check_audit(decision)
+            decision["audit"] = self._disabled_audit() if audit_mode == "disabled" else self._self_check_audit(decision)
             return decision
         try:
             audit = self._decode(self._request("POST", "/responses", self.build_audit_request(question, routing, decision, target, taxonomy, rules)))

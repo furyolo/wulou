@@ -15,6 +15,7 @@ const {
   buildHistoryReportHtml,
   compactHistoryPath,
   sourceTextWithoutAssistant,
+  pendingAcceptanceItems,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
 test('标准化题干空白', () => {
@@ -78,12 +79,24 @@ test('异常分类字段会被规范为可渲染的复核结果', () => {
   assert.equal(result.target, null);
 });
 
-test('待复核结果有完整目录路径时可由人工一键采纳', () => {
+test('待复核结果有完整目录路径时可由人工采纳', () => {
   const target = { path: ['专题12：锐角三角函数', '【大题】', '实数综合计算（含三角比）'] };
   assert.equal(canAcceptClassification({ status: 'suggested', target }), true);
   assert.equal(canAcceptClassification({ status: 'review', target }), true);
   assert.equal(canAcceptClassification({ status: 'review', target: null }), false);
   assert.equal(canAcceptClassification({ status: 'unknown', target }), false);
+});
+
+test('全部采纳只收集当前尚未采纳且目录路径完整的建议', () => {
+  const target = { path: ['专题12：锐角三角函数', '【大题】', '实数综合计算（含三角比）'] };
+  const items = pendingAcceptanceItems([
+    ['1', { exercise_id: '1', status: 'suggested', target }],
+    ['2', { exercise_id: '2', status: 'review', target }],
+    ['3', { exercise_id: '3', status: 'suggested', target, accepted: true }],
+    ['4', { exercise_id: '4', status: 'suggested', target: null }],
+    ['1', { exercise_id: '1', status: 'suggested', target }],
+  ]);
+  assert.deepEqual(items.map(item => item.exerciseId), ['1', '2']);
 });
 
 test('按完整层级路径唯一解析题湖目录 ID', () => {

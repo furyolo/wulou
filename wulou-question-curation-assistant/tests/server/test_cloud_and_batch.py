@@ -241,13 +241,25 @@ class CloudAndBatchTests(unittest.TestCase):
             },
             {"passed": True, "violations": [], "reason": "未发现冲突", "confidence": 0.95},
         ])
-        decision = provider.classify(self.question, self.taxonomy, {"rule_version": "skill-v1"})
+        decision = provider.classify(self.question, self.taxonomy, {"rule_version": "skill-v1"}, audit_mode="always")
         self.assertEqual(provider.request_names, [
             "math_topic_routing", "math_topic_batch_classification", "math_classification_audit",
         ])
         self.assertEqual(decision["routing"]["latest_topic_id"], target.topic_id)
         self.assertTrue(decision["audit"]["passed"])
         self.assertEqual(decision["confidence"], 0.95)
+
+    def test_disabled_audit_stops_after_routing_and_directory_classification(self) -> None:
+        target = self.taxonomy.all_targets()[0]
+        decision = {
+            "self_check": {"passed": False, "violations": ["需复核"]},
+        }
+        self.assertFalse(self.provider._requires_independent_audit(
+            self.question, decision, target, {"rules": {}}, "disabled"
+        ))
+        disabled = self.provider._disabled_audit()
+        self.assertEqual(disabled["mode"], "disabled")
+        self.assertIsNone(disabled["passed"])
 
     def test_non_object_model_json_is_reported_as_cloud_error(self) -> None:
         response = {"status": "completed", "output_text": "[]"}
@@ -286,7 +298,9 @@ class CloudAndBatchTests(unittest.TestCase):
                 content = {"results": [value]} if request_name == "math_topic_batch_classification" else value
                 return {"status": "completed", "output_text": json.dumps(content, ensure_ascii=False)}
 
-        decision = AuditFailureProvider().classify(self.question, self.taxonomy, {"rule_version": "skill-v1"})
+        decision = AuditFailureProvider().classify(
+            self.question, self.taxonomy, {"rule_version": "skill-v1"}, audit_mode="always"
+        )
         self.assertEqual(decision["status"], "review")
         self.assertEqual(decision["target_level3_id"], target.level3_id)
         self.assertIn("audit_request_failed", decision["review_reasons"])

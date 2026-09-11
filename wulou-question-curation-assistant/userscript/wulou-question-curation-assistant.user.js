@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         题湖题库数学题分类助手
 // @namespace    https://www.wulouai.com/
-// @version      0.8.0
+// @version      0.9.0
 // @description  采集当前题目页，显示分类建议，并可将确认后的建议写入题湖可视化分类。
 // @match        https://www.wulouai.com/user-center/exercise-part/*
 // @grant        GM_xmlhttpRequest
@@ -19,6 +19,9 @@
   const PANEL_ID = 'wulou-question-curation-panel';
   const BADGE_CLASS = 'wulou-curation-badge';
   const ATTRIBUTE_CONCURRENCY = 3;
+  // 题湖没有已验证的批量写入接口，因此沿用单题接口并限制浏览器端并发，
+  // 避免一次性请求过多导致登录态、CSRF 或站点限流问题。
+  const ACCEPTANCE_CONCURRENCY = 3;
   const LOCAL_REQUEST_TIMEOUT_MS = 30000;
   const CLASSIFICATION_JOB_POLL_INTERVAL_MS = 2000;
   const MODIFY_ENDPOINT = '/exercise/modifyData';
@@ -249,6 +252,19 @@
     );
   }
 
+  // 只返回尚未写入题湖、且拥有完整目录路径的建议。这个口径同时服务于
+  // 主面板的计数、确认提示与实际批量提交，避免三处规则发生偏差。
+  function pendingAcceptanceItems(entries) {
+    const seen = new Set();
+    return (Array.isArray(entries) ? entries : [])
+      .map(([exerciseId, result]) => ({ exerciseId: normalizeWhitespace(exerciseId || result?.exercise_id), result }))
+      .filter(({ exerciseId, result }) => {
+        if (!exerciseId || seen.has(exerciseId) || result?.accepted || !canAcceptClassification(result)) return false;
+        seen.add(exerciseId);
+        return true;
+      });
+  }
+
   function inputWarningLabels(snapshot) {
     const labels = {
       question_text_missing: '题干文本为空',
@@ -291,7 +307,7 @@
       normalizeWhitespace, stableCodeFromText, runPool, chunkItems,
       classificationPayload, normalizeClassificationResult, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
-      sourceTextWithoutAssistant,
+      sourceTextWithoutAssistant, pendingAcceptanceItems,
     };
     return;
   }
@@ -310,6 +326,7 @@
     cloudConfigured: false,
     cards: new Map(),
     accepting: new Set(),
+    acceptingAll: false,
     confirmation: null,
     historyReport: null,
   };
@@ -405,6 +422,7 @@
       <section class="main-view" aria-label="分类助手主界面">
       <div class="header"><h2>题目分类助手</h2><div class="header-actions"><button class="settings" type="button" aria-expanded="false">设置</button><button class="close" type="button" aria-label="收起面板">›</button></div></div>
       <div class="actions"><button class="primary classify" type="button" disabled>识别当前页</button></div>
+      <div class="actions"><button class="primary accept-all" type="button" disabled>全部采纳</button></div>
       <div class="actions"><button class="history" type="button">工作成果</button><button class="clear-cache" type="button" disabled>清除本页缓存</button></div>
        <!-- 批处理仅适合数百题以上的离线任务；保留实现，暂不占用日常实时分类面板。 -->
        <section class="batch-actions" hidden aria-label="高级批处理操作">
@@ -416,11 +434,11 @@
       </section>
       <section class="settings-drawer" hidden aria-label="云端模型设置">
         <div class="settings-header"><button class="back-settings" type="button">‹ 返回</button><h3>云端模型设置</h3></div>
-         <p class="settings-copy">专题10之前按“最晚必备专题”路由；从专题10“三角形”起的【大题】按压轴题核心考点路由，再选择该专题内的三级、四级目录。条件审核会先由第二轮自检，仅对高风险题追加独立审核。API 密钥留空会保留原密钥。</p>
+         <p class="settings-copy">当前默认只执行“专题路由 → 目录分类与自检”两步。需要更细致复核时，可在此开启第三步独立审核。API 密钥留空会保留原密钥。</p>
          <div class="form">
            <section class="model-settings"><h4>目录分类</h4><p>决定最终三级、四级目录。建议“高”。</p><label>模型<input class="cloud-model" type="text" autocomplete="off" placeholder="例如你的模型部署名"></label><label>推理强度<select class="classification-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium">中（medium）</option><option value="high" selected>高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
            <section class="model-settings"><h4>专题路由</h4><p>按前置知识或压轴题核心考点选择全局专题。建议“中”。</p><label>模型（可选）<input class="routing-model" type="text" autocomplete="off" placeholder="留空则与目录分类模型相同"></label><label>推理强度<select class="routing-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium" selected>中（medium）</option><option value="high">高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
-           <section class="model-settings"><h4>审核策略</h4><p>条件审核可减少低风险题的等待；始终审核适合最高准确性要求。</p><label>策略<select class="audit-mode"><option value="conditional" selected>条件审核（推荐）</option><option value="always">始终独立审核</option></select></label></section>
+           <section class="model-settings"><h4>独立审核</h4><p>当前默认关闭，仅执行前两步；需要细分目录时再按需开启。</p><label>策略<select class="audit-mode"><option value="disabled" selected>关闭独立审核（当前）</option><option value="conditional">条件审核</option><option value="always">始终独立审核</option></select></label></section>
            <section class="model-settings"><h4>并发与流水线</h4><p>路由、分类与必要审核会共享总并发。题量较大时可提高到 4 或 5；出现限流则调低。</p><label>LLM 总并发<select class="max-concurrent-requests"><option value="1">1</option><option value="2">2</option><option value="3" selected>3（推荐）</option><option value="4">4</option><option value="5">5</option></select></label></section>
            <label>接口地址<input class="cloud-base-url" type="url" autocomplete="off" placeholder="https://api.openai.com/v1"></label>
           <label>API 密钥<input class="cloud-api-key" type="password" autocomplete="new-password" placeholder="留空则保留已保存的密钥"></label>
@@ -446,7 +464,7 @@
   const elements = {
     panel: shadow.querySelector('.panel'), tab: shadow.querySelector('.tab'), tabStatus: shadow.querySelector('.tab-status'), close: shadow.querySelector('.close'), mainView: shadow.querySelector('.main-view'), settings: shadow.querySelector('.settings'), settingsDrawer: shadow.querySelector('.settings-drawer'), backSettings: shadow.querySelector('.back-settings'),
      cloudModel: shadow.querySelector('.cloud-model'), routingModel: shadow.querySelector('.routing-model'), classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), auditMode: shadow.querySelector('.audit-mode'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), saveCloud: shadow.querySelector('.save-cloud'),
-    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), exportHistory: shadow.querySelector('.export-history'), captureHistory: shadow.querySelector('.capture-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
+    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), exportHistory: shadow.querySelector('.export-history'), captureHistory: shadow.querySelector('.capture-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
     legend: shadow.querySelector('.legend'), legendList: shadow.querySelector('.legend ul'),
     confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'),
   };
@@ -505,6 +523,7 @@
     elements.exportBatch.disabled = busy || !state.cloudConfigured || !state.currentQuestions.length;
     elements.submitBatch.disabled = busy || !state.cloudConfigured || !state.batchJobId;
     elements.syncBatch.disabled = busy || !state.cloudConfigured || !state.batchJobId;
+    updateAcceptAllAction();
   }
 
   function openSettings() {
@@ -855,7 +874,7 @@
       elements.routingModel.value = cloud.routing_model || '';
       elements.classificationReasoningEffort.value = cloud.reasoning_effort || 'high';
       elements.routingReasoningEffort.value = cloud.routing_reasoning_effort || 'medium';
-      elements.auditMode.value = cloud.audit_mode || 'conditional';
+      elements.auditMode.value = cloud.audit_mode || 'disabled';
       elements.maxConcurrentRequests.value = String(cloud.max_concurrent_requests || 3);
       elements.cloudBaseUrl.value = cloud.base_url || 'https://api.openai.com/v1';
       elements.cloudApiKey.value = '';
@@ -1044,7 +1063,7 @@
     state.results.set(exerciseId, manualResult);
     renderBadge(question.card, manualResult);
     updateLegend();
-    setStatus(`题目 ${exerciseId} 已应用人工分类，点击“一键采纳”写入题湖。`);
+    setStatus(`题目 ${exerciseId} 已应用人工分类，点击“采纳”写入题湖。`);
   }
 
   function openManualEditor(exerciseId, badge) {
@@ -1172,8 +1191,8 @@
       const action = document.createElement('button');
       action.className = 'badge-action';
       action.type = 'button';
-      action.disabled = Boolean(result.accepted || state.accepting.has(result.exercise_id));
-      action.textContent = result.accepted ? '已采纳' : (state.accepting.has(result.exercise_id) ? '提交中…' : '一键采纳');
+      action.disabled = Boolean(result.accepted || state.acceptingAll || state.accepting.has(result.exercise_id));
+      action.textContent = result.accepted ? '已采纳' : (state.accepting.has(result.exercise_id) ? '提交中…' : '采纳');
       action.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
@@ -1185,17 +1204,24 @@
     card.prepend(badge);
   }
 
-  async function acceptSuggestion(exerciseId) {
-    if (state.accepting.has(exerciseId)) return;
+  async function acceptSuggestion(exerciseId, { announce = true } = {}) {
+    if (state.acceptingAll && announce) {
+      const message = '正在执行当前页全部采纳，请等待本批次完成。';
+      setStatus(message);
+      return { exerciseId, accepted: false, skipped: true, message };
+    }
+    if (state.accepting.has(exerciseId)) return { exerciseId, accepted: false, skipped: true };
     const result = state.results.get(exerciseId);
     const question = state.cards.get(exerciseId);
     if (!canAcceptClassification(result)) {
-      setStatus(`题目 ${exerciseId} 没有可采纳的完整建议路径`, true);
-      return;
+      const message = `题目 ${exerciseId} 没有可采纳的完整建议路径`;
+      if (announce) setStatus(message, true);
+      return { exerciseId, accepted: false, skipped: true, message };
     }
     if (!question?.attributeUrl) {
-      setStatus(`题目 ${exerciseId} 缺少属性接口地址`, true);
-      return;
+      const message = `题目 ${exerciseId} 缺少属性接口地址`;
+      if (announce) setStatus(message, true);
+      return { exerciseId, accepted: false, message };
     }
 
     const isManual = result.manual_override?.source === 'manual';
@@ -1279,17 +1305,20 @@
           ? { ...result.manual_override, pending: false, accepted_at: new Date().toISOString() }
           : result.manual_override,
       });
-      if (manualPersistenceError || historyPersistenceError) {
-        const errors = [
-          manualPersistenceError && `人工修正记录保存失败：${manualPersistenceError}`,
-          historyPersistenceError && `工作成果记录保存失败：${historyPersistenceError}`,
-        ].filter(Boolean).join('；');
-        setStatus(`题目 ${exerciseId} 已写入题湖，但${errors}`, true);
-      } else {
+      const warnings = [
+        manualPersistenceError && `人工修正记录保存失败：${manualPersistenceError}`,
+        historyPersistenceError && `工作成果记录保存失败：${historyPersistenceError}`,
+      ].filter(Boolean);
+      if (warnings.length) {
+        if (announce) setStatus(`题目 ${exerciseId} 已写入题湖，但${warnings.join('；')}`, true);
+      } else if (announce) {
         setStatus(`题目 ${exerciseId} 已采纳建议并写入题湖可视化分类。`);
       }
+      return { exerciseId, accepted: true, moved, warnings };
     } catch (error) {
-      setStatus(`题目 ${exerciseId} 采纳失败：${error.message}`, true);
+      const message = `题目 ${exerciseId} 采纳失败：${error.message}`;
+      if (announce) setStatus(message, true);
+      return { exerciseId, accepted: false, message };
     } finally {
       state.accepting.delete(exerciseId);
       const current = state.results.get(exerciseId);
@@ -1364,6 +1393,70 @@
       elements.legendList.append(item);
     }
     elements.tabStatus.textContent = review ? `${review}复核` : `${accepted + suggested}题`;
+    updateAcceptAllAction();
+  }
+
+  function currentPagePendingAcceptances() {
+    return pendingAcceptanceItems([...state.results.entries()])
+      .filter(({ exerciseId }) => Boolean(state.cards.get(exerciseId)?.attributeUrl));
+  }
+
+  function updateAcceptAllAction() {
+    const count = currentPagePendingAcceptances().length;
+    elements.acceptAll.textContent = count ? `全部采纳（${count}）` : '全部采纳';
+    elements.acceptAll.disabled = Boolean(state.busy || state.acceptingAll || !count);
+    elements.acceptAll.title = count
+      ? `并发采纳当前页 ${count} 道尚未采纳的建议`
+      : '当前页没有可采纳的建议';
+  }
+
+  async function acceptAllSuggestions() {
+    if (state.busy || state.acceptingAll) return;
+    const candidates = currentPagePendingAcceptances();
+    if (!candidates.length) {
+      setStatus('当前页没有可采纳的完整分类建议。', true);
+      return;
+    }
+    const confirmed = await confirmAction({
+      title: '全部采纳当前页建议？',
+      message: `将并发采纳当前页 ${candidates.length} 道题的建议，并逐题回读确认是否已写入题湖。失败题目会保留为待采纳状态。`,
+      confirmLabel: `采纳 ${candidates.length} 道`,
+    });
+    if (!confirmed) return;
+
+    state.acceptingAll = true;
+    setBusy(true);
+    for (const [exerciseId, result] of state.results.entries()) {
+      const card = state.cards.get(exerciseId)?.card;
+      if (card) renderBadge(card, result);
+    }
+    setStatus(`正在并发采纳当前页 ${candidates.length} 道题…`);
+    try {
+      const outcomes = await runPool(candidates, ACCEPTANCE_CONCURRENCY,
+        ({ exerciseId }) => acceptSuggestion(exerciseId, { announce: false }));
+      const completed = outcomes.map(item => item.status === 'fulfilled' ? item.value : {
+        accepted: false,
+        message: item.reason?.message || '采纳任务意外中断',
+      });
+      const accepted = completed.filter(item => item.accepted).length;
+      const failures = completed.filter(item => !item.accepted && !item.skipped);
+      const warnings = completed.reduce((total, item) => total + (item.warnings?.length || 0), 0);
+      const details = [
+        `当前页已采纳 ${accepted}/${candidates.length} 道题`,
+        failures.length && `${failures.length} 道失败并保留待采纳`,
+        warnings && `${warnings} 条本地记录未保存`,
+      ].filter(Boolean).join('；');
+      setStatus(`${details}。`, Boolean(failures.length || warnings));
+    } finally {
+      state.acceptingAll = false;
+      // 失败题此前因整页操作而被禁用；批次结束后重新渲染，使其可单题重试。
+      for (const [exerciseId, result] of state.results.entries()) {
+        const card = state.cards.get(exerciseId)?.card;
+        if (card) renderBadge(card, result);
+      }
+      setBusy(false);
+      updateLegend();
+    }
   }
 
   async function restoreCachedResults(restoreId) {
@@ -1568,6 +1661,7 @@
   });
   elements.saveCloud.addEventListener('click', saveCloudSettings);
   elements.classify.addEventListener('click', classifyPage);
+  elements.acceptAll.addEventListener('click', acceptAllSuggestions);
   elements.history.addEventListener('click', openHistory);
   elements.backHistory.addEventListener('click', () => {
     closeHistory();

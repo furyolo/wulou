@@ -207,6 +207,7 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(persisted["classifier"]["cloud"]["max_concurrent_requests"], 5)
 
     def test_conditional_audit_only_skips_low_risk_topic_after_self_check(self) -> None:
+        self.state.settings["classifier"] = {"cloud": {"audit_mode": "conditional"}}
         question = {"question_press": "已知函数关系，求对应值"}
         decision = {"self_check": {"passed": True, "violations": [], "reason": "一致", "confidence": 0.98}}
         low_risk_target = SimpleNamespace(topic_order=11, level2_title="【微专题】")
@@ -217,6 +218,15 @@ class HttpServiceTests(unittest.TestCase):
         self.assertTrue(self.state._requires_independent_audit(
             question, decision, SimpleNamespace(topic_order=10, level2_title="【大题】")
         ))
+
+    def test_disabled_audit_never_schedules_a_third_model_request(self) -> None:
+        self.state.settings["classifier"] = {"cloud": {"audit_mode": "disabled"}}
+        question = {"question_press": "计算并化简"}
+        decision = {"self_check": {"passed": False, "violations": ["需复核"]}}
+        high_risk_target = SimpleNamespace(topic_order=1, level2_title="【大题】")
+        self.assertEqual(self.state.audit_mode(), "disabled")
+        self.assertFalse(self.state._requires_independent_audit(question, decision, high_risk_target))
+        self.assertEqual(self.state._disabled_audit()["mode"], "disabled")
 
     def test_interactive_job_returns_accepted_and_progress_can_be_polled(self) -> None:
         body = {
@@ -280,6 +290,7 @@ class HttpServiceTests(unittest.TestCase):
         # 供内部桩断言使用，避免闭包中依赖 unittest 的隐式绑定。
         cloud.assertEqual = self.assertEqual
         self.state.cloud = cloud
+        self.state.settings["classifier"] = {"cloud": {"audit_mode": "always"}}
         body = {"questions": [{"exercise_id": "cloud-job-1", "question_press": "分母有理化"}]}
         status, submitted = self.request("POST", "/api/v1/classification-jobs", body)
         self.assertEqual(status, 202)

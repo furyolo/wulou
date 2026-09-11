@@ -132,7 +132,7 @@ def validate_model_decision(question: dict[str, Any], decision: dict[str, Any], 
     if target and scope.get("topic_id") and scope.get("topic_id") != target.topic_id:
         review_reasons.append("page_scope_differs_from_routed_topic")
     audit = decision.get("audit") if isinstance(decision.get("audit"), dict) else None
-    if audit is not None and not audit.get("passed"):
+    if audit is not None and audit.get("mode") != "disabled" and audit.get("passed") is False:
         review_reasons.append("skill_audit_failed")
     auto_threshold = float((rules.get("model", {}) or {}).get("auto_accept_min_confidence", 0.92))
     review_reasons = list(dict.fromkeys(review_reasons))
