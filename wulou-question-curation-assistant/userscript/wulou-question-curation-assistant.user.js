@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         题湖题库数学题分类助手
 // @namespace    https://www.wulouai.com/
-// @version      0.16.1
+// @version      0.16.3
 // @description  采集当前题目页，显示分类建议，并可将确认后的建议写入题湖可视化分类。
 // @match        https://www.wulouai.com/user-center/exercise-part/*
 // @grant        GM_xmlhttpRequest
@@ -295,6 +295,11 @@
       && (savedScope.level4_id || null) === (scope.level4_id || null);
   }
 
+  function sameDirectoryPath(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((segment, index) => directoryKey(segment) === directoryKey(right[index]));
+  }
+
   function appendAnswerPreview(badge, header, question) {
     const preview = answerPreviewContent(question);
     if (!preview.texts.length && !preview.latex && !preview.imageUrl) return;
@@ -492,13 +497,20 @@
       .map(item => labels[item] || (/^[a-z][a-z0-9_]*$/i.test(item) ? '需要人工复核' : item)))];
   }
 
+  // 原生翻页会清空当前页面的 JS 内存。只要目录范围仍可识别，主按钮应
+  // 先汇总该目录的缓存，而不是把“全部采纳”悄悄降级为“本页采纳”。
+  function acceptAllActionMode(workset, focusAvailable) {
+    if (workset === 'focus') return 'focus';
+    return focusAvailable ? 'hydrate_focus' : 'page';
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
-      reviewFirstItems, pageSlice, classificationProgressText, CLASSIFICATION_JOB_MAX_QUESTIONS,
+      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, CLASSIFICATION_JOB_MAX_QUESTIONS,
     };
     return;
   }
@@ -1235,7 +1247,8 @@
     const cards = allCards;
     const completionAction = purpose === 'export'
       ? '导出为题库交接包'
-      : (purpose === 'restore' ? '从本地缓存恢复审核队列' : '提交云端分类');
+      : (purpose === 'restore' ? '从本地缓存恢复审核队列'
+        : (purpose === 'acceptance' ? '汇总本地缓存以供全量采纳' : '提交云端分类'));
     setStatus(`已发现 ${visited.size}/${scheduled.size} 页、${allCards.length} 道去重题目（仅含列表摘要），正在并发补全题干、公式、答案与解析文本，随后将${completionAction}…`);
     const fetched = await runPool(cards, ATTRIBUTE_CONCURRENCY, fetchAttribute);
     const questions = [];
@@ -1317,30 +1330,41 @@
     })), selectedIndex);
   }
 
-  function focusedDirectoryScope(taxonomy) {
-    const navigationPath = currentNavigationCataloguePath().map(normalizeWhitespace).filter(Boolean);
-    for (const topic of (taxonomy?.topics || [])) {
-      for (const level2 of (topic.level2 || [])) {
-        const level2Path = [topic.title, level2.title].map(normalizeWhitespace);
-        if (navigationPath.join('\u0000') === level2Path.join('\u0000')) {
-          return { level: 2, topic_id: topic.id, level2_id: level2.id, level3_id: null, title: level2Path.join(' / ') };
-        }
-        for (const level3 of (level2.level3 || [])) {
-          const level3Path = [...level2Path, normalizeWhitespace(level3.title)];
-          if (navigationPath.join('\u0000') === level3Path.join('\u0000')) {
-            return { level: 3, topic_id: topic.id, level2_id: level2.id, level3_id: level3.id, level4_id: null, title: level3Path.join(' / ') };
-          }
-          for (const level4 of (level3.level4 || [])) {
-            const level4Path = [...level3Path, normalizeWhitespace(level4.title)];
-            if (navigationPath.join('\u0000') === level4Path.join('\u0000')) {
-              // 四级目录是叶子范围：只收集它自身的所有分页，不再向下展开。
-              return { level: 4, topic_id: topic.id, level2_id: level2.id, level3_id: level3.id, level4_id: level4.id, title: level4Path.join(' / ') };
-            }
-          }
-        }
-      }
+  function focusScopeForNavigationPath(taxonomy, rawNavigationPath) {
+    const navigationPath = (Array.isArray(rawNavigationPath) ? rawNavigationPath : [])
+      .map(normalizeWhitespace).filter(Boolean);
+    // 只选中“专题”本身时范围过大；二、三、四级及其同层知识点目录均可作为 Focus。
+    if (navigationPath.length < 2) return null;
+    const topic = (taxonomy?.topics || []).find(item => directoryKey(item?.title) === directoryKey(navigationPath[0]));
+    if (!topic) return null;
+
+    // 题湖也有“2.2 / 考点3 / 考法1”这类旧知识点树：它们是有效的当前范围，
+    // 不能因名称未出现在工作簿目标目录中而被误判为“没有选中目录”。
+    const level2 = (topic.level2 || []).find(item => directoryKey(item?.title) === directoryKey(navigationPath[1]));
+    const level2Path = level2 ? [topic.title, level2.title].map(normalizeWhitespace) : [];
+    if (level2 && sameDirectoryPath(navigationPath, level2Path)) {
+      return { level: 2, topic_id: topic.id, level2_id: level2.id, level3_id: null, level4_id: null, title: navigationPath.join(' / ') };
     }
-    return null;
+    const level3 = level2 && (level2.level3 || []).find(item => directoryKey(item?.title) === directoryKey(navigationPath[2]));
+    const level3Path = level3 ? [...level2Path, normalizeWhitespace(level3.title)] : [];
+    if (level3 && sameDirectoryPath(navigationPath, level3Path)) {
+      return { level: 3, topic_id: topic.id, level2_id: level2.id, level3_id: level3.id, level4_id: null, title: navigationPath.join(' / ') };
+    }
+    const level4 = level3 && (level3.level4 || []).find(item => directoryKey(item?.title) === directoryKey(navigationPath[3]));
+    const level4Path = level4 ? [...level3Path, normalizeWhitespace(level4.title)] : [];
+    if (level4 && sameDirectoryPath(navigationPath, level4Path)) {
+      return { level: 4, topic_id: topic.id, level2_id: level2.id, level3_id: level3.id, level4_id: level4.id, title: navigationPath.join(' / ') };
+    }
+    return {
+      level: Math.min(4, navigationPath.length),
+      topic_id: topic.id,
+      // 仅当前路径明确落在目标二级目录时才施加该约束，否则由云端在专题内选择。
+      level2_id: level2?.id || '', level3_id: null, level4_id: null, title: navigationPath.join(' / '),
+    };
+  }
+
+  function focusedDirectoryScope(taxonomy) {
+    return focusScopeForNavigationPath(taxonomy, currentNavigationCataloguePath());
   }
 
   function loadFocusSnapshot() {
@@ -2061,16 +2085,79 @@
     const count = candidates.length;
     const localCount = candidates.filter(item => item.acceptanceMode === 'local').length;
     const moveCount = count - localCount;
-    const scopeLabel = state.workset === 'focus' ? '当前目录全部采纳' : '全部采纳';
+    const actionMode = acceptAllActionMode(state.workset, Boolean(focusedDirectoryScope(state.taxonomy)));
+    const canHydrateFocus = actionMode === 'hydrate_focus';
+    const scopeLabel = actionMode === 'focus'
+      ? '当前目录全部采纳'
+      : (canHydrateFocus ? '全部采纳' : '本页全部采纳');
     elements.acceptAll.textContent = count ? `${scopeLabel}（${count}）` : scopeLabel;
-    elements.acceptAll.disabled = Boolean(state.busy || state.acceptingAll || !count);
-    elements.acceptAll.title = count
-      ? `${state.workset === 'focus' ? '当前目录范围' : '当前页'} ${count} 道待采纳：${localCount} 道已归位，${moveCount} 道将并发移动`
-      : `${state.workset === 'focus' ? '当前目录范围' : '当前页'}没有可采纳的建议`;
+    elements.acceptAll.disabled = Boolean(state.busy || state.acceptingAll || (!count && !canHydrateFocus));
+    elements.acceptAll.title = canHydrateFocus
+      ? '点击后读取当前目录所有分页并查询已有本地缓存，不会重新调用云端分类；随后统一采纳已审核的建议'
+      : (count
+        ? `${state.workset === 'focus' ? '当前目录范围' : '当前页'} ${count} 道待采纳：${localCount} 道已归位，${moveCount} 道将并发移动`
+        : `${state.workset === 'focus' ? '当前目录范围' : '当前页'}没有可采纳的建议`);
+  }
+
+  async function hydrateFocusAcceptanceQueue() {
+    const focus = focusedDirectoryScope(state.taxonomy);
+    if (!focus) return { restored: false, reason: '未选中可汇总的当前目录' };
+    const restoreId = ++state.cacheRestoreId;
+    setBusy(true);
+    try {
+      const collected = await collectAllFocusPages({ purpose: 'acceptance' });
+      if (restoreId !== state.cacheRestoreId) return { restored: false, cancelled: true };
+      state.workset = 'focus';
+      state.results.clear();
+      state.cards.clear();
+      const questions = collected.questions.map(question => {
+        state.cards.set(question.exerciseId, question);
+        return classificationPayload(question, {
+          topic_id: focus.topic_id,
+          level2_id: focus.level2_id,
+        });
+      });
+      state.currentQuestions = questions;
+      const cachedResults = [];
+      const cacheChunks = chunkItems(questions, 200);
+      for (const [index, chunk] of cacheChunks.entries()) {
+        setStatus(`正在汇总当前目录的已审核建议：查询本地缓存（第 ${index + 1}/${cacheChunks.length} 批）…`);
+        const lookup = await request('POST', '/api/v1/cache/classifications/lookup', { questions: chunk });
+        if (restoreId !== state.cacheRestoreId) return { restored: false, cancelled: true };
+        cachedResults.push(...(lookup.results || []));
+      }
+      for (const rawResult of cachedResults) {
+        const result = withAcceptanceState(normalizeClassificationResult(rawResult));
+        if (result.exercise_id) state.results.set(result.exercise_id, result);
+      }
+      // 逐页识别后也建立目录快照：下次刷新可用“恢复上次审核队列”回到完整范围，
+      // 无需再执行云端分类。
+      saveFocusSnapshot(createFocusSnapshot(focus, collected.pageSize));
+      updateLegend();
+      return {
+        restored: true,
+        questionCount: questions.length,
+        cachedCount: state.results.size,
+        attributeFailed: collected.attributeFailed,
+      };
+    } catch (error) {
+      return { restored: false, error };
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function acceptAllSuggestions() {
     if (state.busy || state.acceptingAll) return;
+    if (acceptAllActionMode(state.workset, Boolean(focusedDirectoryScope(state.taxonomy))) === 'hydrate_focus') {
+      const hydrated = await hydrateFocusAcceptanceQueue();
+      if (hydrated.cancelled) return;
+      if (!hydrated.restored) {
+        const reason = hydrated.error?.message || hydrated.reason || '当前目录范围无法读取';
+        setStatus(`未能汇总当前目录的已审核建议：${reason}`, true);
+        return;
+      }
+    }
     const candidates = activePendingAcceptances();
     const scopeLabel = state.workset === 'focus' ? '当前目录全部题目' : '当前页';
     if (!candidates.length) {
@@ -2145,7 +2232,10 @@
       state.cards.clear();
       const questions = collected.questions.map(question => {
         state.cards.set(question.exerciseId, question);
-        return classificationPayload(question, state.scope);
+        return classificationPayload(question, {
+          topic_id: focus.topic_id,
+          level2_id: focus.level2_id,
+        });
       });
       state.currentQuestions = questions;
       installBadgeStyles();
@@ -2364,7 +2454,10 @@
       state.cards.clear();
       const questions = collected.questions.map(question => {
         state.cards.set(question.exerciseId, question);
-        return classificationPayload(question, state.scope);
+        return classificationPayload(question, {
+          topic_id: focus.topic_id,
+          level2_id: focus.level2_id,
+        });
       });
       state.currentQuestions = questions;
       installBadgeStyles();

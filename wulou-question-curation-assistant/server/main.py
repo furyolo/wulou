@@ -389,9 +389,21 @@ class ServiceState:
                 self._llm_slot_condition.notify_all()
 
     def _call_cloud(self, operation: Any, *args: Any) -> Any:
-        """所有实时分类阶段都经由共享闸门调用云端。"""
+        """所有实时分类阶段都经由共享闸门调用云端。
+
+        兼容网关偶尔会返回与其声明协议不符的对象。该类异常不应让整页
+        分类作业中断；转换为 ``CloudProviderError`` 后，会仅把当前分批
+        标为待人工复核，并保留其余分批的执行机会。
+        """
         with self._llm_request_slot():
-            return operation(*args)
+            try:
+                return operation(*args)
+            except CloudProviderError:
+                raise
+            except (AttributeError, KeyError, TypeError) as error:
+                raise CloudProviderError(
+                    f"云端分类响应格式异常（{type(error).__name__}）"
+                ) from error
 
     def create_classification_job(self, questions: Any) -> dict[str, Any]:
         """提交整页实时分类作业；HTTP 立刻返回，长推理在本机后台继续执行。"""
@@ -469,6 +481,24 @@ class ServiceState:
             self.taxonomy,
             self.rules,
         )
+
+    def _cloud_review_result(self, exercise_id: str, reason: str) -> dict[str, Any]:
+        """把单个云端分批异常安全降级为待人工复核结果。"""
+        return {
+            "exercise_id": exercise_id,
+            "taxonomy_version": self.taxonomy.version,
+            "rule_version": self.rule_version,
+            "status": "review",
+            "needs_review": True,
+            "review_reasons": ["cloud_request_failed"],
+            "classification_method": "model",
+            "confidence": 0.0,
+            "reason": reason,
+            "target": None,
+            "proposal_required": False,
+            "proposal_cluster_id": None,
+            "cache_hit": False,
+        }
 
     def _run_classification_job(self, job_id: str) -> None:
         """按总并发上限流水化路由、专题内分类和必要审核，完成即持续写回。"""
@@ -869,21 +899,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         return [results_by_id[str(question["exercise_id"])] for question in normalized]
 
     def _cloud_review_result(self, exercise_id: str, reason: str) -> dict[str, Any]:
-        return {
-            "exercise_id": exercise_id,
-            "taxonomy_version": self.server.state.taxonomy.version,
-            "rule_version": self.server.state.rule_version,
-            "status": "review",
-            "needs_review": True,
-            "review_reasons": ["cloud_request_failed"],
-            "classification_method": "model",
-            "confidence": 0.0,
-            "reason": reason,
-            "target": None,
-            "proposal_required": False,
-            "proposal_cluster_id": None,
-            "cache_hit": False,
-        }
+        return self.server.state._cloud_review_result(exercise_id, reason)
 
     def _require_cloud(self) -> OpenAIChatCompletionsProvider:
         cloud = self.server.state.cloud

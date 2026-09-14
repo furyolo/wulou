@@ -365,6 +365,36 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["results"][0]["target"]["level3_id"], target.level3_id)
         self.assertEqual(cloud.calls, ["routing", f"topic:{target.topic_id}"])
 
+    def test_interactive_cloud_job_recovers_from_unexpected_cloud_attribute_error(self) -> None:
+        """上游兼容网关的格式缺陷只能影响当前分批，不能击穿整个作业。"""
+
+        class BrokenCloud:
+            configured = True
+            provider_name = "stub"
+            model = "fast-model"
+            reasoning_effort = "medium"
+
+            def route_fast_batch(self, _questions, _taxonomy, _rules):
+                raise AttributeError("gateway response has no output_text")
+
+            def classify_topic_batch(self, *_args):
+                raise AssertionError("路由失败的题目不应进入专题内分类")
+
+        self.state.cloud = BrokenCloud()
+        self.state.settings["classifier"] = {"cloud": {}}
+        _, submitted = self.request("POST", "/api/v1/classification-jobs", {
+            "questions": [{"exercise_id": "broken-cloud-1", "question_press": "分母有理化"}],
+        })
+        for _ in range(20):
+            _, snapshot = self.request("GET", f"/api/v1/classification-jobs/{submitted['job_id']}")
+            if snapshot["status"] == "completed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["failed_exercise_ids"], ["broken-cloud-1"])
+        self.assertEqual(snapshot["results"][0]["status"], "review")
+        self.assertIn("云端分类响应格式异常（AttributeError）", snapshot["results"][0]["reason"])
+
     def test_second_stage_reroutes_to_corrected_topic_large_question_directory(self) -> None:
         self.state.taxonomy = Taxonomy({
             "taxonomy_version": "reroute-test-v1",

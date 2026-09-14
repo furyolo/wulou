@@ -28,6 +28,8 @@ const {
   reviewFirstItems,
   pageSlice,
   classificationProgressText,
+  focusScopeForNavigationPath,
+  acceptAllActionMode,
   CLASSIFICATION_JOB_MAX_QUESTIONS,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
@@ -129,6 +131,28 @@ test('当前目录快照只在相同目录身份与页面路径下恢复', () =>
   const level4Snapshot = { ...snapshot, scope: { ...level4Scope } };
   assert.equal(focusSnapshotMatches(level4Snapshot, snapshot.pathname, level4Scope), true);
   assert.equal(focusSnapshotMatches(level4Snapshot, snapshot.pathname, { ...level4Scope, level4_id: 'level4-2' }), false);
+});
+
+test('题湖旧知识点目录可作为当前聚焦范围，不要求与工作簿目标目录同名', () => {
+  const taxonomy = { topics: [{
+    id: 'topic-2', title: '专题2：代数式', level2: [{
+      id: 'large-2', title: '【大题】', level3: [{ id: 'l3-1', title: '整式的化简与求值', level4: [] }],
+    }],
+  }] };
+  assert.deepEqual(
+    focusScopeForNavigationPath(taxonomy, ['专题2：代数式', '2.2 整式的相关概念', '考点3：整式的基本运算']),
+    {
+      level: 3, topic_id: 'topic-2', level2_id: '', level3_id: null, level4_id: null,
+      title: '专题2：代数式 / 2.2 整式的相关概念 / 考点3：整式的基本运算',
+    },
+  );
+  assert.deepEqual(
+    focusScopeForNavigationPath(taxonomy, ['专题2：代数式', '【大题】', '整式的化简与求值']),
+    {
+      level: 3, topic_id: 'topic-2', level2_id: 'large-2', level3_id: 'l3-1', level4_id: null,
+      title: '专题2：代数式 / 【大题】 / 整式的化简与求值',
+    },
+  );
 });
 
 test('有限并发保留输入顺序', async () => {
@@ -255,6 +279,12 @@ test('全部采纳只收集当前尚未采纳且目录路径完整的建议', ()
     ['1', { exercise_id: '1', status: 'suggested', target }],
   ]);
   assert.deepEqual(items.map(item => item.exerciseId), ['1', '2']);
+});
+
+test('原生翻页后全部采纳会先汇总当前目录，而不是静默退化为本页', () => {
+  assert.equal(acceptAllActionMode('page', true), 'hydrate_focus');
+  assert.equal(acceptAllActionMode('focus', true), 'focus');
+  assert.equal(acceptAllActionMode('page', false), 'page');
 });
 
 test('按完整层级路径唯一解析题湖目录 ID', () => {
