@@ -14,6 +14,10 @@ from server.providers.openai_responses import CloudProviderError, OpenAIChatComp
 from server.taxonomy import Taxonomy
 
 
+class _DirectoryRequestCaptured(Exception):
+    """仅用于检查目录方案 Structured Output 请求，不发起真实网络调用。"""
+
+
 class CloudAndBatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.taxonomy = Taxonomy.from_file(ROOT / "config" / "taxonomy.example.yaml")
@@ -39,6 +43,76 @@ class CloudAndBatchTests(unittest.TestCase):
             request = provider.build_routing_request(self.question, self.taxonomy, {"rules": {}})
             self.assertEqual(request["reasoning"]["effort"], effort)
 
+    def test_directory_signal_requests_use_low_reasoning_and_compact_question_text(self) -> None:
+        provider = OpenAIChatCompletionsProvider({
+            "model": "test-model", "directory_reasoning_effort": "low", "directory_batch_size": 60,
+        })
+        request = provider._structured_request("directory-signals", {"questions": []}, {"type": "object"}, reasoning_effort="low")
+        self.assertEqual(request["reasoning"]["effort"], "low")
+        compact = provider._directory_question({
+            "exercise_id": "1", "question_press": "甲" * 2_000, "answer_press": "乙" * 1_000,
+        })
+        self.assertLessEqual(len(compact["text"]), 900)
+        self.assertLessEqual(len(compact["answer"]), 300)
+
+    def test_directory_refactor_schema_leaves_unique_items_to_server_validation(self) -> None:
+        class CapturingProvider(OpenAIChatCompletionsProvider):
+            def _directory_question_signals(self, questions):  # type: ignore[no-untyped-def]
+                return ([
+                    {"exercise_id": str(question["exercise_id"]), "primary_object": "实数", "main_question": "计算", "decisive_condition": "运算"}
+                    for question in questions
+                ], [])
+
+            def _request_with_retry(self, method, path, payload):  # type: ignore[no-untyped-def]
+                self.captured_request = payload
+                raise _DirectoryRequestCaptured()
+
+        provider = CapturingProvider({"model": "test-model"})
+        context = {
+            "selected_level3": [{"id": "l3", "title": "实数计算"}],
+            "focus": {"level": 3, "level3_id": "l3"},
+            "reference_directory_tree": [],
+            "collection": {"sampling": {"mode": "stratified_page", "source_question_count": 3}},
+            "questions": [
+                {"exercise_id": "1", "question_press": "题 1"},
+                {"exercise_id": "2", "question_press": "题 2"},
+                {"exercise_id": "3", "question_press": "题 3"},
+            ],
+            "minimum_level4_question_count": 6,
+            "sampled_level4_candidate_min_count": 3,
+            "sampled_level4_strong_candidate_min_count": 4,
+        }
+        with self.assertRaises(_DirectoryRequestCaptured):
+            provider.propose_directory_refactor(context, {"rules": {}})
+        schema = provider.captured_request["text"]["format"]["schema"]
+        supporting_schema = schema["properties"]["level3"]["items"]["properties"]["level4"]["items"]["properties"]["supporting_exercise_ids"]
+        self.assertNotIn("uniqueItems", supporting_schema)
+        self.assertEqual(supporting_schema["minItems"], 3)
+        self.assertEqual(supporting_schema["maxItems"], 6)
+
+    def test_directory_signal_batch_failure_keeps_other_batches(self) -> None:
+        class PartialSignalProvider(OpenAIChatCompletionsProvider):
+            def _structured_request(self, name, prompt, schema, reasoning_effort=None):  # type: ignore[no-untyped-def]
+                return {"exercise_ids": [str(question["exercise_id"]) for question in prompt["questions"]]}
+
+            def _request_with_retry(self, method, path, payload):  # type: ignore[no-untyped-def]
+                exercise_ids = payload["exercise_ids"]
+                if "1" in exercise_ids:
+                    raise CloudProviderError("临时网关失败")
+                return {"signals": [
+                    {"exercise_id": exercise_id, "primary_object": "实数", "main_question": "计算", "decisive_condition": "运算"}
+                    for exercise_id in exercise_ids
+                ]}
+
+            def _decode(self, payload):  # type: ignore[no-untyped-def]
+                return payload
+
+        provider = PartialSignalProvider({"model": "test-model", "directory_batch_size": 20, "directory_concurrency": 2})
+        questions = [{"exercise_id": str(index), "question_press": f"题 {index}"} for index in range(1, 22)]
+        signals, failed_ids = provider._directory_question_signals(questions)
+        self.assertEqual([item["exercise_id"] for item in signals], ["21"])
+        self.assertEqual(failed_ids, [str(index) for index in range(1, 21)])
+
     def test_realtime_routing_sees_all_topics_and_skill_protocol(self) -> None:
         request = self.provider.build_routing_request(
             self.question,
@@ -53,14 +127,11 @@ class CloudAndBatchTests(unittest.TestCase):
     def test_all_llm_phases_apply_standard_math_notation_convention(self) -> None:
         target = self.taxonomy.all_targets()[0]
         routing = {"latest_topic_id": target.topic_id, "required_knowledge_points": ["实数运算"]}
-        decision = {"target_level3_id": target.level3_id, "target_level4_id": target.level4_id}
         requests = [
             self.provider.build_request(self.question, self.taxonomy.candidates(target.topic_id, None), {"rules": {}}),
             self.provider.build_routing_request(self.question, self.taxonomy, {"rules": {}}),
             self.provider.build_batch_routing_request([self.question], self.taxonomy, {"rules": {}}),
             self.provider.build_topic_batch_request([self.question], target.topic_id, self.taxonomy, {"rules": {}}, {self.question["exercise_id"]: routing}),
-            self.provider.build_audit_request(self.question, routing, decision, target, self.taxonomy, {"rules": {}}),
-            self.provider.build_batch_audit_request([(self.question, routing, decision, target)], self.taxonomy, {"rules": {}}),
             self.provider.build_fast_batch_request([self.question], self.taxonomy, {"rules": {}}),
         ]
         instruction_texts = []
@@ -131,6 +202,8 @@ class CloudAndBatchTests(unittest.TestCase):
         self.assertEqual(len(static_prompt["all_topics_in_order"]), len(self.taxonomy.raw["topics"]))
         self.assertIn("先独立复核", static_prompt["instructions"][0])
         self.assertIn("self_check_passed", item_properties)
+        self.assertIn("reroute_topic_id", item_properties)
+        self.assertEqual(item_properties["reroute_topic_id"]["enum"], [topic["id"] for topic in self.taxonomy.topic_catalog()] + [None])
         candidates = self.taxonomy.candidates(target.topic_id, None)
         self.assertEqual(
             item_properties["target_level3_id"]["enum"],
@@ -140,20 +213,6 @@ class CloudAndBatchTests(unittest.TestCase):
             item_properties["target_level4_id"]["enum"],
             sorted({candidate.level4_id for candidate in candidates if candidate.level4_id is not None}) + [None],
         )
-
-    def test_batch_audit_uses_all_topics_and_does_not_rely_on_hardcoded_signals(self) -> None:
-        target = self.taxonomy.all_targets()[0]
-        routing = {"latest_topic_id": target.topic_id, "required_knowledge_points": ["实数运算"]}
-        decision = {"target_level3_id": target.level3_id, "target_level4_id": target.level4_id}
-        request = self.provider.build_batch_audit_request(
-            [(self.question, routing, decision, target)], self.taxonomy, {"rule_version": "skill-v1"}
-        )
-        static_prompt = json.loads(request["input"][0]["content"][0]["text"])
-        dynamic_prompt = json.loads(request["input"][1]["content"][0]["text"])
-        self.assertEqual(request["text"]["format"]["name"], "math_batch_classification_audit")
-        self.assertEqual(len(static_prompt["all_topics_in_order"]), len(self.taxonomy.raw["topics"]))
-        self.assertIn("不得依赖任何硬编码知识点特判", static_prompt["task"])
-        self.assertEqual(dynamic_prompt["items"][0]["proposed_target"]["level3_id"], target.level3_id)
 
     def test_fast_batch_maps_each_result_to_skill_validation_shape(self) -> None:
         target = self.taxonomy.all_targets()[0]
@@ -169,7 +228,6 @@ class CloudAndBatchTests(unittest.TestCase):
                         "primary_object": "实数式", "main_question": "计算", "decisive_condition": "常规运算",
                         "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
                         "confidence": 0.93, "reason": "唯一命中", "review_reasons": [],
-                        "audit_passed": True, "audit_violations": [],
                         "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
                     })
                 content = json.dumps({"results": rows}, ensure_ascii=False)
@@ -179,7 +237,6 @@ class CloudAndBatchTests(unittest.TestCase):
         decisions = provider.classify_fast_batch(questions, self.taxonomy, {"rule_version": "skill-v1"})
         self.assertEqual([item["exercise_id"] for item in decisions], ["2529221", "2529222"])
         self.assertEqual(decisions[0]["routing"]["latest_topic_id"], target.topic_id)
-        self.assertTrue(decisions[0]["audit"]["passed"])
 
     def test_topic_batch_maps_routing_back_to_each_result(self) -> None:
         target = self.taxonomy.all_targets()[0]
@@ -197,7 +254,7 @@ class CloudAndBatchTests(unittest.TestCase):
                     "confidence": 0.95, "reason": "唯一命中", "review_reasons": [],
                     "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
                     "self_check_passed": True, "self_check_violations": [],
-                    "self_check_reason": "路由与目录一致", "self_check_confidence": 0.95,
+                    "self_check_reason": "路由与目录一致", "self_check_confidence": 0.95, "reroute_topic_id": None,
                 }]}, ensure_ascii=False)
                 return {"status": "completed", "output_text": content}
 
@@ -206,9 +263,7 @@ class CloudAndBatchTests(unittest.TestCase):
         )[0]
         self.assertEqual(decision["routing"]["latest_topic_id"], target.topic_id)
         self.assertTrue(decision["self_check"]["passed"])
-        self.assertIsNone(decision["audit"])
-
-    def test_realtime_classification_runs_route_classify_and_audit(self) -> None:
+    def test_realtime_classification_runs_route_and_directory_classification(self) -> None:
         target = self.taxonomy.all_targets()[0]
 
         class StubProvider(OpenAIChatCompletionsProvider):
@@ -237,73 +292,20 @@ class CloudAndBatchTests(unittest.TestCase):
                 "review_reasons": [],
                 "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
                 "self_check_passed": True, "self_check_violations": [],
-                "self_check_reason": "路由与目录一致", "self_check_confidence": 0.96,
+                "self_check_reason": "路由与目录一致", "self_check_confidence": 0.96, "reroute_topic_id": None,
             },
-            {"passed": True, "violations": [], "reason": "未发现冲突", "confidence": 0.95},
         ])
-        decision = provider.classify(self.question, self.taxonomy, {"rule_version": "skill-v1"}, audit_mode="always")
+        decision = provider.classify(self.question, self.taxonomy, {"rule_version": "skill-v1"})
         self.assertEqual(provider.request_names, [
-            "math_topic_routing", "math_topic_batch_classification", "math_classification_audit",
+            "math_topic_routing", "math_topic_batch_classification",
         ])
         self.assertEqual(decision["routing"]["latest_topic_id"], target.topic_id)
-        self.assertTrue(decision["audit"]["passed"])
-        self.assertEqual(decision["confidence"], 0.95)
-
-    def test_disabled_audit_stops_after_routing_and_directory_classification(self) -> None:
-        target = self.taxonomy.all_targets()[0]
-        decision = {
-            "self_check": {"passed": False, "violations": ["需复核"]},
-        }
-        self.assertFalse(self.provider._requires_independent_audit(
-            self.question, decision, target, {"rules": {}}, "disabled"
-        ))
-        disabled = self.provider._disabled_audit()
-        self.assertEqual(disabled["mode"], "disabled")
-        self.assertIsNone(disabled["passed"])
+        self.assertEqual(decision["confidence"], 0.96)
 
     def test_non_object_model_json_is_reported_as_cloud_error(self) -> None:
         response = {"status": "completed", "output_text": "[]"}
         with self.assertRaisesRegex(CloudProviderError, "JSON 对象"):
             self.provider._decode(response)
-
-    def test_audit_failure_keeps_candidate_as_review(self) -> None:
-        target = self.taxonomy.all_targets()[0]
-
-        class AuditFailureProvider(OpenAIChatCompletionsProvider):
-            def __init__(self) -> None:
-                super().__init__({"model": "test-model", "api_key": "test-key-123"})
-                self.call_count = 0
-
-            def _request(self, method: str, path: str, payload=None, extra_headers=None, raw=False):
-                self.call_count += 1
-                if self.call_count == 1:
-                    value = {
-                        "status": "routed", "required_knowledge_points": ["实数运算"],
-                        "latest_topic_id": target.topic_id, "primary_object": "实数式", "main_question": "计算",
-                        "decisive_condition": "常规运算", "evidence": ["计算"], "confidence": 0.96,
-                        "reason": "路由完成", "review_reasons": [],
-                    }
-                elif self.call_count == 2:
-                    value = {
-                        "exercise_id": "2529221", "status": "suggested", "target_level3_id": target.level3_id,
-                        "target_level4_id": target.level4_id, "confidence": 0.95, "reason": "唯一命中",
-                        "review_reasons": [],
-                        "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
-                        "self_check_passed": True, "self_check_violations": [],
-                        "self_check_reason": "路由与目录一致", "self_check_confidence": 0.95,
-                    }
-                else:
-                    raise CloudProviderError("审核超时")
-                request_name = payload["text"]["format"]["name"]
-                content = {"results": [value]} if request_name == "math_topic_batch_classification" else value
-                return {"status": "completed", "output_text": json.dumps(content, ensure_ascii=False)}
-
-        decision = AuditFailureProvider().classify(
-            self.question, self.taxonomy, {"rule_version": "skill-v1"}, audit_mode="always"
-        )
-        self.assertEqual(decision["status"], "review")
-        self.assertEqual(decision["target_level3_id"], target.level3_id)
-        self.assertIn("audit_request_failed", decision["review_reasons"])
 
     def test_batch_store_keeps_local_input_without_submission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -179,9 +179,26 @@ class Taxonomy:
             catalog.append(topic_row)
         return catalog
 
-    def classification_catalog_for_topic(self, topic_id: str) -> list[dict[str, Any]]:
-        """返回单个专题的完整可分类目录，供第二阶段分类避免重复发送全量目录。"""
-        return [item for item in self.classification_catalog() if item["id"] == topic_id]
+    def classification_catalog_for_topic(self, topic_id: str, level2_id: str | None = None) -> list[dict[str, Any]]:
+        """返回专题内可分类目录；大题场景可进一步限定到【大题】二级目录。"""
+        catalog = [item for item in self.classification_catalog() if item["id"] == topic_id]
+        if not catalog or not level2_id:
+            return catalog
+        topic = dict(catalog[0])
+        topic["level2"] = [item for item in topic.get("level2", []) if item["id"] == level2_id]
+        return [topic]
+
+    def is_large_question_scope(self, question: dict[str, Any]) -> bool:
+        """题目来源页若属于【大题】，跨专题后仍保持大题二级目录约束。"""
+        scope = question.get("scope") if isinstance(question, dict) else None
+        level2_id = str(scope.get("level2_id", "")) if isinstance(scope, dict) else ""
+        return any(target.level2_id == level2_id and target.level2_title == "【大题】" for target in self._targets)
+
+    def large_question_level2_id(self, topic_id: str) -> str | None:
+        """返回某专题唯一的【大题】二级目录 ID；没有或重复时不擅自选择。"""
+        matches = {target.level2_id for target in self._targets
+                   if target.topic_id == topic_id and target.level2_title == "【大题】"}
+        return next(iter(matches)) if len(matches) == 1 else None
 
     def topic(self, topic_id: str | None) -> dict[str, Any] | None:
         for topic in self.topic_catalog():

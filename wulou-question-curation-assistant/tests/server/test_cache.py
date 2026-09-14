@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from server.cache import ResultCache
@@ -77,6 +78,10 @@ class ResultCacheTests(unittest.TestCase):
             override = cache.get_manual_override("exercise-1", "level4-a")
             self.assertIsNotNone(override)
             self.assertEqual(override["target_path"][-1], "分母有理化")
+            # 移到人工指定的目标叶子后，目录 ID 已变化，仍要恢复人工终态。
+            moved_override = cache.get_manual_override("exercise-1", "level4-target")
+            self.assertIsNotNone(moved_override)
+            self.assertEqual(moved_override["target_path"][-1], "分母有理化")
             self.assertEqual(
                 cache._connection.execute("SELECT COUNT(*) FROM manual_classification_audit").fetchone()[0], 1
             )
@@ -119,6 +124,37 @@ class ResultCacheTests(unittest.TestCase):
             self.assertEqual(cache.catalogue_move_report()["summary"]["classified_count"], 2)
             cache.close()
 
+    def test_catalogue_move_report_uses_utc8_today_as_a_half_open_utc_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ResultCache(Path(directory) / "cache.sqlite3")
+
+            def record(exercise_id: str, moved_at: str) -> None:
+                cache.record_catalogue_move(
+                    exercise_id=exercise_id, stable_code=f"CS2026{exercise_id}",
+                    source_catalogue_id=f"old-{exercise_id}", target_catalogue_id=f"new-{exercise_id}",
+                    original_path=["专题1：实数", "【大题】", "旧分类"],
+                    target_path=["专题4：分式方程与不等式", "【大题】", "解不等式"],
+                )
+                cache._connection.execute(
+                    "UPDATE catalogue_move_history SET moved_at = ? WHERE exercise_id = ?",
+                    (moved_at, exercise_id),
+                )
+                cache._connection.commit()
+
+            # UTC+8 的 2026-09-12 对应 SQLite UTC 的 [2026-09-11 16:00:00, 2026-09-12 16:00:00)。
+            record("before", "2026-09-11 15:59:59")
+            record("start", "2026-09-11 16:00:00")
+            record("end", "2026-09-12 15:59:59")
+            record("after", "2026-09-12 16:00:00")
+
+            report = cache.catalogue_move_report(now=datetime(2026, 9, 12, 8, tzinfo=timezone.utc))
+            self.assertEqual(report["summary"]["period"]["date"], "2026-09-12")
+            self.assertEqual(report["summary"]["period"]["label"], "2026-09-12 今日")
+            self.assertEqual(report["summary"]["period"]["utc_start"], "2026-09-11 16:00:00")
+            self.assertEqual(report["summary"]["period"]["utc_end"], "2026-09-12 16:00:00")
+            self.assertEqual({item["stable_code"] for item in report["records"]}, {"CS2026start", "CS2026end"})
+            cache.close()
+
     def test_legacy_cache_table_is_preserved_during_schema_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.sqlite3"
@@ -140,6 +176,28 @@ class ResultCacheTests(unittest.TestCase):
             self.assertIn("classification_results_legacy_v1", tables)
             self.assertEqual(cache._connection.execute("SELECT COUNT(*) FROM classification_results").fetchone()[0], 0)
             self.assertEqual(cache._connection.execute("SELECT COUNT(*) FROM classification_results_legacy_v1").fetchone()[0], 1)
+            cache.close()
+
+    def test_semantic_cache_can_be_recovered_after_the_question_moves_to_another_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ResultCache(Path(directory) / "cache.sqlite3")
+            cache.put("semantic-key", "exercise-1", "catalogue-before", {"target": {"path": ["目录 A"]}})
+
+            recovered = cache.get("semantic-key", "exercise-1", "catalogue-after")
+
+            self.assertEqual(recovered, {"target": {"path": ["目录 A"]}})
+            cache.close()
+
+    def test_latest_catalogue_moves_returns_the_newest_record_for_each_question(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ResultCache(Path(directory) / "cache.sqlite3")
+            cache.record_catalogue_move(exercise_id="exercise-1", stable_code="CS-1", source_catalogue_id="a", target_catalogue_id="b", original_path=["原"], target_path=["目标一"])
+            cache.record_catalogue_move(exercise_id="exercise-1", stable_code="CS-1", source_catalogue_id="b", target_catalogue_id="c", original_path=["目标一"], target_path=["目标二"])
+
+            moves = cache.latest_catalogue_moves(["exercise-1", "missing"])
+
+            self.assertEqual(moves["exercise-1"]["target_catalogue_id"], "c")
+            self.assertEqual(moves["exercise-1"]["target_path"], ["目标二"])
             cache.close()
 
 

@@ -5,6 +5,13 @@ taxonomy_path: taxonomy.example.yaml
 rules_path: classification-rules.yaml
 cache_path: ../.local-data/classification.sqlite3
 
+# 启动时在同一命名前缀内按“日期 + vN”发现最新工作簿，并原子更新本地 taxonomy 快照。
+# 自动同步只读工作簿；生成的新版本永不覆盖此文件。
+# directory_workbook:
+#   path: ../../local-materials/中考数学分类汇编/★全国中考数学-导出目录,ID-<ID>-<日期> v<N>.xlsx
+#   sheet: 目录
+#   auto_sync: true
+
 # 规则分类器默认保守复核。后续模型提供方会在此处增加独立配置。
 classifier:
   mode: heuristic
@@ -14,9 +21,13 @@ classifier:
   #   model: 请填写支持 Responses 和结构化输出的目录分类模型名
   #   routing_model: 可选；填写更快的云端模型名，用于第一阶段专题路由
   #   reasoning_effort: high
+  #   directory_reasoning_effort: low  # 粗粒度目录方案的题目特征提取与综合
+  #   directory_batch_size: 60
+  #   directory_concurrency: 5
+  #   directory_retry_attempts: 3
+  #   directory_request_timeout_seconds: 90  # 单个目录模型请求；超时后按重试策略处理
   #   routing_reasoning_effort: medium
-  #   audit_mode: disabled  # disabled（默认）、conditional 或 always
-  #   max_concurrent_requests: 3  # 1–5；路由、分类与按需审核共享总并发
+  #   max_concurrent_requests: 3  # 1–5；专题路由与目录分类共享总并发
   #   api_key_env: OPENAI_API_KEY
   #   base_url: https://api.openai.com/v1
   #   timeout_seconds: 600

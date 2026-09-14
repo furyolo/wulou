@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -36,6 +38,14 @@ class OpenAIChatCompletionsProvider:
         self.api_key = str(settings.get("api_key", "")).strip()
         self.base_url = str(settings.get("base_url", "https://api.openai.com/v1")).rstrip("/")
         self.reasoning_effort = str(settings.get("reasoning_effort", "high")).strip().lower()
+        # 目录方案是粗粒度结构设计：先并发提取短题目特征，再一次性综合，不能沿用逐题精分的高推理配置。
+        self.directory_reasoning_effort = str(settings.get("directory_reasoning_effort", "low")).strip().lower()
+        self.directory_batch_size = int(settings.get("directory_batch_size", 60))
+        self.directory_concurrency = int(settings.get("directory_concurrency", 5))
+        self.directory_retry_attempts = int(settings.get("directory_retry_attempts", 3))
+        # 目录方案的单个模型请求正常应在一分钟左右完成。比通用分类的 600 秒
+        # 更短的超时可避免网关无响应时让整个方案长期停在“推理中”。
+        self.directory_request_timeout_seconds = int(settings.get("directory_request_timeout_seconds", 90))
         # 这是网络失联保护，不是页面分类的业务时限。兼容旧配置的 180 秒也提升到 600 秒，
         # 防止上游已经完成但本机先断开并重复计费。
         self.timeout_seconds = max(600, int(settings.get("timeout_seconds", 600)))
@@ -43,6 +53,16 @@ class OpenAIChatCompletionsProvider:
             raise ValueError("cloud.model 不能为空")
         if self.reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("cloud.reasoning_effort 必须是 none、low、medium、high、xhigh 或 max")
+        if self.directory_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("cloud.directory_reasoning_effort 必须是 none、low、medium、high、xhigh 或 max")
+        if not 20 <= self.directory_batch_size <= 100:
+            raise ValueError("cloud.directory_batch_size 必须是 20 到 100")
+        if not 1 <= self.directory_concurrency <= 5:
+            raise ValueError("cloud.directory_concurrency 必须是 1 到 5")
+        if not 1 <= self.directory_retry_attempts <= 5:
+            raise ValueError("cloud.directory_retry_attempts 必须是 1 到 5")
+        if not 30 <= self.directory_request_timeout_seconds <= 180:
+            raise ValueError("cloud.directory_request_timeout_seconds 必须是 30 到 180")
 
     @property
     def configured(self) -> bool:
@@ -285,18 +305,24 @@ class OpenAIChatCompletionsProvider:
         """第二阶段只发送路由专题的目录，避免每个分块重复携带全量目录。"""
         if not questions or len(questions) > 10:
             raise ValueError("专题内分类每次必须包含 1-10 道题")
-        catalog = taxonomy.classification_catalog_for_topic(topic_id)
-        candidates = taxonomy.candidates(topic_id, None)
+        is_large_question = all(taxonomy.is_large_question_scope(question) for question in questions)
+        level2_id = taxonomy.large_question_level2_id(topic_id) if is_large_question else None
+        if is_large_question and not level2_id:
+            raise ValueError(f"专题 {topic_id} 缺少唯一的【大题】二级目录")
+        catalog = taxonomy.classification_catalog_for_topic(topic_id, level2_id)
+        candidates = taxonomy.candidates(topic_id, level2_id)
         if len(catalog) != 1:
             raise ValueError("专题路由没有对应的可分类目录")
         static_context = {
-            "task": "复核专题路由后，将题目归入已确定专题的现有大题目录。只能选择给定目录，不能臆造已生效目录。",
+            "task": "复核专题路由后，将题目归入已确定专题的现有目录。只能选择给定目录，不能臆造已生效目录。",
             "policy": self._policy(rules),
             "all_topics_in_order": taxonomy.topic_catalog(),
             "directory_catalog": catalog,
             "instructions": [
-                "先独立复核 topic_routing 是否符合分阶段规则：专题10之前检查是否遗漏更晚的必备专题；专题10及后续的【大题】检查是否把辅助步骤误作核心考点。发现任何疑点时 self_check_passed=false 并写明原因。",
+                "先独立复核 topic_routing 是否符合分阶段规则：专题10之前检查是否遗漏更晚的必备专题；专题10及后续的【大题】检查是否把辅助步骤误作核心考点。若发现应改到其他专题，必须设置 self_check_passed=false、status=review、reroute_topic_id=修正专题，并将目录目标留空；服务端会加载修正专题的详细目录后重新分类。",
                 "自检通过后，只在已路由专题内按首要数学对象确定三级、按主问或决定性条件确定四级。",
+                "directory_catalog 仅是当前已路由专题的详细目录，不代表完整专题目录；不得据此声称系统缺少其他专题目录。",
+                "当前题属于【大题】时，directory_catalog 已限定为该专题的【大题】二级目录；只能在其三级、四级目录中选择。" if is_large_question else "当前题不限定为【大题】；按 directory_catalog 选择可用目录。",
                 "显式符号与目录的含/不含语义冲突、候选不唯一或信息不足时必须返回 review。",
                 "仅当命中的三级目录有四级子目录时才匹配四级；没有四级子目录时三级即末级，target_level4_id 必须为 null。",
                 "input_warnings 仅提示输入风险；答案编号与题干不一致时，须依据数学连续性判断是否属于同一道题，不得直接丢弃答案。",
@@ -327,7 +353,7 @@ class OpenAIChatCompletionsProvider:
         }
         item_schema = {
             "type": "object", "additionalProperties": False,
-            "required": ["exercise_id", "status", "target_level3_id", "target_level4_id", "confidence", "reason", "review_reasons", "proposal", "self_check_passed", "self_check_violations", "self_check_reason", "self_check_confidence"],
+            "required": ["exercise_id", "status", "target_level3_id", "target_level4_id", "confidence", "reason", "review_reasons", "proposal", "self_check_passed", "self_check_violations", "self_check_reason", "self_check_confidence", "reroute_topic_id"],
             "properties": {
                 "exercise_id": {"type": "string"},
                 "status": {"type": "string", "enum": ["suggested", "review"]},
@@ -341,6 +367,7 @@ class OpenAIChatCompletionsProvider:
                 "self_check_violations": {"type": "array", "items": {"type": "string"}},
                 "self_check_reason": {"type": "string"},
                 "self_check_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reroute_topic_id": {"type": ["string", "null"], "enum": [item["id"] for item in taxonomy.topic_catalog()] + [None]},
             },
         }
         schema = {
@@ -366,98 +393,9 @@ class OpenAIChatCompletionsProvider:
                 "violations": self._string_list(row.pop("self_check_violations")),
                 "reason": str(row.pop("self_check_reason")),
                 "confidence": self._confidence(row.pop("self_check_confidence")),
+                "reroute_topic_id": row.pop("reroute_topic_id"),
             }
-            row["audit"] = None
         return rows
-
-    def build_audit_request(
-        self, question: dict[str, Any], routing: dict[str, Any], decision: dict[str, Any], target: Target,
-        taxonomy: Any, rules: dict[str, Any]
-    ) -> dict[str, Any]:
-        """让独立一次模型调用从全量专题中寻找能推翻建议分类的证据。"""
-        prompt = {
-            "task": "独立审核建议分类是否严格符合 Skill；重点寻找错判分类阶段、错误核心考点或遗漏的前置知识。",
-            "policy": self._policy(rules),
-            "question": self._question(question),
-            "all_topics_in_order": taxonomy.topic_catalog(),
-            "topic_routing": routing,
-            "proposed_decision": decision,
-            "proposed_target": self._candidate_rows([target])[0],
-            "checks": [
-                "基础或前置知识专题是否遗漏目录顺序更靠后的必备专题；专题10及后续专题的【大题】是否错误地把辅助步骤当成核心考点",
-                "三级是否按首要数学对象或情境划分",
-                "四级是否按主问或决定性条件划分",
-                "显式符号或运算是否与目录的含/不含语义冲突",
-                "是否能够唯一命中",
-                self._notation_instruction(),
-            ],
-        }
-        schema = {
-            "type": "object", "additionalProperties": False,
-            "required": ["passed", "violations", "reason", "confidence"],
-            "properties": {
-                "passed": {"type": "boolean"},
-                "violations": {"type": "array", "items": {"type": "string"}},
-                "reason": {"type": "string"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            },
-        }
-        return self._structured_request("math_classification_audit", prompt, schema)
-
-    def build_batch_audit_request(
-        self, items: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Target]], taxonomy: Any, rules: dict[str, Any]
-    ) -> dict[str, Any]:
-        """批量独立审核路由和专题内分类，避免把数学语义写死为本地特判。"""
-        if not items or len(items) > 10:
-            raise ValueError("独立审核每次必须包含 1-10 道题")
-        static_context = {
-            "task": "独立审核中考数学题的专题与目录建议。逐题从完整专题目录和实际题干出发，不得依赖任何硬编码知识点特判。",
-            "policy": self._policy(rules),
-            "all_topics_in_order": taxonomy.topic_catalog(),
-            "checks": [
-                "完整列举并核对必备知识点，而非仅检查预设知识词",
-                "专题10之前的基础或前置知识专题是否遗漏最晚必备知识点",
-                "专题10及后续专题的【大题】是否把扇形面积、旋转、坐标或代数运算等辅助步骤误当成核心考点",
-                "去掉候选核心知识点后，主结论的证明或求解主线是否失效",
-                "三级是否按首要数学对象或情境划分，四级是否按主问或决定性条件划分，且是否唯一命中",
-                self._notation_instruction(),
-            ],
-        }
-        dynamic_context = {
-            "items": [
-                {
-                    "exercise_id": str(question["exercise_id"]),
-                    "question": self._question(question),
-                    "topic_routing": routing,
-                    "proposed_decision": decision,
-                    "proposed_target": self._candidate_rows([target])[0],
-                }
-                for question, routing, decision, target in items
-            ],
-        }
-        item_schema = {
-            "type": "object", "additionalProperties": False,
-            "required": ["exercise_id", "passed", "violations", "reason", "confidence"],
-            "properties": {
-                "exercise_id": {"type": "string"},
-                "passed": {"type": "boolean"},
-                "violations": {"type": "array", "items": {"type": "string"}},
-                "reason": {"type": "string"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            },
-        }
-        schema = {
-            "type": "object", "additionalProperties": False, "required": ["results"],
-            "properties": {"results": {"type": "array", "minItems": len(items), "maxItems": len(items), "items": item_schema}},
-        }
-        return self._staged_structured_request("math_batch_classification_audit", static_context, dynamic_context, schema)
-
-    def audit_batch(
-        self, items: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Target]], taxonomy: Any, rules: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        request = self.build_batch_audit_request(items, taxonomy, rules)
-        payload = self._decode(self._request("POST", "/responses", request))
-        return self._batch_rows(payload, [item[0] for item in items], "独立审核")
 
     def build_fast_batch_request(
         self, questions: list[dict[str, Any]], taxonomy: Any, rules: dict[str, Any]
@@ -490,7 +428,7 @@ class OpenAIChatCompletionsProvider:
                 "exercise_id", "status", "required_knowledge_points", "latest_topic_id",
                 "primary_object", "main_question", "decisive_condition",
                 "target_level3_id", "target_level4_id", "confidence", "reason", "review_reasons",
-                "audit_passed", "audit_violations", "proposal",
+                "proposal",
             ],
             "properties": {
                 "exercise_id": {"type": "string"},
@@ -505,8 +443,6 @@ class OpenAIChatCompletionsProvider:
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "reason": {"type": "string"},
                 "review_reasons": {"type": "array", "items": {"type": "string"}},
-                "audit_passed": {"type": "boolean"},
-                "audit_violations": {"type": "array", "items": {"type": "string"}},
                 "proposal": {
                     "type": "object", "additionalProperties": False,
                     "required": ["kind", "title", "cluster_key", "reason"],
@@ -556,27 +492,211 @@ class OpenAIChatCompletionsProvider:
                 "reason": row.get("reason"),
                 "review_reasons": row.get("review_reasons") or [],
             }
-            decision["audit"] = {
-                "passed": row.get("audit_passed"),
-                "violations": row.get("audit_violations") or [],
-                "confidence": row.get("confidence"),
-                "reason": row.get("reason"),
-            }
             by_id[exercise_id] = decision
         if set(by_id) != expected_ids:
             raise CloudProviderError("云端模型没有返回全部题目的分类结果")
         return [by_id[str(question["exercise_id"])] for question in questions]
 
-    def _structured_request(self, name: str, prompt: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
-        return self._responses_request(name, [prompt], schema)
+    def propose_directory_refactor(self, context: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
+        """按一个已选中的二级或三级目录提出待审核的粗粒度目录方案。"""
+        selected = context["selected_level3"]
+        focus = context["focus"]
+        level3_keys = [str(item["id"]) for item in selected]
+        sampling = context["collection"].get("sampling") or {}
+        is_sampled = sampling.get("mode") == "stratified_page"
+        support_minimum = (
+            context["sampled_level4_candidate_min_count"]
+            if is_sampled else context["minimum_level4_question_count"]
+        )
+        static_context = {
+            "task": "为一个中考数学目录 Focus 设计待人工审核的三级、四级目录优化方案。不得执行写入或逐题分类。",
+            "policy": self._policy(rules),
+            "focus": focus,
+            "old_directory_tree": selected,
+            "reference_directory_tree": context["reference_directory_tree"],
+            "collection": context["collection"],
+            "minimum_level4_question_count": context["minimum_level4_question_count"],
+            "instructions": [
+                "三级目录必须按题干首要数学对象或情境划分；四级目录按最终主问或决定性条件划分。",
+                "目录标题必须剥离单题故事背景；四级标题以“考法N：”开头，且每个四级目录至少有给定最小题量。",
+                "每个三级、四级目录均须提供 basis，简洁说明其数学分类边界、纳入条件或与相邻目录的区分；不得引用具体题号或故事背景。该文字可写入 Excel N 列作为分类依据。",
+                "这是目录骨架优化，不是逐题归类任务。不得输出全部题目的分类结果，也不得要求每道题落入某个四级目录。",
+                "每个新建或保留的四级目录必须提供 supporting_exercise_ids：它们只是符合该目录的题号，用于核验该目录的样本或全量题量，不是数学证明题；这些题号在不同四级目录间不得重复。其余题目无需归属。",
+                "Focus 为三级时，level3 只能保留一个，并使用给定的 key；不得移动到其他三级或新建三级。",
+                "旧目录和同专题其他三级、四级目录只作参考，不能照抄无题量支持的目录。",
+                "collection 记录本轮未能读取的题目或分页；只能基于 questions 中已成功读取的题目提出方案，并在 notes 中说明覆盖缺口，不得臆造缺失题目内容。",
+                "二级 Focus 无法形成满足题量的四级分类时，不要捏造目录；可保留三级末级目录。三级 Focus 且题量达到门槛时必须给出四级分类。",
+                self._notation_instruction(),
+            ],
+        }
+        if is_sampled:
+            # 抽样只改变候选证据门槛，不把数百道完整题干塞入一次请求。
+            # 先用低强度并发提炼短数学特征，再由原目录分类强度完成最终归纳。
+            static_context["instructions"].append(
+                "本轮是分页分层抽样，只产出待审核候选，不得直接写入 Excel。样本中有 3 道不同匹配题才可提出四级目录；应尽量列出最多 6 道实际匹配题。样本中 4 至 6 道为强候选，恰好 3 道为普通候选；少于 3 道必须在 notes 标明证据不足，不得猜测。最终写入前仍须全量核验实际题量不少于 6 道。"
+            )
+            request_effort = self.reasoning_effort
+        else:
+            request_effort = self.directory_reasoning_effort
+        # 无论全量还是抽样，都先并发提取短特征，避免单次请求过大、无进度且易卡住。
+        question_signals, signal_failed_ids = self._directory_question_signals(context["questions"])
+        if signal_failed_ids:
+            context["collection"]["failed_signal_exercise_ids"] = signal_failed_ids
+            static_context["instructions"].append(
+                "部分题目的特征提取请求失败，failed_signal_exercise_ids 中的题只能视为覆盖缺口；不得根据缺失题目猜测目录。"
+            )
+        if not question_signals:
+            raise CloudProviderError("所有抽样题目的数学特征提取均失败，无法生成目录方案")
+        dynamic_context = {
+            "question_signals": question_signals,
+            "question_count": len(context["questions"]),
+            "sampling": sampling,
+        }
+        exercise_ids = [str(question["exercise_id"]) for question in context["questions"]]
+        level4_schema = {
+            "type": "object", "additionalProperties": False, "required": ["key", "title", "basis", "supporting_exercise_ids"],
+            "properties": {
+                "key": {"type": "string"}, "title": {"type": "string"}, "basis": {"type": "string"},
+                "supporting_exercise_ids": {
+                    "type": "array", "minItems": support_minimum,
+                    "maxItems": context["minimum_level4_question_count"],
+                    # 部分兼容网关的 Structured Outputs 不支持 uniqueItems；
+                    # 返回后仍由 directory_refactor 严格校验同目录和跨目录的题号去重。
+                    "items": {"type": "string", "enum": exercise_ids},
+                },
+            },
+        }
+        level3_schema = {
+            "type": "object", "additionalProperties": False, "required": ["key", "title", "basis", "level4"],
+            "properties": {
+                "key": {"type": "string", "enum": level3_keys} if focus["level"] == 3 else {"type": "string"},
+                "title": {"type": "string"}, "basis": {"type": "string"},
+                "level4": {"type": "array", "items": level4_schema},
+            },
+        }
+        schema = {
+            "type": "object", "additionalProperties": False, "required": ["level3", "notes"],
+            "properties": {
+                "level3": {"type": "array", "minItems": 1, "items": level3_schema},
+                "notes": {"type": "array", "items": {"type": "string"}},
+            },
+        }
+        request = self._staged_structured_request(
+            "math_directory_refactor", static_context, dynamic_context, schema,
+            reasoning_effort=request_effort,
+        )
+        return self._decode(self._request_with_retry("POST", "/responses", request))
+
+    @staticmethod
+    def _clip_directory_text(value: Any, limit: int) -> str:
+        """保留题干头尾，避免长材料题吞掉目录方案的上下文窗口。"""
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        separator = " … "
+        head = max(1, (limit - len(separator)) * 2 // 3)
+        tail = max(1, limit - len(separator) - head)
+        return f"{text[:head]}{separator}{text[-tail:]}"
+
+    def _directory_question(self, question: dict[str, Any]) -> dict[str, Any]:
+        full = self._question(question)
+        return {
+            "exercise_id": full["exercise_id"],
+            "text": self._clip_directory_text(full["text"], 900),
+            "question_latex": self._clip_directory_text(full["question_latex"], 400),
+            "answer": self._clip_directory_text(full["answer"], 300),
+            "answer_latex": self._clip_directory_text(full["answer_latex"], 240),
+            "page_scope_hint": self._clip_directory_text(full["page_scope_hint"], 120),
+        }
+
+    def _directory_question_signals(self, questions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+        """分批并发提取题目数学特征；这是目录归纳的中间摘要，不是逐题分类结果。"""
+        batches = [questions[index:index + self.directory_batch_size] for index in range(0, len(questions), self.directory_batch_size)]
+
+        def request_batch(index: int, batch: list[dict[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+            exercise_ids = [str(question["exercise_id"]) for question in batch]
+            schema = {
+                "type": "object", "additionalProperties": False, "required": ["signals"],
+                "properties": {"signals": {"type": "array", "minItems": len(batch), "maxItems": len(batch), "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["exercise_id", "primary_object", "main_question", "decisive_condition"],
+                    "properties": {
+                        "exercise_id": {"type": "string", "enum": exercise_ids},
+                        "primary_object": {"type": "string"}, "main_question": {"type": "string"},
+                        "decisive_condition": {"type": "string"},
+                    },
+                }}},
+            }
+            prompt = {
+                "task": "仅提取每道中考数学题的短数学特征，供后续粗粒度目录设计使用；不是目录分类。",
+                "instructions": [
+                    "每道题必须返回一次，字段均用极简数学术语。",
+                    "primary_object 写首要对象或情境；main_question 写最终主问；decisive_condition 写决定性条件或方法。",
+                    "剥离具体故事背景，不给出三级、四级目录名称，不解释推理。",
+                ],
+                "questions": [self._directory_question(question) for question in batch],
+            }
+            request = self._structured_request("math_directory_question_signals", prompt, schema, reasoning_effort=self.directory_reasoning_effort)
+            payload = self._decode(self._request_with_retry("POST", "/responses", request))
+            rows = payload.get("signals") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise CloudProviderError("目录题目特征未返回 signals 数组")
+            by_id = {str(row.get("exercise_id", "")): row for row in rows if isinstance(row, dict)}
+            if len(by_id) != len(batch) or set(by_id) != set(exercise_ids):
+                raise CloudProviderError("目录题目特征没有覆盖当前批次的全部题目")
+            return index, [by_id[exercise_id] for exercise_id in exercise_ids]
+
+        results: list[list[dict[str, Any]] | None] = [None] * len(batches)
+        failed_exercise_ids: list[str] = []
+        with ThreadPoolExecutor(max_workers=min(self.directory_concurrency, len(batches))) as executor:
+            futures = {
+                executor.submit(request_batch, index, batch): batch
+                for index, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                try:
+                    index, rows = future.result()
+                except CloudProviderError:
+                    # 单个特征分批失败不能丢弃其他已完成分批；最终方案会带上覆盖缺口。
+                    failed_exercise_ids.extend(str(question["exercise_id"]) for question in futures[future])
+                    continue
+                results[index] = rows
+        return [row for batch in results if batch for row in batch], failed_exercise_ids
+
+    def _request_with_retry(self, method: str, path: str, payload: Any) -> Any:
+        """目录分析可安全重试瞬时模型或网关失败；参数错误不做无意义重试。"""
+        last_error: CloudProviderError | None = None
+        for attempt in range(self.directory_retry_attempts):
+            try:
+                return self._request(
+                    method, path, payload,
+                    timeout_seconds=self.directory_request_timeout_seconds,
+                )
+            except CloudProviderError as error:
+                message = str(error)
+                if "HTTP 4" in message and "HTTP 429" not in message:
+                    raise
+                last_error = error
+                if attempt + 1 < self.directory_retry_attempts:
+                    time.sleep(1.5 * (2 ** attempt))
+        assert last_error is not None
+        raise CloudProviderError(f"目录模型请求已重试 {self.directory_retry_attempts} 次仍失败：{last_error}") from last_error
+
+    def _structured_request(
+        self, name: str, prompt: dict[str, Any], schema: dict[str, Any], reasoning_effort: str | None = None
+    ) -> dict[str, Any]:
+        return self._responses_request(name, [prompt], schema, reasoning_effort=reasoning_effort)
 
     def _staged_structured_request(
-        self, name: str, static_context: dict[str, Any], dynamic_context: dict[str, Any], schema: dict[str, Any]
+        self, name: str, static_context: dict[str, Any], dynamic_context: dict[str, Any], schema: dict[str, Any],
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """把固定 Skill/目录和动态题目拆成连续消息，便于兼容网关复用共同前缀。"""
-        return self._responses_request(name, [static_context, dynamic_context], schema)
+        return self._responses_request(name, [static_context, dynamic_context], schema, reasoning_effort=reasoning_effort)
 
-    def _responses_request(self, name: str, contexts: list[dict[str, Any]], schema: dict[str, Any]) -> dict[str, Any]:
+    def _responses_request(
+        self, name: str, contexts: list[dict[str, Any]], schema: dict[str, Any], reasoning_effort: str | None = None
+    ) -> dict[str, Any]:
         """按 Responses API 生成请求；连续 input 消息让固定上下文位于动态题目前。"""
         request: dict[str, Any] = {
             "model": self.model,
@@ -586,7 +706,7 @@ class OpenAIChatCompletionsProvider:
                 for context in contexts
             ],
             "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
-            "reasoning": {"effort": self.reasoning_effort},
+            "reasoning": {"effort": reasoning_effort or self.reasoning_effort},
         }
         return request
 
@@ -608,50 +728,8 @@ class OpenAIChatCompletionsProvider:
             raise CloudProviderError(f"云端模型没有返回全部{label}结果")
         return [by_id[exercise_id] for exercise_id in expected_ids]
 
-    def _requires_independent_audit(
-        self, question: dict[str, Any], decision: dict[str, Any], target: Target, rules: dict[str, Any], audit_mode: str
-    ) -> bool:
-        """兼容单题接口的条件审核判断，与交互式作业保持相同的风险边界。"""
-        if audit_mode == "disabled":
-            return False
-        if audit_mode == "always":
-            return True
-        self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else None
-        if not self_check or self_check.get("passed") is not True:
-            return True
-        warnings = set(self._question(question).get("input_warnings") or [])
-        if warnings - {"answer_text_missing"}:
-            return True
-        core_start = int((rules.get("rules") or {}).get("large_question_core_topic_start_order", 10))
-        return target.topic_order < core_start or (
-            target.topic_order >= core_start and str(target.level2_title) == "【大题】"
-        )
-
-    @staticmethod
-    def _self_check_audit(decision: dict[str, Any]) -> dict[str, Any]:
-        self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else {}
-        return {
-            "mode": "second_stage_self_check",
-            "passed": self_check.get("passed") is True,
-            "violations": list(self_check.get("violations") or []),
-            "reason": str(self_check.get("reason") or "第二阶段自检通过，未触发独立审核"),
-            "confidence": self_check.get("confidence"),
-        }
-
-    @staticmethod
-    def _disabled_audit() -> dict[str, Any]:
-        return {
-            "mode": "disabled",
-            "passed": None,
-            "violations": [],
-            "reason": "独立审核已关闭；当前仅执行专题路由与目录分类自检",
-            "confidence": None,
-        }
-
-    def classify(
-        self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any], audit_mode: str = "disabled"
-    ) -> dict[str, Any]:
-        """实时精准分类：全局路由、专题内分类与自检，必要时独立审核。"""
+    def classify(self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any]) -> dict[str, Any]:
+        """实时精准分类：全局专题路由、专题内目录分类与第二阶段自检。"""
         routing = self._decode(self._request("POST", "/responses", self.build_routing_request(question, taxonomy, rules)))
         topic_id = routing.get("latest_topic_id")
         if routing.get("status") != "routed" or not taxonomy.topic(str(topic_id)):
@@ -660,41 +738,32 @@ class OpenAIChatCompletionsProvider:
                 "confidence": 0.0, "reason": str(routing.get("reason") or "无法确定最终归属专题"),
                 "review_reasons": self._string_list(routing.get("review_reasons")) or ["topic_routing_failed"],
                 "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
-                "routing": routing, "audit": None,
+                "routing": routing,
             }
-        decision = self.classify_topic_batch(
-            [question], str(topic_id), taxonomy, rules, {str(question["exercise_id"]): routing}
-        )[0]
-        target = taxonomy.global_target(str(decision.get("target_level3_id")), decision.get("target_level4_id")) if decision.get("target_level3_id") else None
-        if decision.get("status") != "suggested" or not target or target.topic_id != str(topic_id):
-            decision["audit"] = None
-            return decision
-        if not self._requires_independent_audit(question, decision, target, rules, audit_mode):
-            decision["audit"] = self._disabled_audit() if audit_mode == "disabled" else self._self_check_audit(decision)
-            return decision
-        try:
-            audit = self._decode(self._request("POST", "/responses", self.build_audit_request(question, routing, decision, target, taxonomy, rules)))
-        except CloudProviderError as error:
-            # 前两阶段已有可检查的候选时，审核服务失败不应把整题变成 500 或丢失候选。
-            decision["status"] = "review"
-            decision["review_reasons"] = self._string_list(decision.get("review_reasons")) + ["audit_request_failed"]
-            decision["reason"] = f"已生成候选，但独立审核未完成：{error}"
-            decision["audit"] = None
-            decision["confidence"] = min(
-                self._confidence(decision.get("confidence")), self._confidence(routing.get("confidence"))
-            )
-            return decision
-        decision["audit"] = audit
-        audit_passed = self._boolean(audit.get("passed"), "passed")
-        if not audit_passed:
-            decision["status"] = "review"
-            decision["review_reasons"] = self._string_list(decision.get("review_reasons")) + ["skill_audit_failed"] + self._string_list(audit.get("violations"))
-            decision["reason"] = str(audit.get("reason") or decision.get("reason") or "Skill 二次审核未通过")
-        decision["confidence"] = min(
-            self._confidence(decision.get("confidence")),
-            self._confidence(routing.get("confidence")),
-            self._confidence(audit.get("confidence")),
-        )
+        current_topic_id = str(topic_id)
+        for reroute_count in range(2):
+            decision = self.classify_topic_batch(
+                [question], current_topic_id, taxonomy, rules, {str(question["exercise_id"]): routing}
+            )[0]
+            self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else {}
+            corrected_topic_id = str(self_check.get("reroute_topic_id") or "").strip()
+            if (
+                decision.get("status") != "review"
+                or self_check.get("passed") is not False
+                or not corrected_topic_id
+                or corrected_topic_id == current_topic_id
+                or not taxonomy.topic(corrected_topic_id)
+            ):
+                break
+            if taxonomy.is_large_question_scope(question) and not taxonomy.large_question_level2_id(corrected_topic_id):
+                break
+            routing = dict(routing)
+            routing["initial_topic_id"] = routing.get("initial_topic_id") or current_topic_id
+            routing["rerouted_from_topic_id"] = current_topic_id
+            routing["latest_topic_id"] = corrected_topic_id
+            routing["reroute_reason"] = str(self_check.get("reason") or decision.get("reason") or "二阶段目录自检要求修正专题")
+            routing["reroute_count"] = reroute_count + 1
+            current_topic_id = corrected_topic_id
         return decision
 
     def create_batch_jsonl(self, questions: list[dict[str, Any]], taxonomy: Any, rules: dict[str, Any]) -> str:

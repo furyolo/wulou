@@ -72,3 +72,82 @@ def write_approved_plan(baseline: Path, output: Path, plan_path: Path) -> dict[s
     load_workbook(output, read_only=True).close()
     if sha256(baseline) != plan["baseline_sha256"]: raise ValueError("写入后基准工作簿发生变化")
     return {"output": str(output), "baseline_sha256": plan["baseline_sha256"], "inserted_rows": len(rows)}
+
+
+def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> dict[str, Any]:
+    """重建一个已锚定的三级目录范围，并证明范围外单元格未改变。
+
+    方案必须由人工在审核页补全 ``replace_start_row``、``replace_end_row`` 和
+    ``rows``。该函数不猜测 Excel 行号，不接受二级容器行，也不覆盖基准文件。
+    """
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if plan.get("status") != "approved":
+        raise ValueError("目录重构方案必须先人工审核为 approved")
+    if sha256(baseline) != plan.get("baseline_sha256"):
+        raise ValueError("基准工作簿已变化，拒绝写入")
+    if output.exists():
+        raise ValueError("目标文件已存在，拒绝覆盖")
+    sheet_name = str(plan.get("sheet", ""))
+    start = int(plan.get("replace_start_row", 0))
+    end = int(plan.get("replace_end_row", 0))
+    rows = plan.get("rows") or []
+    if not sheet_name or start < 1 or end < start or not rows:
+        raise ValueError("重构方案缺少工作表、明确替换范围或目录行")
+    if any(not isinstance(row, dict) or row.get("level") not in {3, 4} for row in rows):
+        raise ValueError("重构方案只能写入三级或四级目录行")
+
+    baseline_book = load_workbook(baseline, data_only=False)
+    if sheet_name not in baseline_book.sheetnames:
+        raise ValueError("重构方案引用的工作表不存在")
+    baseline_sheet = baseline_book[sheet_name]
+    if end > baseline_sheet.max_row:
+        raise ValueError("重构范围超出工作表")
+    comparison_max_column = max(baseline_sheet.max_column, 19)
+    baseline_rows = [
+        tuple(cell.value for cell in row)
+        for row in baseline_sheet.iter_rows(max_col=comparison_max_column)
+    ]
+
+    book = load_workbook(baseline, data_only=False)
+    sheet = book[sheet_name]
+    removed = end - start + 1
+    sheet.delete_rows(start, removed)
+    sheet.insert_rows(start, len(rows))
+    style_source_row = start - 1 if start > 1 else start + len(rows)
+    for offset, item in enumerate(rows):
+        row_index = start + offset
+        for source_cell in sheet[style_source_row]:
+            target = sheet.cell(row_index, source_cell.column)
+            target._style = copy(source_cell._style)
+            target.number_format = source_cell.number_format
+        level = int(item["level"])
+        sheet.cell(row_index, 3 if level == 3 else 4).value = str(item["title"])
+        if item.get("knowledge_point_id"):
+            sheet.cell(row_index, 5).value = str(item["knowledge_point_id"])
+        if item.get("reason"):
+            sheet.cell(row_index, 14).value = str(item["reason"])
+        if item.get("question_count") is not None:
+            sheet.cell(row_index, 19).value = int(item["question_count"])
+    book.save(output)
+
+    reopened = load_workbook(output, data_only=False)
+    output_sheet = reopened[sheet_name]
+    def row_values(row_index: int) -> tuple[Any, ...]:
+        return tuple(output_sheet.cell(row_index, column).value for column in range(1, comparison_max_column + 1))
+
+    # 被替换范围之外，前缀原样不动，后缀仅允许因行数变化整体平移。
+    for row_index in range(1, start):
+        if row_values(row_index) != baseline_rows[row_index - 1]:
+            raise ValueError("重构范围之前的单元格发生变化")
+    shift = len(rows) - removed
+    for old_row in range(end + 1, len(baseline_rows) + 1):
+        new_row = old_row + shift
+        if row_values(new_row) != baseline_rows[old_row - 1]:
+            raise ValueError("重构范围之后的单元格发生变化")
+    reopened.close()
+    if sha256(baseline) != plan["baseline_sha256"]:
+        raise ValueError("写入后基准工作簿发生变化")
+    return {
+        "output": str(output), "baseline_sha256": plan["baseline_sha256"],
+        "replace_start_row": start, "replace_end_row": end, "written_rows": len(rows),
+    }

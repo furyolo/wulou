@@ -107,7 +107,7 @@ class ClassifierTests(unittest.TestCase):
             "status": "suggested", "target_level3_id": "real-calc", "target_level4_id": None,
             "confidence": 0.99, "reason": "不含分母有理化", "review_reasons": [],
             "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
-            "routing": {"latest_topic_id": "topic-real"}, "audit": {"passed": True},
+            "routing": {"latest_topic_id": "topic-real"},
         }, taxonomy, rules)
         self.assertEqual(result["status"], "suggested")
         self.assertEqual(result["target"]["topic_id"], "topic-real")
@@ -139,7 +139,6 @@ class ClassifierTests(unittest.TestCase):
             "confidence": 0.99, "reason": "全等三角形是证明主线，sin60°仅用于中间计算", "review_reasons": [],
             "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
             "routing": {"latest_topic_id": "topic-triangle", "required_knowledge_points": ["三角形全等", "sin60°"]},
-            "audit": {"passed": True},
         }, taxonomy, rules)
         self.assertEqual(result["status"], "suggested")
         self.assertEqual(result["target"]["topic_id"], "topic-triangle")

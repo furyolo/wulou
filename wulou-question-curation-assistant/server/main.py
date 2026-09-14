@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import traceback
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import defaultdict, deque
 from http import HTTPStatus
@@ -28,6 +29,10 @@ try:
     from .classification_jobs import ClassificationJobStore
     from .proposals import ProposalStore
     from .model_input import SNAPSHOT_VERSION, build_model_input_snapshot
+    from .directory_refactor import prepare_refactor_context, validate_refactor_plan
+    from .excel_scope import resolve_excel_scope
+    from .directory_exports import write_directory_export
+    from .taxonomy_sync import synchronize_taxonomy
 except ImportError:  # 支持直接运行 python server/main.py。
     from cache import ResultCache
     from classifier import classify, content_hash, validate_model_decision
@@ -38,9 +43,16 @@ except ImportError:  # 支持直接运行 python server/main.py。
     from classification_jobs import ClassificationJobStore
     from proposals import ProposalStore
     from model_input import SNAPSHOT_VERSION, build_model_input_snapshot
+    from directory_refactor import prepare_refactor_context, validate_refactor_plan
+    from excel_scope import resolve_excel_scope
+    from directory_exports import write_directory_export
+    from taxonomy_sync import synchronize_taxonomy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS = 1000
+MAX_TOPIC_REROUTES_PER_QUESTION = 2
+ROUTING_PIPELINE_VERSION = 2
 
 
 def load_settings(config_path: Path) -> dict[str, Any]:
@@ -70,9 +82,18 @@ class ServiceState:
         taxonomy_path = resolve_path(self.config_path, str(self.settings["taxonomy_path"]))
         generated_taxonomy = PROJECT_ROOT / ".local-data" / "taxonomy.yaml"
         example_taxonomy = (PROJECT_ROOT / "config" / "taxonomy.example.yaml").resolve()
-        # 首次保存云端设置会生成 settings.local.yaml 并沿用示例路径；此时应自动切换到已导出的真实目录。
-        if self.config_path.name in {"settings.example.yaml", "settings.local.yaml"} and taxonomy_path == example_taxonomy and generated_taxonomy.exists():
+        # 本机配置沿用示例路径时，目录快照固定写入 Git 忽略的 .local-data。
+        if self.config_path.name in {"settings.example.yaml", "settings.local.yaml"} and taxonomy_path == example_taxonomy:
             taxonomy_path = generated_taxonomy
+        sync_result = synchronize_taxonomy(
+            config_path=self.config_path,
+            workbook_settings=self.settings.get("directory_workbook"),
+            output_path=taxonomy_path,
+        )
+        if sync_result.workbook_path:
+            # 目录重构等后续流程必须使用与当前 taxonomy 同一版本的工作簿。
+            self.settings.setdefault("directory_workbook", {})["path"] = str(sync_result.workbook_path)
+        self.taxonomy_sync_status = sync_result.status
         self.taxonomy = Taxonomy.from_file(taxonomy_path)
         rules_path = resolve_path(self.config_path, str(self.settings["rules_path"]))
         with rules_path.open("r", encoding="utf-8") as file:
@@ -94,6 +115,9 @@ class ServiceState:
         batch_path = resolve_path(self.config_path, str((classifier_settings.get("batch") or {}).get("storage_path", "../.local-data/batches")))
         self.batches = BatchStore(batch_path)
         self.classification_jobs = ClassificationJobStore()
+        # 所有实时分类作业共用同一组模型请求槽位，避免两个 Focus 各自按 3 路并发时叠加成 6 路。
+        self._llm_slot_condition = threading.Condition()
+        self._active_llm_requests = 0
         proposal_minimum = int((self.rules.get("rules") or {}).get("proposal_minimum_distinct_questions", 3))
         self.proposals = ProposalStore(cache_path.with_name("directory-proposals.sqlite3"), proposal_minimum)
 
@@ -102,14 +126,13 @@ class ServiceState:
         routing_model = str(cloud_settings.get("routing_model", "")).strip()
         directory_effort = str(cloud_settings.get("reasoning_effort", "high")).strip().lower()
         routing_effort = str(cloud_settings.get("routing_reasoning_effort", "medium")).strip().lower()
-        audit_mode = self.audit_mode()
-        source_catalogue_id = self.source_catalogue_id(question)
         material = "|".join([
-            str(question.get("exercise_id", "")), source_catalogue_id, content_hash(question), self.taxonomy.version, self.rule_version,
+            "semantic-cache-v2", str(question.get("exercise_id", "")), content_hash(question), self.taxonomy.version, self.rule_version,
             SNAPSHOT_VERSION,
             self.rule_hash,
             # 模型名相同时，更换 API 协议或提供方也必须重新生成结果。
-            f"cloud:{self.cloud.provider_name}:{self.cloud.model}:directory:{directory_effort}:route:{routing_model or self.cloud.model}:{routing_effort}:audit:{audit_mode}" if self.cloud else "heuristic-v1",
+            # 保持与旧版默认“审核关闭”结果的缓存兼容，避免移除该步骤后无谓重跑全量题目。
+            f"cloud:{self.cloud.provider_name}:{self.cloud.model}:directory:{directory_effort}:route:{routing_model or self.cloud.model}:{routing_effort}:audit:disabled" if self.cloud else "heuristic-v1",
         ])
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -128,8 +151,23 @@ class ServiceState:
         exercise_id = str(question["exercise_id"])
         source_catalogue_id = self.source_catalogue_id(question)
         cached = self.cache.get(self.cache_key(question), exercise_id, source_catalogue_id)
+        # 旧版二阶段自检发现跨专题问题后只能停在待复核。仅让这类旧模型复核结果重跑，
+        # 已通过的建议、人工修正和真实移动记录仍复用原缓存。
+        if (
+            cached
+            and cached.get("status") == "review"
+            and cached.get("classification_method") == "model"
+            and isinstance(cached.get("routing"), dict)
+            and cached.get("routing_pipeline_version") != ROUTING_PIPELINE_VERSION
+        ):
+            cached = None
         manual = self.cache.get_manual_override(exercise_id, source_catalogue_id)
         if not manual:
+            if cached:
+                move = self.cache.latest_catalogue_moves([exercise_id]).get(exercise_id)
+                if move:
+                    cached = dict(cached)
+                    cached["catalogue_move"] = move
             return cached
         # 人工采纳的路径优先于模型输出；即使模型缓存因规则更新失效，人工结果仍可恢复。
         result = dict(cached or {
@@ -152,9 +190,13 @@ class ServiceState:
                 "accepted_at": manual["accepted_at"],
             },
         })
+        move = self.cache.latest_catalogue_moves([exercise_id]).get(exercise_id)
+        if move:
+            result["catalogue_move"] = move
         return result
 
     def cache_result(self, question: dict[str, Any], result: dict[str, Any]) -> None:
+        result["routing_pipeline_version"] = ROUTING_PIPELINE_VERSION
         self.cache.put(
             self.cache_key(question),
             str(question["exercise_id"]),
@@ -251,7 +293,6 @@ class ServiceState:
             "routing_model": cloud_settings.get("routing_model", ""),
             "reasoning_effort": cloud_settings.get("reasoning_effort", "high"),
             "routing_reasoning_effort": cloud_settings.get("routing_reasoning_effort", "medium"),
-            "audit_mode": self.audit_mode(),
             "max_concurrent_requests": self.llm_concurrency(),
             "base_url": cloud_settings.get("base_url", "https://api.openai.com/v1"),
             "api_key_env": cloud_settings.get("api_key_env", "OPENAI_API_KEY"),
@@ -264,7 +305,6 @@ class ServiceState:
         routing_model = str(payload.get("routing_model", "")).strip()
         reasoning_effort = str(payload.get("reasoning_effort", "high")).strip().lower()
         routing_reasoning_effort = str(payload.get("routing_reasoning_effort", "medium")).strip().lower()
-        audit_mode = str(payload.get("audit_mode", "disabled")).strip().lower()
         try:
             max_concurrent_requests = int(payload.get("max_concurrent_requests", existing_cloud.get("max_concurrent_requests", 3)))
         except (TypeError, ValueError) as error:
@@ -278,8 +318,6 @@ class ServiceState:
             raise ValueError("目录分类推理强度必须是 none、low、medium、high、xhigh 或 max")
         if routing_reasoning_effort not in allowed_efforts:
             raise ValueError("专题路由推理强度必须是 none、low、medium、high、xhigh 或 max")
-        if audit_mode not in {"disabled", "conditional", "always"}:
-            raise ValueError("审核策略必须是 disabled、conditional 或 always")
         if not 1 <= max_concurrent_requests <= 5:
             raise ValueError("LLM 并发数必须是 1 到 5")
         if not base_url.startswith(("https://", "http://")): raise ValueError("接口地址必须以 http:// 或 https:// 开头")
@@ -289,13 +327,14 @@ class ServiceState:
             "model": model, "base_url": base_url, "api_key_env": api_key_env,
             "reasoning_effort": reasoning_effort,
             "routing_reasoning_effort": routing_reasoning_effort,
-            "audit_mode": audit_mode,
             "max_concurrent_requests": max_concurrent_requests,
         })
         if routing_model:
             cloud["routing_model"] = routing_model
         else:
             cloud.pop("routing_model", None)
+        # 清理旧版本留下的独立审核配置，后续不会再触发第三次模型调用。
+        cloud.pop("audit_mode", None)
         if payload.get("clear_api_key") is True: cloud.pop("api_key", None)
         elif "api_key" in payload:
             api_key = str(payload.get("api_key") or "").strip()
@@ -307,6 +346,8 @@ class ServiceState:
         save_settings(target_config, self.settings)
         self.config_path = target_config
         self.cloud = OpenAIChatCompletionsProvider(cloud)
+        with self._llm_slot_condition:
+            self._llm_slot_condition.notify_all()
         return self.cloud_summary()
 
     def routing_cloud(self) -> OpenAIChatCompletionsProvider | None:
@@ -324,14 +365,8 @@ class ServiceState:
         routing_settings["reasoning_effort"] = routing_effort
         return OpenAIChatCompletionsProvider(routing_settings)
 
-    def audit_mode(self) -> str:
-        """默认只执行前两阶段；旧配置缺失时同样不额外产生第三次模型请求。"""
-        cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
-        mode = str(cloud_settings.get("audit_mode", "disabled")).strip().lower()
-        return mode if mode in {"disabled", "conditional", "always"} else "disabled"
-
     def llm_concurrency(self) -> int:
-        """限制整条实时流水线的总在途请求数，保护网关免受突发并发冲击。"""
+        """限制服务全部实时流水线的总在途请求数，保护网关免受突发并发冲击。"""
         cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
         try:
             value = int(cloud_settings.get("max_concurrent_requests", 3))
@@ -339,56 +374,31 @@ class ServiceState:
             value = 3
         return max(1, min(5, value))
 
-    def _requires_independent_audit(
-        self, question: dict[str, Any], decision: dict[str, Any], target: Any
-    ) -> bool:
-        """只以 Skill 定义的高风险结构和 LLM 自检结果决定是否追加独立审核。"""
-        if self.audit_mode() == "disabled":
-            return False
-        if self.audit_mode() == "always":
-            return True
-        self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else None
-        if not self_check or self_check.get("passed") is not True:
-            return True
-        # 答案是辅助证据，单独缺失不必增加一轮审核；其余排版或题干风险交给独立审核判断。
-        warnings = set(build_model_input_snapshot(question).get("warnings") or [])
-        if warnings - {"answer_text_missing"}:
-            return True
-        core_start = int((self.rules.get("rules") or {}).get("large_question_core_topic_start_order", 10))
-        # Skill 要求：前置专题检查最晚必备知识；后续专题【大题】检查核心/辅助关系。
-        return target.topic_order < core_start or (
-            target.topic_order >= core_start and str(target.level2_title) == "【大题】"
-        )
+    @contextmanager
+    def _llm_request_slot(self):
+        """为一次真实云端调用申请服务级并发槽位。"""
+        with self._llm_slot_condition:
+            while self._active_llm_requests >= self.llm_concurrency():
+                self._llm_slot_condition.wait()
+            self._active_llm_requests += 1
+        try:
+            yield
+        finally:
+            with self._llm_slot_condition:
+                self._active_llm_requests -= 1
+                self._llm_slot_condition.notify_all()
 
-    @staticmethod
-    def _self_check_audit(decision: dict[str, Any]) -> dict[str, Any]:
-        """未触发第三轮时保留第二轮自检证据，便于结果追溯。"""
-        self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else {}
-        return {
-            "mode": "second_stage_self_check",
-            "passed": self_check.get("passed") is True,
-            "violations": list(self_check.get("violations") or []),
-            "reason": str(self_check.get("reason") or "第二阶段自检通过，未触发独立审核"),
-            "confidence": self_check.get("confidence"),
-        }
-
-    @staticmethod
-    def _disabled_audit() -> dict[str, Any]:
-        """显式标记用户关闭了第三阶段，避免将其误读成一次审核通过。"""
-        return {
-            "mode": "disabled",
-            "passed": None,
-            "violations": [],
-            "reason": "独立审核已关闭；当前仅执行专题路由与目录分类自检",
-            "confidence": None,
-        }
+    def _call_cloud(self, operation: Any, *args: Any) -> Any:
+        """所有实时分类阶段都经由共享闸门调用云端。"""
+        with self._llm_request_slot():
+            return operation(*args)
 
     def create_classification_job(self, questions: Any) -> dict[str, Any]:
         """提交整页实时分类作业；HTTP 立刻返回，长推理在本机后台继续执行。"""
         if not isinstance(questions, list) or not questions:
             raise ValueError("questions 必须是非空数组")
-        if len(questions) > 100:
-            raise ValueError("单个分类作业最多处理 100 道题")
+        if len(questions) > MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS:
+            raise ValueError(f"单个分类作业最多处理 {MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS} 道题")
         normalized: list[dict[str, Any]] = []
         exercise_ids: set[str] = set()
         for question in questions:
@@ -405,6 +415,29 @@ class ServiceState:
         )
         worker.start()
         return self.classification_jobs.snapshot(job.job_id)
+
+    def create_directory_refactor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """生成目录重构的只读审核方案；不在此处修改 Excel 或题湖。"""
+        context = prepare_refactor_context(payload, self.taxonomy)
+        if not self.cloud or not self.cloud.configured:
+            raise ValueError("目录重构需要已配置云端模型；未配置时不能凭关键词生成目录")
+        raw_plan = self.cloud.propose_directory_refactor(context, self.rules)
+        plan = validate_refactor_plan(context, raw_plan)
+        # 方案只携带自动定位出的写入范围；这里不写入 Excel，确认阶段仍需单独执行。
+        plan["excel_scope"] = resolve_excel_scope(self.settings, self.config_path, self.taxonomy.raw, context["focus"])
+        plan["taxonomy_version"] = self.taxonomy.version
+        plan["rule_version"] = self.rule_version
+        return plan
+
+    def create_directory_export(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """保存完整题库交接包，供用户手动启动的 Agent 使用。"""
+        context = prepare_refactor_context(payload, self.taxonomy)
+        return write_directory_export(
+            PROJECT_ROOT / ".local-data" / "directory-exports",
+            context=context,
+            taxonomy_version=self.taxonomy.version,
+            rule_version=self.rule_version,
+        )
 
     @staticmethod
     def _chunks(items: list[Any], size: int) -> list[list[Any]]:
@@ -468,7 +501,7 @@ class ServiceState:
             self.classification_jobs.set_stage(job_id, "routing", routed_count)
             route_queue = deque(self._chunks(uncached, 10))
             classify_queue: deque[tuple[str, list[dict[str, Any]], dict[str, dict[str, Any]]]] = deque()
-            audit_queue: deque[tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]]]] = deque()
+            reroute_attempts: defaultdict[str, int] = defaultdict(int)
             total_limit = self.llm_concurrency()
 
             def finalize(batch: list[dict[str, Any]], decisions: list[dict[str, Any]]) -> None:
@@ -476,8 +509,33 @@ class ServiceState:
                     result = validate_model_decision(question, decision, self.taxonomy, self.rules)
                     self._put_job_result(job_id, question, result)
 
-            # 单个执行池对三阶段共享总上限。调度器在仍有路由任务时保留至少一个路由槽位，
-            # 其余空闲槽优先给已经产生的分类与审核任务，避免三阶段的全页栅栏等待。
+            def corrected_routing(question: dict[str, Any], decision: dict[str, Any], current_topic_id: str) -> tuple[str, dict[str, Any]] | None:
+                """仅接受二阶段自检明确给出的跨专题修正，最多重路由两次以避免循环。"""
+                self_check = decision.get("self_check") if isinstance(decision.get("self_check"), dict) else {}
+                corrected_topic_id = str(self_check.get("reroute_topic_id") or "").strip()
+                if decision.get("status") != "review" or self_check.get("passed") is not False:
+                    return None
+                if not corrected_topic_id or corrected_topic_id == current_topic_id or not self.taxonomy.topic(corrected_topic_id):
+                    return None
+                if self.taxonomy.is_large_question_scope(question) and not self.taxonomy.large_question_level2_id(corrected_topic_id):
+                    decision["review_reasons"] = list(decision.get("review_reasons") or []) + ["target_topic_large_question_directory_missing"]
+                    decision["reason"] = "修正专题未配置唯一的【大题】二级目录，无法安全重路由"
+                    return None
+                exercise_id = str(question["exercise_id"])
+                if reroute_attempts[exercise_id] >= MAX_TOPIC_REROUTES_PER_QUESTION:
+                    decision["review_reasons"] = list(decision.get("review_reasons") or []) + ["topic_reroute_limit_reached"]
+                    decision["reason"] = "已完成最多两次专题重路由，仍无法稳定确定归属，请人工复核"
+                    return None
+                reroute_attempts[exercise_id] += 1
+                routing = dict(decision.get("routing") or {})
+                routing["initial_topic_id"] = routing.get("initial_topic_id") or current_topic_id
+                routing["rerouted_from_topic_id"] = current_topic_id
+                routing["latest_topic_id"] = corrected_topic_id
+                routing["reroute_reason"] = str(self_check.get("reason") or decision.get("reason") or "二阶段目录自检要求修正专题")
+                routing["reroute_count"] = reroute_attempts[exercise_id]
+                return corrected_topic_id, routing
+
+            # 单个执行池对专题路由和专题内分类共享总上限；仍保留一个路由槽位，避免全页栅栏等待。
             with ThreadPoolExecutor(max_workers=total_limit) as executor:
                 futures: dict[Any, tuple[str, Any]] = {}
 
@@ -486,23 +544,23 @@ class ServiceState:
                         active_route = any(kind == "routing" for kind, _payload in futures.values())
                         if route_queue and not active_route:
                             batch = route_queue.popleft()
-                            future = executor.submit(routing_cloud.route_fast_batch, batch, self.taxonomy, self.rules)
+                            future = executor.submit(
+                                self._call_cloud, routing_cloud.route_fast_batch, batch, self.taxonomy, self.rules
+                            )
                             futures[future] = ("routing", batch)
-                        elif audit_queue:
-                            batch, decisions, audit_items = audit_queue.popleft()
-                            future = executor.submit(cloud.audit_batch, audit_items, self.taxonomy, self.rules)
-                            futures[future] = ("auditing", (batch, decisions, audit_items))
-                            self.classification_jobs.set_stage(job_id, "auditing", routed_count)
                         elif classify_queue:
                             topic_id, batch, routing_by_id = classify_queue.popleft()
                             future = executor.submit(
-                                cloud.classify_topic_batch, batch, topic_id, self.taxonomy, self.rules, routing_by_id
+                                self._call_cloud, cloud.classify_topic_batch,
+                                batch, topic_id, self.taxonomy, self.rules, routing_by_id,
                             )
                             futures[future] = ("classifying", (topic_id, batch))
                             self.classification_jobs.set_stage(job_id, "classifying", routed_count)
                         elif route_queue:
                             batch = route_queue.popleft()
-                            future = executor.submit(routing_cloud.route_fast_batch, batch, self.taxonomy, self.rules)
+                            future = executor.submit(
+                                self._call_cloud, routing_cloud.route_fast_batch, batch, self.taxonomy, self.rules
+                            )
                             futures[future] = ("routing", batch)
                         else:
                             return
@@ -520,14 +578,21 @@ class ServiceState:
                                 for question in batch:
                                     self._put_job_result(job_id, question, self._cloud_review_result(str(question["exercise_id"]), str(error)), failed=True)
                             else:
-                                routed_groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
+                                routed_groups: dict[tuple[str, bool], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
                                 for question, routing in zip(batch, routings, strict=True):
                                     topic_id = str(routing.get("latest_topic_id") or "")
                                     if routing.get("status") != "routed" or not self.taxonomy.topic(topic_id):
                                         self._put_job_result(job_id, question, self._routing_review_result(question, routing))
+                                    elif self.taxonomy.is_large_question_scope(question) and not self.taxonomy.large_question_level2_id(topic_id):
+                                        self._put_job_result(job_id, question, self._routing_review_result(question, {
+                                            **routing,
+                                            "status": "review",
+                                            "reason": "目标专题未配置唯一的【大题】二级目录，无法安全重路由",
+                                            "review_reasons": ["target_topic_large_question_directory_missing"],
+                                        }))
                                     else:
-                                        routed_groups[topic_id].append((question, routing))
-                                for topic_id, pairs in routed_groups.items():
+                                        routed_groups[(topic_id, self.taxonomy.is_large_question_scope(question))].append((question, routing))
+                                for (topic_id, _is_large_question), pairs in routed_groups.items():
                                     batch_questions = [item[0] for item in pairs]
                                     routing_by_id = {str(item[0]["exercise_id"]): item[1] for item in pairs}
                                     classify_queue.append((topic_id, batch_questions, routing_by_id))
@@ -537,44 +602,27 @@ class ServiceState:
                             topic_id, batch = payload
                             try:
                                 decisions = future.result()
-                            except CloudProviderError as error:
+                            except (CloudProviderError, ValueError) as error:
                                 for question in batch:
                                     self._put_job_result(job_id, question, self._cloud_review_result(str(question["exercise_id"]), str(error)), failed=True)
                             else:
-                                audit_items: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]] = []
+                                settled_batch: list[dict[str, Any]] = []
+                                settled_decisions: list[dict[str, Any]] = []
+                                rerouted_groups: dict[tuple[str, bool], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
                                 for question, decision in zip(batch, decisions, strict=True):
-                                    target_level3_id = decision.get("target_level3_id")
-                                    target = self.taxonomy.global_target(
-                                        str(target_level3_id), decision.get("target_level4_id")
-                                    ) if target_level3_id else None
-                                    if decision.get("status") == "suggested" and target and target.topic_id == topic_id:
-                                        if self._requires_independent_audit(question, decision, target):
-                                            routing = decision.get("routing") if isinstance(decision.get("routing"), dict) else {}
-                                            audit_items.append((question, routing, decision, target))
-                                        else:
-                                            decision["audit"] = (
-                                                self._disabled_audit() if self.audit_mode() == "disabled"
-                                                else self._self_check_audit(decision)
-                                            )
-                                if audit_items:
-                                    audit_queue.append((batch, decisions, audit_items))
-                                else:
-                                    finalize(batch, decisions)
-                        else:
-                            batch, decisions, audit_items = payload
-                            try:
-                                audits = future.result()
-                            except CloudProviderError as error:
-                                for _question, _routing, decision, _target in audit_items:
-                                    decision["status"] = "review"
-                                    decision["review_reasons"] = list(decision.get("review_reasons") or []) + ["audit_request_failed"]
-                                    decision["reason"] = f"已生成候选，但独立审核未完成：{error}"
-                                    decision["audit"] = None
-                            else:
-                                audit_by_id = {str(audit["exercise_id"]): audit for audit in audits}
-                                for question, _routing, decision, _target in audit_items:
-                                    decision["audit"] = audit_by_id[str(question["exercise_id"])]
-                            finalize(batch, decisions)
+                                    rerouted = corrected_routing(question, decision, topic_id)
+                                    if rerouted:
+                                        corrected_topic_id, routing = rerouted
+                                        rerouted_groups[(corrected_topic_id, self.taxonomy.is_large_question_scope(question))].append((question, routing))
+                                        continue
+                                    settled_batch.append(question)
+                                    settled_decisions.append(decision)
+                                for (corrected_topic_id, _is_large_question), pairs in rerouted_groups.items():
+                                    rerouted_questions = [item[0] for item in pairs]
+                                    rerouted_by_id = {str(item[0]["exercise_id"]): item[1] for item in pairs}
+                                    classify_queue.append((corrected_topic_id, rerouted_questions, rerouted_by_id))
+                                if settled_batch:
+                                    finalize(settled_batch, settled_decisions)
                         schedule()
             self.classification_jobs.complete(job_id)
         except Exception as error:
@@ -617,13 +665,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
+        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/directory-refactors", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         try:
-            payload = self._read_json()
+            payload = self._read_json(maximum_length=12_000_000 if self.path in {"/api/v1/directory-exports", "/api/v1/classification-jobs"} else 2_000_000)
             if self.path == "/api/v1/settings/cloud":
                 self._send_json(HTTPStatus.OK, self.server.state.update_cloud_settings(payload))
+            elif self.path == "/api/v1/directory-refactors":
+                self._send_json(HTTPStatus.OK, self.server.state.create_directory_refactor(payload))
+            elif self.path == "/api/v1/directory-exports":
+                self._send_json(HTTPStatus.CREATED, self.server.state.create_directory_export(payload))
             elif self.path == "/api/v1/manual-classifications":
                 self._send_json(HTTPStatus.CREATED, self.server.state.save_manual_classification(payload))
             elif self.path == "/api/v1/history/catalogue-moves":
@@ -727,9 +779,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             cached["cache_hit"] = True
             return cached
         if self.server.state.cloud and self.server.state.cloud.configured:
-            decision = self.server.state.cloud.classify(
-                question, self.server.state.taxonomy, self.server.state.rules, self.server.state.audit_mode()
-            )
+            decision = self.server.state.cloud.classify(question, self.server.state.taxonomy, self.server.state.rules)
             result = validate_model_decision(question, decision, self.server.state.taxonomy, self.server.state.rules)
         else:
             result = classify(question, self.server.state.taxonomy, self.server.state.rules)
@@ -840,12 +890,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not cloud or not cloud.configured: raise ValueError("云端模型未配置；请设置 cloud.api_key_env 指向的环境变量")
         return cloud
 
-    def _read_json(self) -> dict[str, Any]:
+    def _read_json(self, maximum_length: int = 2_000_000) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
         if not raw_length:
             raise ValueError("缺少 Content-Length")
         length = int(raw_length)
-        if length > 2_000_000:
+        if length > maximum_length:
             raise ValueError("请求体过大")
         raw = self.rfile.read(length)
         parsed = json.loads(raw.decode("utf-8"))

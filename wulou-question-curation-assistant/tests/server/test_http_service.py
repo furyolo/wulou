@@ -6,7 +6,6 @@ import tempfile
 import threading
 import time
 import unittest
-from types import SimpleNamespace
 from pathlib import Path
 import sys
 
@@ -15,7 +14,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from server.main import CurationServer, ServiceState
+from server.main import CurationServer, MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS, ServiceState
+from server.taxonomy import Taxonomy
 
 
 class HttpServiceTests(unittest.TestCase):
@@ -149,6 +149,19 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(result["target"]["path"][-1], "分母有理化")
         self.assertEqual(result["manual_override"]["source"], "manual")
 
+        # 题目移到人工指定的目标叶子后，恢复缓存时目录 ID 已变；
+        # 人工决定仍必须压过旧的模型复核缓存。
+        moved_lookup_status, moved_lookup = self.request(
+            "POST", "/api/v1/cache/classifications/lookup", {"questions": [{
+                **body,
+                "current_catalogue_id": "level4-target",
+            }]}
+        )
+        self.assertEqual(moved_lookup_status, 200)
+        moved_result = moved_lookup["results"][0]
+        self.assertEqual(moved_result["target"]["path"][-1], "分母有理化")
+        self.assertEqual(moved_result["manual_override"]["source"], "manual")
+
     def test_catalogue_move_history_reports_latest_confirmed_move(self) -> None:
         first = {
             "exercise_id": "move-history-1", "stable_code": "CS2026MOVE001",
@@ -187,7 +200,7 @@ class HttpServiceTests(unittest.TestCase):
         status, payload = self.request("POST", "/api/v1/settings/cloud", {
             "model": "test-cloud-model", "routing_model": "test-routing-model",
             "reasoning_effort": "high", "routing_reasoning_effort": "medium",
-            "audit_mode": "conditional", "max_concurrent_requests": 5,
+            "max_concurrent_requests": 5,
             "base_url": "https://api.example.test/v1", "api_key": "test-secret-key-123",
         })
         self.assertEqual(status, 200)
@@ -195,7 +208,6 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(payload["routing_model"], "test-routing-model")
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["routing_reasoning_effort"], "medium")
-        self.assertEqual(payload["audit_mode"], "conditional")
         self.assertEqual(payload["max_concurrent_requests"], 5)
         self.assertTrue(payload["api_key_configured"])
         self.assertNotIn("api_key", payload)
@@ -203,30 +215,7 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(persisted["classifier"]["cloud"]["api_key"], "test-secret-key-123")
         self.assertEqual(persisted["classifier"]["cloud"]["routing_model"], "test-routing-model")
         self.assertEqual(persisted["classifier"]["cloud"]["routing_reasoning_effort"], "medium")
-        self.assertEqual(persisted["classifier"]["cloud"]["audit_mode"], "conditional")
         self.assertEqual(persisted["classifier"]["cloud"]["max_concurrent_requests"], 5)
-
-    def test_conditional_audit_only_skips_low_risk_topic_after_self_check(self) -> None:
-        self.state.settings["classifier"] = {"cloud": {"audit_mode": "conditional"}}
-        question = {"question_press": "已知函数关系，求对应值"}
-        decision = {"self_check": {"passed": True, "violations": [], "reason": "一致", "confidence": 0.98}}
-        low_risk_target = SimpleNamespace(topic_order=11, level2_title="【微专题】")
-        self.assertFalse(self.state._requires_independent_audit(question, decision, low_risk_target))
-        self.assertTrue(self.state._requires_independent_audit(
-            {**question, "question_latex": r"\frac{1{2}"}, decision, low_risk_target
-        ))
-        self.assertTrue(self.state._requires_independent_audit(
-            question, decision, SimpleNamespace(topic_order=10, level2_title="【大题】")
-        ))
-
-    def test_disabled_audit_never_schedules_a_third_model_request(self) -> None:
-        self.state.settings["classifier"] = {"cloud": {"audit_mode": "disabled"}}
-        question = {"question_press": "计算并化简"}
-        decision = {"self_check": {"passed": False, "violations": ["需复核"]}}
-        high_risk_target = SimpleNamespace(topic_order=1, level2_title="【大题】")
-        self.assertEqual(self.state.audit_mode(), "disabled")
-        self.assertFalse(self.state._requires_independent_audit(question, decision, high_risk_target))
-        self.assertEqual(self.state._disabled_audit()["mode"], "disabled")
 
     def test_interactive_job_returns_accepted_and_progress_can_be_polled(self) -> None:
         body = {
@@ -247,6 +236,86 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["completed"], 1)
         self.assertEqual(snapshot["results"][0]["exercise_id"], "job-2529221")
+
+    def test_interactive_job_accepts_focus_sized_payload_and_keeps_a_protection_limit(self) -> None:
+        questions = [{"exercise_id": f"focus-{index}", "question_press": "分母有理化"} for index in range(101)]
+        submitted = self.state.create_classification_job(questions)
+        self.assertEqual(submitted["total"], 101)
+        for _ in range(100):
+            status = self.state.classification_jobs.snapshot(submitted["job_id"])["status"]
+            if status == "completed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(status, "completed")
+        with self.assertRaisesRegex(ValueError, "最多处理 1000 道题"):
+            self.state.create_classification_job([
+                {"exercise_id": f"oversized-{index}"}
+                for index in range(MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS + 1)
+            ])
+
+    def test_concurrent_jobs_share_one_service_level_llm_limit(self) -> None:
+        target = self.state.taxonomy.all_targets()[0]
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        class StubCloud:
+            configured = True
+            provider_name = "stub"
+            model = "fast-model"
+            reasoning_effort = "medium"
+
+            @staticmethod
+            def _result(question):
+                return {
+                    "exercise_id": str(question["exercise_id"]), "status": "suggested",
+                    "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
+                    "confidence": 0.96, "reason": "唯一命中", "review_reasons": [],
+                    "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+                }
+
+            def _call(self, callback):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    time.sleep(0.02)
+                    return callback()
+                finally:
+                    with lock:
+                        active -= 1
+
+            def route_fast_batch(self, questions, _taxonomy, _rules):
+                return self._call(lambda: [{
+                    "exercise_id": str(question["exercise_id"]), "status": "routed",
+                    "required_knowledge_points": ["实数运算"], "latest_topic_id": target.topic_id,
+                    "confidence": 0.96, "reason": "路由完成", "review_reasons": [],
+                } for question in questions])
+
+            def classify_topic_batch(self, questions, _topic_id, _taxonomy, _rules, routings):
+                return self._call(lambda: [
+                    {**self._result(question), "routing": routings[str(question["exercise_id"])]}
+                    for question in questions
+                ])
+
+        self.state.settings["classifier"] = {"cloud": {"max_concurrent_requests": 1}}
+        self.state.cloud = StubCloud()
+        first = self.state.create_classification_job([
+            {"exercise_id": f"first-{index}", "question_press": "分母有理化"} for index in range(10)
+        ])
+        second = self.state.create_classification_job([
+            {"exercise_id": f"second-{index}", "question_press": "分母有理化"} for index in range(10)
+        ])
+        for _ in range(100):
+            first_status = self.state.classification_jobs.snapshot(first["job_id"])["status"]
+            second_status = self.state.classification_jobs.snapshot(second["job_id"])["status"]
+            if first_status == second_status == "completed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(first_status, "completed")
+        self.assertEqual(second_status, "completed")
+        self.assertEqual(peak, 1)
 
     def test_interactive_cloud_job_routes_then_classifies_with_one_topic_catalog(self) -> None:
         target = self.state.taxonomy.all_targets()[0]
@@ -276,21 +345,14 @@ class HttpServiceTests(unittest.TestCase):
                     "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
                     "confidence": 0.96, "reason": "唯一命中", "review_reasons": [],
                     "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
-                    "routing": routings[str(question["exercise_id"])], "audit": None,
+                    "routing": routings[str(question["exercise_id"])],
                 } for question in questions]
-
-            def audit_batch(self, items, taxonomy, rules):
-                self.calls.append("audit")
-                return [{
-                    "exercise_id": str(question["exercise_id"]), "passed": True,
-                    "violations": [], "reason": "未发现冲突", "confidence": 0.95,
-                } for question, _routing, _decision, _target in items]
 
         cloud = StubCloud()
         # 供内部桩断言使用，避免闭包中依赖 unittest 的隐式绑定。
         cloud.assertEqual = self.assertEqual
         self.state.cloud = cloud
-        self.state.settings["classifier"] = {"cloud": {"audit_mode": "always"}}
+        self.state.settings["classifier"] = {"cloud": {}}
         body = {"questions": [{"exercise_id": "cloud-job-1", "question_press": "分母有理化"}]}
         status, submitted = self.request("POST", "/api/v1/classification-jobs", body)
         self.assertEqual(status, 202)
@@ -301,7 +363,89 @@ class HttpServiceTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["results"][0]["target"]["level3_id"], target.level3_id)
-        self.assertEqual(cloud.calls, ["routing", f"topic:{target.topic_id}", "audit"])
+        self.assertEqual(cloud.calls, ["routing", f"topic:{target.topic_id}"])
+
+    def test_second_stage_reroutes_to_corrected_topic_large_question_directory(self) -> None:
+        self.state.taxonomy = Taxonomy({
+            "taxonomy_version": "reroute-test-v1",
+            "topics": [
+                {"id": "topic-algebra", "title": "专题2：代数式", "order": 2, "level2": [
+                    {"id": "algebra-large", "title": "【大题】", "level3": [
+                        {"id": "algebra-fraction", "title": "分式化简", "level4": []},
+                    ]},
+                ]},
+                {"id": "topic-trigonometry", "title": "专题12：锐角三角函数", "order": 12, "level2": [
+                    {"id": "trigonometry-large", "title": "【大题】", "level3": [
+                        {"id": "trigonometry-solve", "title": "锐角三角函数求值", "level4": [
+                            {"id": "trigonometry-special-angle", "title": "考法1：特殊角三角函数值"},
+                        ]},
+                    ]},
+                ]},
+            ],
+        })
+        target = self.state.taxonomy.global_target("trigonometry-solve", "trigonometry-special-angle")
+        self.assertIsNotNone(target)
+
+        class StubCloud:
+            configured = True
+            provider_name = "stub"
+            model = "fast-model"
+            reasoning_effort = "medium"
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def route_fast_batch(self, questions, _taxonomy, _rules):
+                self.calls.append("routing:topic-algebra")
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "status": "routed",
+                    "required_knowledge_points": ["分式"], "latest_topic_id": "topic-algebra",
+                    "confidence": 0.8, "reason": "初始路由", "review_reasons": [],
+                } for question in questions]
+
+            def classify_topic_batch(self, questions, topic_id, _taxonomy, _rules, routings):
+                self.calls.append(f"classify:{topic_id}")
+                if topic_id == "topic-algebra":
+                    return [{
+                        "exercise_id": str(question["exercise_id"]), "status": "review",
+                        "target_level3_id": None, "target_level4_id": None,
+                        "confidence": 0.0, "reason": "遗漏锐角三角函数",
+                        "review_reasons": ["topic_routing_incomplete"],
+                        "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+                        "routing": routings[str(question["exercise_id"])],
+                        "self_check": {"passed": False, "violations": ["遗漏更晚专题"], "reason": "需改路由", "confidence": 0.98, "reroute_topic_id": "topic-trigonometry"},
+                    } for question in questions]
+                self.assertEqual(topic_id, "topic-trigonometry")
+                if not all(routings[str(question["exercise_id"])]["rerouted_from_topic_id"] == "topic-algebra" for question in questions):
+                    raise AssertionError("重路由后的专题轨迹缺失")
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "status": "suggested",
+                    "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
+                    "confidence": 0.96, "reason": "特殊角三角函数值",
+                    "review_reasons": [],
+                    "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+                    "routing": routings[str(question["exercise_id"])],
+                    "self_check": {"passed": True, "violations": [], "reason": "路由与目录一致", "confidence": 0.96, "reroute_topic_id": None},
+                } for question in questions]
+
+        cloud = StubCloud()
+        cloud.assertEqual = self.assertEqual
+        self.state.cloud = cloud
+        self.state.settings["classifier"] = {"cloud": {"max_concurrent_requests": 1}}
+        _, submitted = self.request("POST", "/api/v1/classification-jobs", {"questions": [{
+            "exercise_id": "reroute-1", "question_press": "计算 tan60° 的值",
+            "scope": {"topic_id": "topic-algebra", "level2_id": "algebra-large"},
+        }]})
+        for _ in range(50):
+            _, snapshot = self.request("GET", f"/api/v1/classification-jobs/{submitted['job_id']}")
+            if snapshot["status"] == "completed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(cloud.calls, ["routing:topic-algebra", "classify:topic-algebra", "classify:topic-trigonometry"])
+        self.assertEqual(snapshot["results"][0]["target"]["topic_id"], "topic-trigonometry")
+        self.assertEqual(snapshot["results"][0]["target"]["level2_title"], "【大题】")
+        self.assertEqual(snapshot["results"][0]["routing"]["rerouted_from_topic_id"], "topic-algebra")
 
     def test_interactive_cloud_job_starts_topic_classification_before_all_routing_batches_finish(self) -> None:
         target = self.state.taxonomy.all_targets()[0]
@@ -332,14 +476,8 @@ class HttpServiceTests(unittest.TestCase):
                     "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
                     "confidence": 0.96, "reason": "唯一命中", "review_reasons": [],
                     "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
-                    "routing": routings[str(question["exercise_id"])], "audit": None,
+                    "routing": routings[str(question["exercise_id"])],
                 } for question in questions]
-
-            def audit_batch(self, items, taxonomy, rules):
-                return [{
-                    "exercise_id": str(question["exercise_id"]), "passed": True,
-                    "violations": [], "reason": "未发现冲突", "confidence": 0.95,
-                } for question, _routing, _decision, _target in items]
 
         self.state.settings.setdefault("classifier", {}).setdefault("cloud", {})["max_concurrent_requests"] = 2
         self.state.cloud = StubCloud()

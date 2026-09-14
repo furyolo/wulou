@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,10 @@ class ResultCache:
             self._connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_stable_code ON {self._MANUAL_TABLE}(stable_code)"
             )
+            self._connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_exercise_updated "
+                f"ON {self._MANUAL_TABLE}(exercise_id, updated_at DESC)"
+            )
             # 工作成果只记录题湖已经回读确认的真实移动，独立于可清除的模型缓存。
             self._connection.execute(
                 f"""
@@ -125,6 +130,18 @@ class ResultCache:
                 """,
                 (exercise_id, source_catalogue_id, cache_key),
             ).fetchone()
+            # 分类结论由题目内容、目录版本和规则版本决定；题目移入目标叶子后，
+            # 仍应复用同一结论，不能因来源目录变化再次请求模型。
+            if not row:
+                row = self._connection.execute(
+                    f"""
+                    SELECT payload_json FROM {self._TABLE}
+                    WHERE exercise_id = ? AND cache_key = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (exercise_id, cache_key),
+                ).fetchone()
         return json.loads(row[0]) if row else None
 
     def put(
@@ -171,7 +188,12 @@ class ResultCache:
         return cursor.rowcount
 
     def get_manual_override(self, exercise_id: str, source_catalogue_id: str) -> dict[str, Any] | None:
-        """读取当前目录语境下已经写入题湖的人工修正。"""
+        """读取人工修正：当前目录优先，其次是同题最新人工决定。
+
+        题目移动到人工指定的目标叶子后，当前目录 ID 会变成目标目录 ID，
+        不能因此退回旧的模型缓存。若同题在当前目录没有记录，采用最新一次
+        已写入题湖的人工决定；当前目录存在记录时仍以其为准。
+        """
         with self._lock:
             row = self._connection.execute(
                 f"""
@@ -181,6 +203,17 @@ class ResultCache:
                 """,
                 (exercise_id, source_catalogue_id),
             ).fetchone()
+            if not row:
+                row = self._connection.execute(
+                    f"""
+                    SELECT stable_code, original_target_path_json, target_path_json, accepted_at, updated_at
+                    FROM {self._MANUAL_TABLE}
+                    WHERE exercise_id = ?
+                    ORDER BY updated_at DESC, rowid DESC
+                    LIMIT 1
+                    """,
+                    (exercise_id,),
+                ).fetchone()
         if not row:
             return None
         return {
@@ -271,15 +304,28 @@ class ResultCache:
             ).fetchone()
         return {"record_id": cursor.lastrowid, "moved_at": row[0]}
 
-    def catalogue_move_report(self) -> dict[str, Any]:
-        """按题目保留最近一次移动，用于工作成果汇报。"""
+    def catalogue_move_report(self, now: datetime | None = None) -> dict[str, Any]:
+        """按 UTC+8 的今日范围汇报每题最近一次移动。"""
+        utc8 = timezone(timedelta(hours=8))
+        current_time = now or datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            raise ValueError("工作成果查询时间必须携带时区")
+        local_today = current_time.astimezone(utc8).date()
+        local_start = datetime.combine(local_today, time.min, tzinfo=utc8)
+        local_end = local_start + timedelta(days=1)
+        # SQLite CURRENT_TIMESTAMP 以 UTC 的 YYYY-MM-DD HH:MM:SS 保存；采用左闭右开区间，
+        # 可以准确包含北京时间 00:00:00，又不会包含次日零点的记录。
+        utc_start = local_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        utc_end = local_end.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
             rows = self._connection.execute(
                 f"""
                 SELECT exercise_id, stable_code, original_path_json, target_path_json, moved_at
                 FROM {self._MOVE_HISTORY_TABLE}
+                WHERE moved_at >= ? AND moved_at < ?
                 ORDER BY moved_at DESC, id DESC
-                """
+                """,
+                (utc_start, utc_end),
             ).fetchall()
         latest_by_exercise: dict[str, dict[str, Any]] = {}
         for exercise_id, stable_code, original_json, target_json, moved_at in rows:
@@ -294,9 +340,47 @@ class ResultCache:
         records = list(latest_by_exercise.values())
         topics = sorted({record["target_path"][0] for record in records if record["target_path"]})
         return {
-            "summary": {"classified_count": len(records), "topics": topics},
+            "summary": {
+                "classified_count": len(records),
+                "topics": topics,
+                "period": {
+                    "label": f"{local_today.isoformat()} 今日",
+                    "date": local_today.isoformat(),
+                    "timezone": "UTC+08:00",
+                    "utc_start": utc_start,
+                    "utc_end": utc_end,
+                },
+            },
             "records": records,
         }
+
+    def latest_catalogue_moves(self, exercise_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """返回指定题目的最近一次已回读目录移动，用于跨 Focus 恢复终态。"""
+        normalized = sorted({str(item).strip() for item in exercise_ids if str(item).strip()})
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT exercise_id, stable_code, target_catalogue_id, target_path_json, moved_at
+                FROM {self._MOVE_HISTORY_TABLE}
+                WHERE exercise_id IN ({placeholders})
+                ORDER BY moved_at DESC, id DESC
+                """,
+                normalized,
+            ).fetchall()
+        latest: dict[str, dict[str, Any]] = {}
+        for exercise_id, stable_code, target_catalogue_id, target_path_json, moved_at in rows:
+            if exercise_id in latest:
+                continue
+            latest[exercise_id] = {
+                "stable_code": stable_code or "",
+                "target_catalogue_id": target_catalogue_id,
+                "target_path": json.loads(target_path_json),
+                "moved_at": moved_at,
+            }
+        return latest
 
     def close(self) -> None:
         with self._lock:
