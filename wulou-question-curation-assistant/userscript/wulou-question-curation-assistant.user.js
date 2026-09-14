@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         题湖题库数学题分类助手
 // @namespace    https://www.wulouai.com/
-// @version      0.16.3
+// @version      0.16.4
 // @description  采集当前题目页，显示分类建议，并可将确认后的建议写入题湖可视化分类。
 // @match        https://www.wulouai.com/user-center/exercise-part/*
 // @grant        GM_xmlhttpRequest
@@ -504,13 +504,24 @@
     return focusAvailable ? 'hydrate_focus' : 'page';
   }
 
+  function manualSelectionPayload(exerciseId, question, result) {
+    return {
+      exercise_id: normalizeWhitespace(exerciseId),
+      current_catalogue_id: normalizeWhitespace(question?.currentCatalogueId),
+      stable_code: normalizeWhitespace(question?.stableCode),
+      original_target_path: Array.isArray(result?.manual_override?.original_target_path)
+        ? result.manual_override.original_target_path : [],
+      target_path: Array.isArray(result?.target?.path) ? result.target.path : [],
+    };
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
-      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, CLASSIFICATION_JOB_MAX_QUESTIONS,
+      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, CLASSIFICATION_JOB_MAX_QUESTIONS,
     };
     return;
   }
@@ -531,6 +542,9 @@
     cards: new Map(),
     accepting: new Set(),
     acceptingAll: false,
+    // 人工目录选择必须先落到本地服务；否则原生翻页、刷新或全目录缓存汇总
+    // 会用旧模型结果覆盖仅存在于当前页面内存中的选择。
+    manualSaveChains: new Map(),
     confirmation: null,
     historyReport: null,
     directoryPlan: null,
@@ -1511,7 +1525,27 @@
     return selected;
   }
 
-  function applyManualTarget(exerciseId, path) {
+  function queueManualSelectionSave(exerciseId, question, result) {
+    const previous = state.manualSaveChains.get(exerciseId) || Promise.resolve();
+    const payload = manualSelectionPayload(exerciseId, question, result);
+    // 同题连续修改时严格按选择顺序写入，避免较早的网络请求晚到后覆盖最新目录。
+    const write = previous.catch(() => undefined).then(() => request('POST', '/api/v1/manual-classifications', payload));
+    state.manualSaveChains.set(exerciseId, write);
+    return write.finally(() => {
+      if (state.manualSaveChains.get(exerciseId) === write) state.manualSaveChains.delete(exerciseId);
+    });
+  }
+
+  async function flushManualSelectionSaves() {
+    const writes = [...state.manualSaveChains.values()];
+    if (!writes.length) return;
+    setStatus(`正在保存 ${writes.length} 道人工选择的目录…`);
+    const outcomes = await Promise.allSettled(writes);
+    const failed = outcomes.find(item => item.status === 'rejected');
+    if (failed) throw new Error(`人工选择尚未保存：${failed.reason?.message || '本地服务请求失败'}`);
+  }
+
+  async function applyManualTarget(exerciseId, path) {
     const result = state.results.get(exerciseId);
     const question = state.cards.get(exerciseId);
     if (!result || !question?.card) return;
@@ -1544,7 +1578,18 @@
     state.results.set(exerciseId, manualResult);
     renderBadge(question.card, manualResult);
     updateLegend();
-    setStatus(`题目 ${exerciseId} 已应用人工分类，点击“采纳”写入题湖。`);
+    setStatus(`正在保存题目 ${exerciseId} 的人工分类…`);
+    try {
+      await queueManualSelectionSave(exerciseId, question, manualResult);
+      // 用户可能在保存期间再次修改了该题；只为仍是本次选择的结果更新提示。
+      if (state.results.get(exerciseId) === manualResult) {
+        setStatus(`题目 ${exerciseId} 的人工分类已保存，点击“采纳”写入题湖。`);
+      }
+    } catch (error) {
+      if (state.results.get(exerciseId) === manualResult) {
+        setStatus(`题目 ${exerciseId} 的人工分类尚未保存：${error.message}`, true);
+      }
+    }
   }
 
   function openManualEditor(exerciseId, badge) {
@@ -1590,13 +1635,13 @@
           select.append(option);
         }
         select.value = selectedPath[depth] || '';
-        select.addEventListener('change', () => {
+        select.addEventListener('change', async () => {
           selectedPath = selectedPath.slice(0, depth);
           if (select.value) selectedPath.push(select.value);
           const selectedNode = directoryNodeForPath(selectedPath);
           const children = Array.isArray(selectedNode?.child) ? selectedNode.child : [];
           if (selectedNode && !children.length) {
-            applyManualTarget(exerciseId, selectedPath);
+            await applyManualTarget(exerciseId, selectedPath);
             return;
           }
           renderFields();
@@ -2149,6 +2194,14 @@
 
   async function acceptAllSuggestions() {
     if (state.busy || state.acceptingAll) return;
+    try {
+      // 先确认刚刚完成的人工目录选择已写入本地服务；随后若需要汇总全目录，
+      // 缓存查询即可读到这些选择，而不会退回模型的待复核结果。
+      await flushManualSelectionSaves();
+    } catch (error) {
+      setStatus(error.message, true);
+      return;
+    }
     if (acceptAllActionMode(state.workset, Boolean(focusedDirectoryScope(state.taxonomy))) === 'hydrate_focus') {
       const hydrated = await hydrateFocusAcceptanceQueue();
       if (hydrated.cancelled) return;

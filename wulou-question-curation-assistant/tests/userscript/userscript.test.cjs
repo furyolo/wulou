@@ -30,6 +30,7 @@ const {
   classificationProgressText,
   focusScopeForNavigationPath,
   acceptAllActionMode,
+  manualSelectionPayload,
   CLASSIFICATION_JOB_MAX_QUESTIONS,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
@@ -285,6 +286,19 @@ test('原生翻页后全部采纳会先汇总当前目录，而不是静默退�
   assert.equal(acceptAllActionMode('page', true), 'hydrate_focus');
   assert.equal(acceptAllActionMode('focus', true), 'focus');
   assert.equal(acceptAllActionMode('page', false), 'page');
+});
+
+test('人工目录选择会使用当前题目的来源目录持久化为待采纳决定', () => {
+  assert.deepEqual(manualSelectionPayload(' 42 ', {
+    currentCatalogueId: 'source-leaf', stableCode: 'CS2026-42',
+  }, {
+    target: { path: ['专题2：代数式', '【大题】', '整式运算'] },
+    manual_override: { original_target_path: ['专题1：实数', '【大题】', '实数运算'] },
+  }), {
+    exercise_id: '42', current_catalogue_id: 'source-leaf', stable_code: 'CS2026-42',
+    original_target_path: ['专题1：实数', '【大题】', '实数运算'],
+    target_path: ['专题2：代数式', '【大题】', '整式运算'],
+  });
 });
 
 test('按完整层级路径唯一解析题湖目录 ID', () => {
