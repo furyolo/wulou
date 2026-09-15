@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         题湖题库数学题分类助手
 // @namespace    https://www.wulouai.com/
-// @version      0.16.4
+// @version      0.16.27
 // @description  采集当前题目页，显示分类建议，并可将确认后的建议写入题湖可视化分类。
 // @match        https://www.wulouai.com/user-center/exercise-part/*
 // @grant        GM_xmlhttpRequest
@@ -25,6 +25,9 @@
   // 避免一次性请求过多导致登录态、CSRF 或站点限流问题。
   const ACCEPTANCE_CONCURRENCY = 3;
   const LOCAL_REQUEST_TIMEOUT_MS = 30000;
+  // 连接测试只读取模型详情，不触发模型生成；超过 15 秒可视为未能快速连通。
+  const CONNECTION_TEST_TIMEOUT_MS = 15000;
+  const CONNECTION_TEST_POLL_INTERVAL_MS = 300;
   const CLASSIFICATION_JOB_POLL_INTERVAL_MS = 2000;
   // 服务端单作业上限。800 题级当前目录范围会作为一个总作业持续流水化；
   // 仅超过该保护上限时才拆分，避免浏览器和本机服务持有无限大的任务快照。
@@ -374,6 +377,8 @@
     const summary = report?.summary || {};
     const records = Array.isArray(report?.records) ? report.records : [];
     const topics = Array.isArray(summary.topics) ? summary.topics : [];
+    const periodDate = normalizeWhitespace(summary.period?.date);
+    const periodLabel = normalizeWhitespace(summary.period?.label) || (periodDate ? `${periodDate} 工作成果` : '');
     const pathHtml = path => escapeReportHtml(compactHistoryPath(path));
     const rows = records.map(record => `
       <tr>
@@ -384,7 +389,7 @@
     const topicHtml = topics.map(topic => `<span>${escapeReportHtml(topic)}</span>`).join('') || '<span>暂无</span>';
     return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>题目分类今日成果汇总</title><style>
+<title>题目分类成果汇总</title><style>
   :root { color: #1f2c2a; font: 14px/1.55 "Microsoft YaHei", "微软雅黑", sans-serif; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
   body { max-width: 1280px; margin: 0 auto; padding: 20px; background: #f5f8f7; } main { padding: 24px; border: 1px solid #d7e1dd; border-radius: 14px; background: #fff; box-shadow: 0 14px 42px rgb(19 49 41 / .10); }
   h1 { margin: 0; color: #126b5c; font-size: 24px; font-weight: 700; letter-spacing: .02em; } .summary { display: grid; grid-template-columns: 170px minmax(0, 1fr); align-items: start; gap: 12px; margin: 16px 0; }.summary-card { min-height: 74px; padding: 13px 15px; border: 1px solid #cfe2db; border-radius: 11px; background: linear-gradient(135deg, #f4faf7, #e7f2ee); }.metric-label, .topic-label { color: #4e6860; font-size: 12px; font-weight: 700; }.count { margin-top: 2px; color: #0d6858; font-size: 29px; font-weight: 800; line-height: 1.1; }.count-label { color: #526660; font-size: 12px; }.topic-card { min-width: 0; min-height: 74px; padding: 13px 15px; border: 1px solid #dce7e3; border-radius: 11px; background: #fff; }.topics { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }.topics span { padding: 3px 8px; border-radius: 999px; background: #e7f2ee; color: #1d6554; font-size: 11px; font-weight: 650; }
@@ -392,7 +397,7 @@
   @media (max-width: 640px) { body { padding: 10px; } main { padding: 16px; border-radius: 12px; } h1 { font-size: 20px; }.summary { grid-template-columns: minmax(112px, .4fr) minmax(0, .6fr); gap: 8px; margin: 12px 0; }.summary-card, .topic-card { min-height: 0; padding: 11px; }.count { font-size: 25px; }.topics { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 3px; -webkit-overflow-scrolling: touch; }.topics span { flex: 0 0 auto; } table { display: block; table-layout: auto; font-size: 12px; } thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; } tbody { display: grid; gap: 10px; } tr { display: grid; gap: 6px; padding: 11px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; } td { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px; padding: 0; border: 0; font-size: 12px; } td::before { content: attr(data-label); color: #4e6860; font-size: 11px; font-weight: 700; } th:first-child, .code { width: auto; }.empty { display: block; padding: 10px; }.empty::before { content: none; } }
   @page { size: A4 landscape; margin: 10mm; } @media print { body { max-width: none; padding: 0; background: #fff; } main { padding: 0; border: 0; box-shadow: none; } }
 </style></head><body><main>
-  <h1>题目分类今日成果汇总</h1>
+  <h1>题目分类成果汇总${periodLabel ? `（${escapeReportHtml(periodLabel)}）` : ''}</h1>
   <section class="summary"><div class="summary-card"><div class="metric-label">已分类题目</div><div class="count">${Number(summary.classified_count) || 0}</div></div><div class="topic-card"><div class="topic-label">涉及专题</div><div class="topics">${topicHtml}</div></div></section>
   <table><thead><tr><th>Stable Code</th><th>原目录</th><th>现目录</th></tr></thead><tbody>${rows}</tbody></table>
 </main></body></html>`;
@@ -539,6 +544,12 @@
     classificationJobId: '',
     cacheRestoreId: 0,
     cloudConfigured: false,
+    cloudProfiles: [],
+    cloudSettings: null,
+    profileNameSave: Promise.resolve(),
+    profileDrag: null,
+    suppressProfileClickUntil: 0,
+    availableModelsByProfile: new Map(),
     cards: new Map(),
     accepting: new Set(),
     acceptingAll: false,
@@ -547,6 +558,9 @@
     manualSaveChains: new Map(),
     confirmation: null,
     historyReport: null,
+    historyLoadId: 0,
+    historyRange: { start: '', end: '' },
+    historyCalendarMonth: '',
     directoryPlan: null,
     priorityView: null,
     focusSnapshot: null,
@@ -560,11 +574,11 @@
     <style>
       :host { all: initial; color-scheme: light; font: 14px/1.5 "Microsoft YaHei", "微软雅黑", sans-serif; color: #1f2c2a; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
       *, *::before, *::after { box-sizing: border-box; }
-      button, input, select { font: inherit; }
+      button, input, select, textarea { font: inherit; }
       button { min-height: 38px; border: 1px solid #cfdad5; border-radius: 10px; background: #fff; color: #1f2c2a; cursor: pointer; padding: 8px 11px; transition: background .16s ease, border-color .16s ease, transform .16s ease; }
       button:hover { border-color: #8ba99f; background: #f2f7f5; }
       button:active { transform: translateY(1px); }
-      button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #9bd0bf; outline-offset: 2px; }
+      button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #9bd0bf; outline-offset: 2px; }
       button:disabled { opacity: .52; cursor: default; transform: none; }
       .tab { position: fixed; right: 0; top: 44%; z-index: 2147483000; display: grid; gap: 2px; justify-items: center; width: 50px; padding: 12px 6px; border-radius: 12px 0 0 12px; background: #126b5c; border-color: #126b5c; color: #fff; box-shadow: 0 10px 28px rgb(18 107 92 / .24); }
       .tab:hover { background: #0c5649; border-color: #0c5649; }
@@ -580,7 +594,7 @@
       .settings { min-height: 34px; padding: 6px 9px; border-color: transparent; background: #eef4f1; color: #39534c; font-size: 12px; font-weight: 650; }
       .form { display: grid; gap: 9px; padding: 12px; border: 1px solid #e2eae6; border-radius: 12px; background: #f8fbfa; }
       label { display: grid; gap: 4px; font-size: 12px; color: #526660; }
-      input, select { width: 100%; min-height: 36px; border: 1px solid #cfdad5; border-radius: 8px; background: #fff; color: #1f2c2a; padding: 7px 9px; }
+      input, select, textarea { width: 100%; min-height: 36px; border: 1px solid #cfdad5; border-radius: 8px; background: #fff; color: #1f2c2a; padding: 7px 9px; }
       .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
       .actions > :only-child { grid-column: 1 / -1; }
       .primary { border-color: #126b5c; background: #126b5c; color: #fff; font-weight: 650; }
@@ -598,22 +612,58 @@
       .settings-drawer { margin: 0; }
       .main-view[hidden], .settings-drawer[hidden] { display: none; }
       .settings-header { display: flex; align-items: center; gap: 8px; min-height: 34px; }
-      .settings-header h3 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+      .settings-header h3 { min-width: 0; margin: 0; font-size: 16px; letter-spacing: -.02em; }
       .back-settings { min-height: 34px; padding: 6px 9px; border-color: transparent; background: #eef4f1; color: #39534c; font-size: 12px; font-weight: 650; }
-      .settings-copy { margin: 0 0 2px; color: #687a74; font-size: 11px; }
-       .model-settings { display: grid; gap: 8px; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
-       .model-settings h4 { margin: 0; color: #29453d; font-size: 12px; }
-       .model-settings p { margin: -2px 0 0; color: #687a74; font-size: 11px; }
-      .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .profile-bar { display: grid; gap: 8px; padding: 9px; border: 1px solid #dce7e3; border-radius: 12px; background: #f6faf8; }
+      .profile-tabs { display: flex; flex-wrap: wrap; gap: 7px; }
+      .profile-card { position: relative; width: fit-content; min-width: 0; max-width: min(180px, 100%); border: 1px solid #d7e3de; border-radius: 10px; background: #fff; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease, opacity .16s ease; }
+      @keyframes profile-ready-to-drag { 0%, 100% { transform: translateY(-1px) rotate(0); } 28% { transform: translateY(-2px) rotate(-.45deg); } 68% { transform: translateY(-2px) rotate(.45deg); } }
+      .profile-card:hover { border-color: #9ebbb1; box-shadow: 0 5px 14px rgb(31 72 62 / .10); animation: profile-ready-to-drag .42s ease-in-out 1; }
+      .profile-card[aria-current="true"] { border-color: #78a99a; background: #eaf5f0; }
+      .profile-card.just-saved { border-color: #77aa96; box-shadow: 0 0 0 2px rgb(119 170 150 / .16); }
+      .profile-card.drag-candidate { border-color: #78a99a; box-shadow: 0 0 0 2px rgb(119 170 150 / .16); }
+      .profile-card.dragging { opacity: .28; animation: none; }
+      .profile-card.sorting { animation: none !important; }
+      .profile-drop-marker { flex: 0 0 auto; border: 1px dashed #78a99a; border-radius: 10px; background: #edf7f3; transition: width .14s ease, height .14s ease; }
+      .profile-select { display: block; width: auto; max-width: min(178px, calc(100vw - 92px)); min-height: 36px; overflow: hidden; border: 0; border-radius: 9px; background: transparent; color: #526660; cursor: grab; font-size: 12px; font-weight: 650; text-align: left; text-overflow: ellipsis; white-space: nowrap; padding: 7px 9px; }
+      .profile-select:active { cursor: grabbing; }
+      .profile-drag-ghost { position: fixed; z-index: 2147483003; min-height: 36px; max-width: min(180px, calc(100vw - 32px)); overflow: hidden; border: 1px solid #78a99a; border-radius: 10px; background: #eaf5f0; box-shadow: 0 9px 20px rgb(31 72 62 / .18); color: #126b5c; font-size: 12px; font-weight: 650; line-height: 20px; pointer-events: none; text-overflow: ellipsis; white-space: nowrap; padding: 7px 9px; transform: translate(-50%, -50%) rotate(1.5deg); }
+      .profile-select:hover { border-color: transparent; background: transparent; color: #31574d; }
+      .profile-card[aria-current="true"] .profile-select { color: #126b5c; }
+      .profile-card .profile-action { position: absolute; z-index: 1; display: grid; width: 18px; min-height: 18px; height: 18px; place-items: center; border: 1px solid #cbdad4; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgb(31 72 62 / .14); color: #5c7069; font-size: 12px; line-height: 1; opacity: 0; pointer-events: none; padding: 0; transition: opacity .14s ease, background .14s ease, border-color .14s ease; }
+      .profile-card:hover .profile-action, .profile-card.editing .profile-action { opacity: 1; pointer-events: auto; }
+      .profile-edit { top: -7px; left: -7px; }
+      .profile-delete { top: -7px; right: -7px; }
+      .profile-card .profile-edit:hover { border-color: #84a99c; background: #eef7f3; color: #126b5c; }
+      .profile-card .profile-delete:hover { border-color: #d7a39e; background: #fff5f4; color: #9a3430; }
+      .profile-name-editor { width: 100%; min-height: 36px; border: 0; border-radius: 9px; background: #fff; color: #29453d; font-size: 12px; font-weight: 650; padding: 7px 9px; }
+      .cloud-profile-name { display: none; }
+      .profile-add { min-height: 36px; border-style: dashed; color: #526660; font-size: 12px; padding: 5px 9px; }
+      .model-settings { display: grid; gap: 8px; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
+      .model-settings h4 { margin: 0; color: #29453d; font-size: 12px; }
+      .model-settings p { margin: -2px 0 0; color: #687a74; font-size: 11px; }
+      .profile-actions, .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .profile-actions { justify-content: flex-start; }
+      .connection-test-status { min-height: 18px; color: #526660; font-size: 12px; font-weight: 650; line-height: 1.4; }
+      .connection-test-status.error { color: #9a3430; }
+      .connection-test-status.success { color: #28704d; }
+      .advanced-connection { border-top: 1px solid #e4ebe8; margin-top: 2px; padding-top: 8px; }
+      .advanced-connection summary { color: #526660; cursor: pointer; font-size: 11px; font-weight: 650; }
+      .advanced-connection-fields { display: grid; gap: 8px; margin-top: 9px; }
+      .custom-headers { min-height: 72px; resize: vertical; line-height: 1.45; }
+      .custom-header-hint { margin: -3px 0 0; color: #687a74; font-size: 11px; line-height: 1.45; }
+      label.clear-custom-headers-row { display: flex; align-items: center; gap: 6px; color: #687a74; font-size: 11px; }
+      .clear-custom-headers { width: auto; min-height: auto; margin: 0; }
       .history-view { display: grid; gap: 12px; }
       .history-view[hidden] { display: none; }
       .history-header { display: flex; align-items: center; gap: 8px; min-height: 34px; }
       .history-header h3 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+      .history-date-range { min-height: 34px; margin-left: auto; padding: 6px 9px; border-color: #c8d9d2; background: #fff; color: #31574d; font-size: 12px; font-weight: 650; white-space: nowrap; }
+      .history-date-range:hover { border-color: #8ba99f; background: #f6faf8; }
       .back-history { min-height: 34px; padding: 6px 9px; border-color: transparent; background: #eef4f1; color: #39534c; font-size: 12px; font-weight: 650; }
       .history-export-actions { display: flex; gap: 6px; margin-left: auto; }
       .export-history { min-height: 34px; padding: 6px 9px; border-color: #126b5c; background: #126b5c; color: #fff; font-size: 12px; font-weight: 650; }
       .export-history:hover { border-color: #0c5649; background: #0c5649; }
-      .capture-history { min-height: 34px; padding: 6px 9px; border-color: #8ba99f; background: #fff; color: #31574d; font-size: 12px; font-weight: 650; }
       .history-summary { margin: 0; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #f6faf8; color: #405650; font-size: 12px; }
       .history-topics { display: flex; flex-wrap: wrap; gap: 6px; }
       .history-topic { padding: 3px 7px; border-radius: 999px; background: #e7f2ee; color: #266657; font-size: 11px; }
@@ -625,6 +675,23 @@
       .history-path strong { color: #39534c; }
       .history-arrow { color: #126b5c; font-size: 11px; font-weight: 700; }
       .history-empty { margin: 0; padding: 18px 10px; color: #687a74; font-size: 12px; text-align: center; }
+      .history-date-sheet[hidden] { display: none; }
+      .history-date-sheet { position: fixed; inset: 0; z-index: 2147483003; display: grid; align-items: end; background: rgb(19 49 41 / .34); }
+      .history-date-backdrop { position: absolute; inset: 0; border: 0; border-radius: 0; background: transparent; }
+      .history-date-dialog { position: relative; display: grid; gap: 10px; width: min(480px, 100vw); max-height: min(78dvh, 620px); margin: 0 auto; padding: 17px 18px calc(17px + env(safe-area-inset-bottom)); border: 1px solid #d7e1dd; border-bottom: 0; border-radius: 18px 18px 0 0; background: #fff; box-shadow: 0 -14px 42px rgb(19 49 41 / .2); }
+      .history-date-picker-head { display: grid; grid-template-columns: 38px 1fr 38px; align-items: center; gap: 6px; }
+      .history-date-picker-head strong { color: #29453d; font-size: 15px; text-align: center; }
+      .history-month-prev, .history-month-next { min-height: 34px; padding: 4px; border-color: transparent; background: #eef4f1; color: #31574d; font-size: 20px; line-height: 1; }
+      .history-weekdays, .history-calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+      .history-weekdays span { padding: 4px 0; color: #80918b; font-size: 11px; font-weight: 650; text-align: center; }
+      .history-calendar-day { min-height: 38px; padding: 4px; border-color: transparent; background: transparent; color: #29453d; font-size: 12px; }
+      .history-calendar-day:hover:not(:disabled) { background: #e7f2ee; }
+      .history-calendar-day.in-range { border-radius: 0; background: #e7f2ee; color: #1d6554; }
+      .history-calendar-day.range-start, .history-calendar-day.range-end { border-radius: 8px; background: #126b5c; color: #fff; font-weight: 700; }
+      .history-calendar-day.today:not(.range-start):not(.range-end) { box-shadow: inset 0 0 0 1px #8ba99f; }
+      .history-calendar-day:disabled { color: #c4cfca; cursor: not-allowed; }
+      .history-calendar-spacer { min-height: 38px; }
+      .history-date-hint { margin: 2px 0 0; color: #687a74; font-size: 11px; text-align: center; }
       .confirm-overlay[hidden] { display: none; }
       .confirm-overlay { position: fixed; inset: 0; z-index: 2147483002; display: grid; place-items: center; padding: 18px; background: rgb(19 49 41 / .34); }
       .confirm-dialog { width: min(352px, calc(100vw - 36px)); padding: 18px; border: 1px solid #d7e1dd; border-radius: 16px; background: #fff; box-shadow: 0 22px 56px rgb(19 49 41 / .26); }
@@ -633,8 +700,8 @@
       .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
       .danger { border-color: #b43c35; background: #b43c35; color: #fff; font-weight: 650; }
       .danger:hover { border-color: #8f2f2a; background: #8f2f2a; }
-      @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } }
-      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
+      @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } .cloud-profile-name { width: 98px; } .history-header { flex-wrap: wrap; } .history-date-range { order: 3; margin-left: 0; } .history-export-actions { margin-left: auto; } }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
     </style>
     <button class="tab" type="button" aria-label="展开题目分类助手" aria-expanded="false">
       <span class="tab-arrow" aria-hidden="true">‹</span>
@@ -659,24 +726,24 @@
       <section class="directory-plan" hidden aria-live="polite"><h3>目录重构方案</h3><p class="directory-plan-summary"></p><ul class="directory-plan-list"></ul></section>
       <div class="legend" hidden><h3>当前页状态</h3><ul></ul></div>
       </section>
-      <section class="settings-drawer" hidden aria-label="云端模型设置">
-        <div class="settings-header"><button class="back-settings" type="button">‹ 返回</button><h3>云端模型设置</h3></div>
-         <p class="settings-copy">分类固定执行“专题路由 → 目录分类与自检”两步。API 密钥留空会保留原密钥。</p>
+      <section class="settings-drawer" hidden aria-label="模型设置">
+        <div class="settings-header"><button class="back-settings" type="button">‹ 返回</button><h3>模型设置</h3></div>
+        <section class="profile-bar" aria-label="模型方案"><select class="cloud-profile-select" hidden aria-hidden="true"></select><div class="profile-tabs" role="tablist" aria-label="选择模型方案"><button class="create-cloud-profile profile-add" type="button">＋ 新建方案</button></div><input class="cloud-profile-name" type="text" maxlength="40" autocomplete="off" aria-hidden="true" tabindex="-1"></section>
          <div class="form">
-           <section class="model-settings"><h4>目录分类</h4><p>决定最终三级、四级目录。建议“高”。</p><label>模型<input class="cloud-model" type="text" autocomplete="off" placeholder="例如你的模型部署名"></label><label>推理强度<select class="classification-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium">中（medium）</option><option value="high" selected>高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
-           <section class="model-settings"><h4>专题路由</h4><p>按前置知识或压轴题核心考点选择全局专题。建议“中”。</p><label>模型（可选）<input class="routing-model" type="text" autocomplete="off" placeholder="留空则与目录分类模型相同"></label><label>推理强度<select class="routing-reasoning-effort"><option value="none">无（none）</option><option value="low">低（low）</option><option value="medium" selected>中（medium）</option><option value="high">高（high）</option><option value="xhigh">极高（xhigh）</option><option value="max">最高（max）</option></select></label></section>
-           <section class="model-settings"><h4>并发与流水线</h4><p>专题路由与目录分类共享总并发。题量较大时可提高到 4 或 5；出现限流则调低。</p><label>LLM 总并发<select class="max-concurrent-requests"><option value="1">1</option><option value="2">2</option><option value="3" selected>3（推荐）</option><option value="4">4</option><option value="5">5</option></select></label></section>
-           <label>接口地址<input class="cloud-base-url" type="url" autocomplete="off" placeholder="https://api.openai.com/v1"></label>
-          <label>API 密钥<input class="cloud-api-key" type="password" autocomplete="new-password" placeholder="留空则保留已保存的密钥"></label>
+           <section class="model-settings"><h4>连接信息</h4><label>协议<select class="cloud-protocol"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option><option value="anthropic_messages">Claude Messages</option></select></label><label>接口地址<input class="cloud-base-url" type="url" autocomplete="off" placeholder="https://api.openai.com"></label><label>API 密钥<input class="cloud-api-key" type="password" autocomplete="new-password" placeholder="留空则保留已保存的密钥"></label><details class="advanced-connection"><summary>高级连接选项</summary><div class="advanced-connection-fields"><label>请求兼容方式<select class="request-compatibility"><option value="standard">标准（默认）</option><option value="go_http">兼容模式</option></select></label><p class="custom-header-hint">仅当接口拒绝标准连接时，才改用兼容模式。</p><label>自定义请求头（可选）<textarea class="custom-headers" autocomplete="off" spellcheck="false" placeholder="每行：名称: 值"></textarea></label><p class="custom-header-hint custom-header-status"></p><label class="clear-custom-headers-row"><input class="clear-custom-headers" type="checkbox">移除已保存的自定义请求头</label></div></details><div class="profile-actions"><button class="test-cloud-connection" type="button">测试连接</button></div><div class="connection-test-status" role="status" aria-live="polite"></div></section>
+           <section class="model-settings"><h4>目录分类</h4><label>模型<span class="cloud-model-control"></span></label><label>思考强度<select class="classification-reasoning-effort"><option value="none">无</option><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最高</option></select></label></section>
+           <section class="model-settings"><h4>专题选择</h4><p>留空时使用上面的模型。</p><label>模型（可选）<span class="routing-model-control"></span></label><label>思考强度<select class="routing-reasoning-effort"><option value="none">无</option><option value="low">低</option><option value="medium" selected>中</option><option value="high">高</option><option value="xhigh">很高</option><option value="max">最高</option></select></label></section>
+           <section class="model-settings"><h4>处理速度</h4><p>所有方案共用。请求过多时调低。</p><label>同时处理的请求<select class="max-concurrent-requests"><option value="1">1</option><option value="2">2</option><option value="3" selected>3（推荐）</option><option value="4">4</option><option value="5">5</option></select></label></section>
         </div>
         <div class="settings-actions"><button class="cancel-settings" type="button">取消</button><button class="primary save-cloud" type="button">保存设置</button></div>
       </section>
-      <section class="history-view" hidden aria-label="今日工作成果">
-        <div class="history-header"><button class="back-history" type="button">‹ 返回</button><h3>今日工作成果</h3><div class="history-export-actions"><button class="capture-history" type="button" disabled>今日截图</button><button class="export-history" type="button" disabled>导出今日</button></div></div>
-        <p class="history-summary" aria-live="polite">正在加载今日移动记录…</p>
+      <section class="history-view" hidden aria-label="工作成果">
+        <div class="history-header"><button class="back-history" type="button">‹ 返回</button><h3>工作成果</h3><button class="history-date-range" type="button" aria-haspopup="dialog" aria-expanded="false">选择日期</button><div class="history-export-actions"><button class="export-history" type="button" disabled>导出</button></div></div>
+        <p class="history-summary" aria-live="polite">正在加载工作成果…</p>
         <div class="history-topics" aria-label="涉及专题"></div>
         <div class="history-list" aria-live="polite"></div>
       </section>
+      <section class="history-date-sheet" hidden aria-hidden="true"><button class="history-date-backdrop" type="button" aria-label="关闭日期选择器"></button><div class="history-date-dialog" role="dialog" aria-modal="true" aria-label="选择工作成果日期范围"><div class="history-date-picker-head"><button class="history-month-prev" type="button" aria-label="上个月">‹</button><strong class="history-month-title"></strong><button class="history-month-next" type="button" aria-label="下个月">›</button></div><div class="history-weekdays" aria-hidden="true"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div class="history-calendar-grid"></div><p class="history-date-hint"></p></div></section>
       <section class="confirm-overlay" hidden aria-hidden="true">
         <div class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
           <h3 id="confirm-title">确认操作</h3>
@@ -689,8 +756,8 @@
 
   const elements = {
     panel: shadow.querySelector('.panel'), tab: shadow.querySelector('.tab'), tabStatus: shadow.querySelector('.tab-status'), close: shadow.querySelector('.close'), mainView: shadow.querySelector('.main-view'), settings: shadow.querySelector('.settings'), settingsDrawer: shadow.querySelector('.settings-drawer'), backSettings: shadow.querySelector('.back-settings'),
-     cloudModel: shadow.querySelector('.cloud-model'), routingModel: shadow.querySelector('.routing-model'), classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), saveCloud: shadow.querySelector('.save-cloud'),
-    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), classifyFocus: shadow.querySelector('.classify-focus'), restoreFocus: shadow.querySelector('.restore-focus'), exportAllQuestions: shadow.querySelector('.export-all-questions'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), exportHistory: shadow.querySelector('.export-history'), captureHistory: shadow.querySelector('.capture-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'), directoryPlan: shadow.querySelector('.directory-plan'), directoryPlanSummary: shadow.querySelector('.directory-plan-summary'), directoryPlanList: shadow.querySelector('.directory-plan-list'),
+     cloudProfileSelect: shadow.querySelector('.cloud-profile-select'), cloudProfileName: shadow.querySelector('.cloud-profile-name'), profileTabs: shadow.querySelector('.profile-tabs'), createCloudProfile: shadow.querySelector('.create-cloud-profile'), cloudModelControl: shadow.querySelector('.cloud-model-control'), routingModelControl: shadow.querySelector('.routing-model-control'), cloudModel: null, routingModel: null, classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudProtocol: shadow.querySelector('.cloud-protocol'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), requestCompatibility: shadow.querySelector('.request-compatibility'), customHeaders: shadow.querySelector('.custom-headers'), customHeaderStatus: shadow.querySelector('.custom-header-status'), clearCustomHeaders: shadow.querySelector('.clear-custom-headers'), testCloudConnection: shadow.querySelector('.test-cloud-connection'), connectionTestStatus: shadow.querySelector('.connection-test-status'), saveCloud: shadow.querySelector('.save-cloud'),
+    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), classifyFocus: shadow.querySelector('.classify-focus'), restoreFocus: shadow.querySelector('.restore-focus'), exportAllQuestions: shadow.querySelector('.export-all-questions'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), historyDateRange: shadow.querySelector('.history-date-range'), historyDateSheet: shadow.querySelector('.history-date-sheet'), historyDateBackdrop: shadow.querySelector('.history-date-backdrop'), historyMonthPrev: shadow.querySelector('.history-month-prev'), historyMonthNext: shadow.querySelector('.history-month-next'), historyMonthTitle: shadow.querySelector('.history-month-title'), historyCalendarGrid: shadow.querySelector('.history-calendar-grid'), historyDateHint: shadow.querySelector('.history-date-hint'), exportHistory: shadow.querySelector('.export-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'), directoryPlan: shadow.querySelector('.directory-plan'), directoryPlanSummary: shadow.querySelector('.directory-plan-summary'), directoryPlanList: shadow.querySelector('.directory-plan-list'),
     legend: shadow.querySelector('.legend'), legendList: shadow.querySelector('.legend ul'),
     confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'),
   };
@@ -713,6 +780,86 @@
     elements.status.textContent = message;
     elements.status.classList.toggle('error', resolvedTone === 'error');
     elements.status.classList.toggle('warning', resolvedTone === 'warning');
+  }
+
+  function setConnectionTestStatus(message = '', tone = 'normal') {
+    elements.connectionTestStatus.textContent = message;
+    elements.connectionTestStatus.classList.toggle('error', tone === 'error');
+    elements.connectionTestStatus.classList.toggle('success', tone === 'success');
+  }
+
+  function renderAvailableModels(
+    profileId = elements.cloudProfileSelect.value,
+    directoryModel = elements.cloudModel?.value || '',
+    routingModel = elements.routingModel?.value || '',
+  ) {
+    const rawModels = state.availableModelsByProfile.get(profileId);
+    const models = Array.isArray(rawModels) ? rawModels : [];
+    const buildOption = (value, label = value, { disabled = false } = {}) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      option.disabled = disabled;
+      return option;
+    };
+    const selectedDirectory = normalizeWhitespace(directoryModel);
+    const selectedRouting = normalizeWhitespace(routingModel);
+    const modelOptions = models.map(model => buildOption(model));
+    const directoryOptions = [buildOption('', '请选择模型')];
+    const routingOptions = [buildOption('', '使用目录分类模型')];
+    if (selectedDirectory && !models.includes(selectedDirectory)) {
+      directoryOptions.push(buildOption(selectedDirectory, selectedDirectory));
+    }
+    if (selectedRouting && !models.includes(selectedRouting)) {
+      routingOptions.push(buildOption(selectedRouting, selectedRouting));
+    }
+    const renderControl = (container, className, selected, options, placeholder, optional) => {
+      const control = document.createElement(models.length ? 'select' : 'input');
+      control.className = className;
+      control.setAttribute('aria-label', optional ? '专题选择模型' : '目录分类模型');
+      if (control instanceof HTMLInputElement) {
+        control.type = 'text';
+        control.autocomplete = 'off';
+        control.placeholder = placeholder;
+        control.value = selected;
+      } else {
+        control.replaceChildren(...options);
+        control.value = selected;
+      }
+      container.replaceChildren(control);
+      return control;
+    };
+    elements.cloudModel = renderControl(
+      elements.cloudModelControl, 'cloud-model', selectedDirectory,
+      [...directoryOptions, ...modelOptions.map(option => option.cloneNode(true))],
+      '例如你的模型部署名', false,
+    );
+    elements.routingModel = renderControl(
+      elements.routingModelControl, 'routing-model', selectedRouting,
+      [...routingOptions, ...modelOptions],
+      '留空则使用目录分类模型', true,
+    );
+  }
+
+  function setAvailableModels(profileId, values) {
+    const seen = new Set();
+    const models = [];
+    for (const item of Array.isArray(values) ? values : []) {
+      const model = normalizeWhitespace(item);
+      if (model && !seen.has(model)) {
+        seen.add(model);
+        models.push(model);
+      }
+      if (models.length >= 500) break;
+    }
+    state.availableModelsByProfile.set(profileId, models);
+    if (profileId === elements.cloudProfileSelect.value) renderAvailableModels(profileId);
+  }
+
+  function clearAvailableModels() {
+    const profileId = elements.cloudProfileSelect.value;
+    state.availableModelsByProfile.delete(profileId);
+    renderAvailableModels(profileId);
   }
 
   function confirmAction({ title, message, confirmLabel = '确认', destructive = false }) {
@@ -744,13 +891,23 @@
     state.busy = busy;
     elements.settings.disabled = busy;
     elements.saveCloud.disabled = busy;
+    elements.cloudProfileSelect.disabled = busy;
+    elements.cloudProfileName.disabled = busy;
+    elements.createCloudProfile.disabled = busy;
+    elements.profileTabs.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+    elements.cloudProtocol.disabled = busy;
+    elements.cloudBaseUrl.disabled = busy;
+    elements.cloudApiKey.disabled = busy;
+    elements.requestCompatibility.disabled = busy;
+    elements.customHeaders.disabled = busy;
+    elements.clearCustomHeaders.disabled = busy;
+    elements.testCloudConnection.disabled = busy;
     elements.classify.disabled = busy || !state.taxonomy;
     elements.classifyFocus.disabled = busy || !state.taxonomy;
     updateFocusRestoreAction();
     elements.exportAllQuestions.disabled = busy || !state.taxonomy;
     elements.history.disabled = busy;
     elements.exportHistory.disabled = busy || !state.historyReport?.records?.length;
-    elements.captureHistory.disabled = busy || !state.historyReport?.records?.length;
     elements.clearCache.disabled = busy || !state.taxonomy;
     elements.exportBatch.disabled = busy || !state.cloudConfigured || !state.currentQuestions.length;
     elements.submitBatch.disabled = busy || !state.cloudConfigured || !state.batchJobId;
@@ -767,7 +924,6 @@
     elements.mainView.hidden = true;
     elements.settingsDrawer.hidden = false;
     elements.settings.setAttribute('aria-expanded', 'true');
-    elements.cloudModel.focus({ preventScroll: true });
   }
 
   function closeSettings() {
@@ -777,6 +933,7 @@
   }
 
   function closeHistory() {
+    closeHistoryDatePicker();
     elements.historyView.hidden = true;
     elements.mainView.hidden = false;
   }
@@ -791,10 +948,10 @@
     const summary = report?.summary || {};
     const records = Array.isArray(report?.records) ? report.records : [];
     const topics = Array.isArray(summary.topics) ? summary.topics : [];
+    const periodLabel = normalizeWhitespace(summary.period?.label) || '所选日期';
     state.historyReport = { summary, records };
     elements.exportHistory.disabled = !records.length;
-    elements.captureHistory.disabled = !records.length;
-    elements.historySummary.textContent = `今日已分类 ${Number(summary.classified_count) || 0} 道题目，涉及 ${topics.length} 个专题。`;
+    elements.historySummary.textContent = `${periodLabel}：已分类 ${Number(summary.classified_count) || 0} 道题目，涉及 ${topics.length} 个专题。`;
     elements.historyTopics.replaceChildren(...topics.map(topic => {
       const item = document.createElement('span');
       item.className = 'history-topic';
@@ -804,7 +961,7 @@
     if (!records.length) {
       const empty = document.createElement('p');
       empty.className = 'history-empty';
-      empty.textContent = '今日暂无已分类题目记录。';
+      empty.textContent = `${periodLabel}暂无已分类题目记录。`;
       elements.historyList.replaceChildren(empty);
       return;
     }
@@ -838,22 +995,149 @@
     }));
   }
 
+  function historyRangeLabel(range = state.historyRange) {
+    const start = normalizeWhitespace(range?.start);
+    const end = normalizeWhitespace(range?.end);
+    const format = value => value.replaceAll('-', '.');
+    if (!start) return '选择日期';
+    return !end || start === end ? format(start) : `${format(start)} - ${format(end)}`;
+  }
+
+  function updateHistoryDateRange() {
+    const label = historyRangeLabel();
+    elements.historyDateRange.textContent = label;
+    elements.historyDateRange.setAttribute('aria-label', `选择工作成果日期范围，当前为${label}`);
+  }
+
+  function historyMonthValue(dateValue = chinaDate()) {
+    return normalizeWhitespace(dateValue).slice(0, 7) || chinaDate().slice(0, 7);
+  }
+
+  function historyDateFromParts(year, month, day) {
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+
+  function moveHistoryCalendarMonth(offset) {
+    const [year, month] = historyMonthValue(state.historyCalendarMonth).split('-').map(Number);
+    const next = new Date(Date.UTC(year, month - 1 + offset, 1));
+    state.historyCalendarMonth = historyDateFromParts(next.getUTCFullYear(), next.getUTCMonth() + 1, 1).slice(0, 7);
+    renderHistoryCalendar();
+  }
+
+  function renderHistoryCalendar() {
+    const monthValue = historyMonthValue(state.historyCalendarMonth);
+    const [year, month] = monthValue.split('-').map(Number);
+    const firstDay = new Date(Date.UTC(year, month - 1, 1));
+    const today = chinaDate();
+    const maxMonth = today.slice(0, 7);
+    const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const start = state.historyRange.start;
+    const end = state.historyRange.end;
+    elements.historyMonthTitle.textContent = `${year} 年 ${month} 月`;
+    elements.historyMonthNext.disabled = monthValue >= maxMonth;
+    elements.historyCalendarGrid.replaceChildren();
+    for (let index = 0; index < firstDay.getUTCDay(); index += 1) {
+      const spacer = document.createElement('span');
+      spacer.className = 'history-calendar-spacer';
+      spacer.setAttribute('aria-hidden', 'true');
+      elements.historyCalendarGrid.append(spacer);
+    }
+    for (let day = 1; day <= daysInMonth; day += 1) {
+      const value = historyDateFromParts(year, month, day);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'history-calendar-day';
+      button.textContent = String(day);
+      button.dataset.date = value;
+      button.disabled = value > today;
+      button.setAttribute('aria-label', value);
+      if (value === today) button.classList.add('today');
+      if (value === start) button.classList.add('range-start');
+      if (value === end) button.classList.add('range-end');
+      if (start && end && value > start && value < end) button.classList.add('in-range');
+      elements.historyCalendarGrid.append(button);
+    }
+    elements.historyDateHint.textContent = start && !end
+      ? '请选择截止日期；再次选择同一天即可查询当天。'
+      : '先选择起始日期，再选择截止日期。';
+  }
+
+  function openHistoryDatePicker() {
+    if (state.busy) return;
+    state.historyCalendarMonth = historyMonthValue(state.historyRange.end || state.historyRange.start || chinaDate());
+    renderHistoryCalendar();
+    elements.historyDateSheet.hidden = false;
+    elements.historyDateSheet.setAttribute('aria-hidden', 'false');
+    elements.historyDateRange.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeHistoryDatePicker() {
+    elements.historyDateSheet.hidden = true;
+    elements.historyDateSheet.setAttribute('aria-hidden', 'true');
+    elements.historyDateRange.setAttribute('aria-expanded', 'false');
+  }
+
+  async function chooseHistoryDate(value) {
+    const dateValue = normalizeWhitespace(value);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || dateValue > chinaDate()) return;
+    if (!state.historyRange.start || state.historyRange.end) {
+      state.historyRange = { start: dateValue, end: '' };
+      updateHistoryDateRange();
+      renderHistoryCalendar();
+      return;
+    }
+    if (dateValue < state.historyRange.start) {
+      state.historyRange = { start: dateValue, end: '' };
+      updateHistoryDateRange();
+      renderHistoryCalendar();
+      return;
+    }
+    state.historyRange.end = dateValue;
+    updateHistoryDateRange();
+    closeHistoryDatePicker();
+    await loadHistoryForRange();
+  }
+
+  async function loadHistoryForRange() {
+    const start = normalizeWhitespace(state.historyRange.start) || chinaDate();
+    const end = normalizeWhitespace(state.historyRange.end) || start;
+    const loadId = ++state.historyLoadId;
+    state.historyReport = null;
+    elements.exportHistory.disabled = true;
+    elements.historyDateRange.disabled = true;
+    elements.historySummary.textContent = `正在加载 ${historyRangeLabel({ start, end })} 的移动记录…`;
+    elements.historyTopics.replaceChildren();
+    elements.historyList.replaceChildren();
+    try {
+      const report = await request('GET', `/api/v1/history/catalogue-moves?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}`);
+      if (loadId !== state.historyLoadId) return;
+      renderHistory(report);
+    } catch (error) {
+      if (loadId === state.historyLoadId) elements.historySummary.textContent = `无法加载工作成果：${error.message}`;
+    } finally {
+      if (loadId === state.historyLoadId) elements.historyDateRange.disabled = false;
+    }
+  }
+
   async function openHistory() {
     if (state.busy) return;
     closeSettings();
     elements.mainView.hidden = true;
     elements.historyView.hidden = false;
-    state.historyReport = null;
-    elements.exportHistory.disabled = true;
-    elements.captureHistory.disabled = true;
-    elements.historySummary.textContent = '正在加载今日移动记录…';
-    elements.historyTopics.replaceChildren();
-    elements.historyList.replaceChildren();
-    try {
-      renderHistory(await request('GET', '/api/v1/history/catalogue-moves'));
-    } catch (error) {
-      elements.historySummary.textContent = `无法加载工作成果：${error.message}`;
-    }
+    state.historyRange = { start: chinaDate(), end: chinaDate() };
+    updateHistoryDateRange();
+    await loadHistoryForRange();
+  }
+
+  function selectedHistoryDateRange() {
+    const period = state.historyReport?.summary?.period || {};
+    const start = normalizeWhitespace(period.start_date || period.date) || state.historyRange.start || chinaDate();
+    const end = normalizeWhitespace(period.end_date) || state.historyRange.end || start;
+    return start === end ? start : `${start}至${end}`;
+  }
+
+  function selectedHistoryLabel() {
+    return normalizeWhitespace(state.historyReport?.summary?.period?.label) || `${selectedHistoryDateRange()} 工作成果`;
   }
 
   function exportHistoryReport() {
@@ -866,188 +1150,12 @@
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    const date = normalizeWhitespace(state.historyReport?.summary?.period?.date) || chinaDate();
-    link.download = `题目分类今日成果-${date}.html`;
+    link.download = `题目分类成果-${selectedHistoryDateRange()}.html`;
     document.body.append(link);
     link.click();
     link.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    setStatus(`已导出今日 ${records.length} 道题的工作成果报告。`);
-  }
-
-  async function captureHistoryReport() {
-    const records = state.historyReport?.records;
-    if (!Array.isArray(records) || !records.length || elements.captureHistory.disabled) return;
-    elements.captureHistory.disabled = true;
-    try {
-      const width = 720;
-      const outerMargin = 22;
-      const cardInsetX = 36;
-      const cardInsetTop = 38;
-      const cardInsetBottom = 36;
-      const titleHeight = 30;
-      const titleGap = 22;
-      const sectionGap = 18;
-      const tableHeaderHeight = 32;
-      const cardWidth = width - outerMargin * 2;
-      const contentWidth = cardWidth - cardInsetX * 2;
-      const columnWidths = [140, 232, 232];
-      const summary = state.historyReport.summary || {};
-      const topics = Array.isArray(summary.topics) ? summary.topics : [];
-      const fontFamily = '"Microsoft YaHei", "微软雅黑", sans-serif';
-      const measureCanvas = document.createElement('canvas');
-      const measure = measureCanvas.getContext('2d');
-      if (!measure) throw new Error('浏览器不支持截图渲染');
-      const wrap = (value, maxWidth) => {
-        const source = String(value || '—');
-        const lines = [];
-        let line = '';
-        for (const character of source) {
-          const candidate = line + character;
-          if (line && measure.measureText(candidate).width > maxWidth) {
-            lines.push(line);
-            line = character;
-          } else {
-            line = candidate;
-          }
-        }
-        if (line) lines.push(line);
-        return lines;
-      };
-      measure.font = `600 12px ${fontFamily}`;
-      const topicLines = wrap(topics.join(' · ') || '暂无', contentWidth - 206);
-      measure.font = `700 11px ${fontFamily}`;
-      const tableRows = records.map(record => {
-        const cells = [
-          wrap(record.stable_code || '未提取 Stable Code', columnWidths[0] - 16),
-          wrap(compactHistoryPath(record.original_path), columnWidths[1] - 16),
-          wrap(compactHistoryPath(record.target_path), columnWidths[2] - 16),
-        ];
-        return { cells, height: Math.max(34, Math.max(...cells.map(lines => lines.length)) * 17 + 14) };
-      });
-      const summaryHeight = Math.max(78, topicLines.length * 18 + 36);
-      const tableRowsHeight = tableRows.reduce((total, row) => total + row.height, 0);
-      const cardHeight = cardInsetTop + titleHeight + titleGap + summaryHeight
-        + sectionGap + tableHeaderHeight + tableRowsHeight + cardInsetBottom;
-      const height = outerMargin * 2 + cardHeight;
-      const scale = Math.min(2, 30000 / height);
-      if (height < 1 || scale < 0.5) throw new Error('记录过多，无法安全生成单张长图；请改用导出报告');
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.round(width * scale);
-      canvas.height = Math.round(height * scale);
-      const context = canvas.getContext('2d');
-      if (!context) throw new Error('浏览器不支持截图渲染');
-      context.scale(scale, scale);
-      const roundRect = (x, y, rectWidth, rectHeight, radius) => {
-        const r = Math.min(radius, rectWidth / 2, rectHeight / 2);
-        context.beginPath();
-        context.moveTo(x + r, y);
-        context.arcTo(x + rectWidth, y, x + rectWidth, y + rectHeight, r);
-        context.arcTo(x + rectWidth, y + rectHeight, x, y + rectHeight, r);
-        context.arcTo(x, y + rectHeight, x, y, r);
-        context.arcTo(x, y, x + rectWidth, y, r);
-        context.closePath();
-      };
-      const drawLines = (lines, x, y, lineHeight) => lines.forEach((line, index) => context.fillText(line, x, y + index * lineHeight));
-
-      context.fillStyle = '#f5f8f7';
-      context.fillRect(0, 0, width, height);
-      roundRect(outerMargin, outerMargin, cardWidth, cardHeight, 14);
-      context.fillStyle = '#ffffff';
-      context.fill();
-      context.strokeStyle = '#d7e1dd';
-      context.lineWidth = 1;
-      context.stroke();
-
-      const contentX = outerMargin + cardInsetX;
-      context.fillStyle = '#126b5c';
-      context.font = `700 24px ${fontFamily}`;
-      context.fillText('题目分类今日成果汇总', contentX, outerMargin + cardInsetTop + 26);
-
-      const summaryX = contentX;
-      const summaryWidth = contentWidth;
-      const countWidth = 148;
-      let y = outerMargin + cardInsetTop + titleHeight + titleGap;
-      roundRect(summaryX, y, countWidth, summaryHeight, 10);
-      context.fillStyle = '#e7f2ee';
-      context.fill();
-      context.strokeStyle = '#cfe2db';
-      context.stroke();
-      roundRect(summaryX + countWidth + 12, y, summaryWidth - countWidth - 12, summaryHeight, 10);
-      context.fillStyle = '#ffffff';
-      context.fill();
-      context.strokeStyle = '#dce7e3';
-      context.stroke();
-      context.fillStyle = '#4e6860';
-      context.font = `700 12px ${fontFamily}`;
-      context.fillText('已分类题目', summaryX + 13, y + 20);
-      context.fillStyle = '#0d6858';
-      context.font = `800 28px ${fontFamily}`;
-      context.fillText(String(Number(summary.classified_count) || 0), summaryX + 13, y + 52);
-      context.fillStyle = '#4e6860';
-      context.font = `700 12px ${fontFamily}`;
-      context.fillText('涉及专题', summaryX + countWidth + 25, y + 20);
-      context.fillStyle = '#1d6554';
-      context.font = `600 12px ${fontFamily}`;
-      drawLines(topicLines, summaryX + countWidth + 25, y + 43, 18);
-      y += summaryHeight + sectionGap;
-
-      const tableX = summaryX;
-      const tableWidth = summaryWidth;
-      context.fillStyle = '#eef4f1';
-      context.fillRect(tableX, y, tableWidth, tableHeaderHeight);
-      context.strokeStyle = '#dce7e3';
-      context.strokeRect(tableX, y, tableWidth, tableHeaderHeight);
-      context.beginPath();
-      context.moveTo(tableX + columnWidths[0], y);
-      context.lineTo(tableX + columnWidths[0], y + tableHeaderHeight);
-      context.moveTo(tableX + columnWidths[0] + columnWidths[1], y);
-      context.lineTo(tableX + columnWidths[0] + columnWidths[1], y + tableHeaderHeight);
-      context.stroke();
-      context.fillStyle = '#29453d';
-      context.font = `700 11px ${fontFamily}`;
-      context.fillText('Stable Code', tableX + 8, y + 20);
-      context.fillText('原目录', tableX + columnWidths[0] + 8, y + 20);
-      context.fillText('现目录', tableX + columnWidths[0] + columnWidths[1] + 8, y + 20);
-      y += tableHeaderHeight;
-
-      context.font = `600 11px ${fontFamily}`;
-      tableRows.forEach(row => {
-        context.fillStyle = '#ffffff';
-        context.fillRect(tableX, y, tableWidth, row.height);
-        context.strokeStyle = '#dce7e3';
-        context.strokeRect(tableX, y, tableWidth, row.height);
-        context.beginPath();
-        context.moveTo(tableX + columnWidths[0], y);
-        context.lineTo(tableX + columnWidths[0], y + row.height);
-        context.moveTo(tableX + columnWidths[0] + columnWidths[1], y);
-        context.lineTo(tableX + columnWidths[0] + columnWidths[1], y + row.height);
-        context.stroke();
-        context.fillStyle = '#29453d';
-        drawLines(row.cells[0], tableX + 8, y + 19, 17);
-        context.fillStyle = '#405650';
-        drawLines(row.cells[1], tableX + columnWidths[0] + 8, y + 19, 17);
-        drawLines(row.cells[2], tableX + columnWidths[0] + columnWidths[1] + 8, y + 19, 17);
-        y += row.height;
-      });
-      const png = await new Promise((resolve, reject) => canvas.toBlob(
-        blob => blob ? resolve(blob) : reject(new Error('截图编码失败')), 'image/png'
-      ));
-      const downloadUrl = URL.createObjectURL(png);
-      const link = document.createElement('a');
-      link.href = downloadUrl;
-      const date = normalizeWhitespace(state.historyReport?.summary?.period?.date) || chinaDate();
-      link.download = `题目分类今日成果-${date}.png`;
-      document.body.append(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 0);
-      setStatus(`已生成 ${records.length} 道题的窄版高清长图。`);
-    } catch (error) {
-      setStatus(`一键截图失败：${error.message}`, true);
-    } finally {
-      elements.captureHistory.disabled = !state.historyReport?.records?.length;
-    }
+    setStatus(`已导出 ${selectedHistoryLabel()}的 ${records.length} 道题工作成果报告。`);
   }
 
   function request(method, path, body, { timeoutMs = LOCAL_REQUEST_TIMEOUT_MS } = {}) {
@@ -1109,13 +1217,7 @@
       ]);
       state.taxonomy = taxonomy;
       state.cloudConfigured = Boolean(health.cloud_configured);
-      elements.cloudModel.value = cloud.model || '';
-      elements.routingModel.value = cloud.routing_model || '';
-      elements.classificationReasoningEffort.value = cloud.reasoning_effort || 'high';
-      elements.routingReasoningEffort.value = cloud.routing_reasoning_effort || 'medium';
-      elements.maxConcurrentRequests.value = String(cloud.max_concurrent_requests || 3);
-      elements.cloudBaseUrl.value = cloud.base_url || 'https://api.openai.com/v1';
-      elements.cloudApiKey.value = '';
+      renderCloudSettings(cloud);
       const pageScope = detectPageScope(state.taxonomy);
       if (!pageScope) {
         state.scope = { topic_id: '', level2_id: '' };
@@ -1149,22 +1251,452 @@
     }
   }
 
+  function renderCloudSettings(cloud) {
+    const profiles = Array.isArray(cloud.profiles) && cloud.profiles.length
+      ? cloud.profiles : [{ id: cloud.active_profile_id || 'default', name: cloud.active_profile_name || '默认方案', ...cloud }];
+    const activeId = cloud.active_profile_id || profiles[0].id;
+    state.cloudSettings = cloud;
+    state.cloudProfiles = profiles;
+    elements.cloudProfileSelect.replaceChildren(...profiles.map(profile => {
+      const option = document.createElement('option');
+      option.value = profile.id;
+      option.textContent = profile.name || '未命名方案';
+      option.selected = profile.id === activeId;
+      return option;
+    }));
+    const profileTabs = profiles.map(profile => {
+      const card = document.createElement('div');
+      card.className = 'profile-card';
+      card.dataset.profileId = profile.id;
+      card.dataset.profileName = profile.name || '未命名方案';
+      card.setAttribute('aria-current', String(profile.id === activeId));
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.className = 'profile-select';
+      tab.dataset.profileId = profile.id;
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', String(profile.id === activeId));
+      tab.title = '单击切换；长按拖动排序';
+      tab.disabled = state.busy;
+      tab.textContent = profile.name || '未命名方案';
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'profile-action profile-edit';
+      edit.dataset.profileId = profile.id;
+      edit.setAttribute('aria-label', `编辑“${profile.name || '未命名方案'}”`);
+      edit.title = '编辑方案名称';
+      edit.textContent = '✎';
+      edit.disabled = state.busy;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'profile-action profile-delete';
+      remove.dataset.profileId = profile.id;
+      remove.setAttribute('aria-label', `删除“${profile.name || '未命名方案'}”`);
+      remove.title = '删除方案';
+      remove.textContent = '×';
+      remove.disabled = state.busy || profiles.length <= 1;
+      card.append(tab, edit, remove);
+      return card;
+    });
+    elements.profileTabs.replaceChildren(...profileTabs, elements.createCloudProfile);
+    const active = profiles.find(profile => profile.id === activeId) || profiles[0];
+    elements.cloudProfileName.value = active.name || '';
+    elements.cloudProtocol.value = active.protocol || 'responses';
+    elements.classificationReasoningEffort.value = active.reasoning_effort || 'high';
+    elements.routingReasoningEffort.value = active.routing_reasoning_effort || 'medium';
+    elements.maxConcurrentRequests.value = String((cloud.pipeline || {}).max_concurrent_requests || cloud.max_concurrent_requests || 3);
+    elements.cloudBaseUrl.value = active.base_url || 'https://api.openai.com';
+    elements.cloudApiKey.value = '';
+    elements.requestCompatibility.value = active.request_compatibility || 'standard';
+    elements.customHeaders.value = '';
+    elements.clearCustomHeaders.checked = false;
+    const savedHeaderNames = Array.isArray(active.custom_header_names) ? active.custom_header_names : [];
+    elements.customHeaderStatus.textContent = savedHeaderNames.length
+      ? `已保存：${savedHeaderNames.join('、')}。留空会保留；填写后会整体替换。`
+      : '每行填写一个“名称: 值”。';
+    renderAvailableModels(activeId, active.model || '', active.routing_model || '');
+    setConnectionTestStatus('');
+  }
+
+  function profileCards() {
+    return [...elements.profileTabs.querySelectorAll('.profile-card')];
+  }
+
+  function profileCardAtPoint(clientX, clientY) {
+    return profileCards().find(card => {
+      const rect = card.getBoundingClientRect();
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    }) || null;
+  }
+
+  function profileCardRects() {
+    return new Map(profileCards().map(card => [card, card.getBoundingClientRect()]));
+  }
+
+  function animateProfileCardReflow(beforeRects) {
+    for (const card of profileCards()) {
+      const before = beforeRects.get(card);
+      if (!before) continue;
+      const after = card.getBoundingClientRect();
+      const deltaX = before.left - after.left;
+      const deltaY = before.top - after.top;
+      if (!deltaX && !deltaY) continue;
+      card.classList.add('sorting');
+      card.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+      card.getBoundingClientRect();
+      requestAnimationFrame(() => {
+        card.style.transform = '';
+        window.setTimeout(() => card.classList.remove('sorting'), 180);
+      });
+    }
+  }
+
+  function moveProfileDropMarker(drag, reference) {
+    if (!drag.marker || reference === drag.marker || drag.marker.nextSibling === reference) return;
+    const beforeRects = profileCardRects();
+    elements.profileTabs.insertBefore(drag.marker, reference);
+    animateProfileCardReflow(beforeRects);
+  }
+
+  function moveDraggedProfileCard(drag, clientX, clientY) {
+    if (!drag.ghost) return;
+    drag.ghost.style.left = `${clientX}px`;
+    drag.ghost.style.top = `${clientY}px`;
+    if (drag.marker) {
+      const markerRect = drag.marker.getBoundingClientRect();
+      if (clientX >= markerRect.left && clientX <= markerRect.right && clientY >= markerRect.top && clientY <= markerRect.bottom) return;
+    }
+    const over = profileCardAtPoint(clientX, clientY);
+    if (over) {
+      const rect = over.getBoundingClientRect();
+      const before = clientY < rect.top + rect.height / 2
+        || (clientY <= rect.bottom && clientX < rect.left + rect.width / 2);
+      moveProfileDropMarker(drag, before ? over : over.nextSibling);
+      return;
+    }
+    const container = elements.profileTabs.getBoundingClientRect();
+    if (clientX >= container.left && clientX <= container.right && clientY >= container.top && clientY <= container.bottom) {
+      moveProfileDropMarker(drag, elements.createCloudProfile);
+    }
+  }
+
+  function beginProfileDrag(drag) {
+    if (state.profileDrag !== drag || drag.cancelled) return;
+    drag.started = true;
+    elements.profileTabs.setPointerCapture?.(drag.pointerId);
+    drag.card.classList.add('drag-candidate', 'dragging');
+    const rect = drag.card.getBoundingClientRect();
+    const marker = document.createElement('div');
+    marker.className = 'profile-drop-marker';
+    marker.style.width = `${Math.ceil(rect.width)}px`;
+    marker.style.height = `${Math.ceil(rect.height)}px`;
+    drag.card.replaceWith(marker);
+    drag.marker = marker;
+    const ghost = document.createElement('div');
+    ghost.className = 'profile-drag-ghost';
+    ghost.textContent = drag.card.dataset.profileName || '未命名方案';
+    shadow.append(ghost);
+    drag.ghost = ghost;
+    ghost.style.left = `${drag.clientX}px`;
+    ghost.style.top = `${drag.clientY}px`;
+  }
+
+  function restoreProfileDragCard(drag, restoreOriginalOrder = false) {
+    if (drag.marker?.isConnected) drag.marker.replaceWith(drag.card);
+    if (restoreOriginalOrder) {
+      const byId = new Map(profileCards().map(card => [card.dataset.profileId, card]));
+      for (const id of drag.originalOrder) {
+        const card = byId.get(id);
+        if (card) elements.profileTabs.insertBefore(card, elements.createCloudProfile);
+      }
+    }
+  }
+
+  function finishProfileDrag(drag, restoreOriginalOrder = false) {
+    if (!drag) return;
+    window.clearTimeout(drag.timer);
+    drag.ghost?.remove();
+    if (drag.started) restoreProfileDragCard(drag, restoreOriginalOrder);
+    drag.card.classList.remove('drag-candidate', 'dragging');
+    if (state.profileDrag === drag) state.profileDrag = null;
+  }
+
+  async function saveProfileOrder(profileIds, originalOrder) {
+    if (profileIds.every((id, index) => id === originalOrder[index])) return;
+    setBusy(true);
+    try {
+      const cloud = await request('POST', '/api/v1/settings/cloud', {
+        action: 'reorder_profiles', profile_ids: profileIds,
+      });
+      state.cloudConfigured = Boolean(cloud.api_key_configured);
+      renderCloudSettings(cloud);
+      setStatus('模型方案顺序已保存');
+    } catch (error) {
+      if (state.cloudSettings) renderCloudSettings(state.cloudSettings);
+      setStatus(error.message || '模型方案排序保存失败', true);
+    } finally { setBusy(false); }
+  }
+
+  function startProfileDragCandidate(event) {
+    if (event.button !== 0 || state.busy) return;
+    if (state.profileDrag) finishProfileDrag(state.profileDrag, true);
+    const target = event.target instanceof Element ? event.target.closest('.profile-select') : null;
+    if (!target) return;
+    const card = target.closest('.profile-card');
+    if (!card || card.classList.contains('editing')) return;
+    const profileId = card.dataset.profileId;
+    if (!profileId) return;
+    const drag = {
+      profileId, card, pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY,
+      startX: event.clientX, startY: event.clientY, originalOrder: profileCards().map(item => item.dataset.profileId),
+      started: false, cancelled: false, timer: null, ghost: null, marker: null,
+    };
+    state.profileDrag = drag;
+    drag.timer = window.setTimeout(() => beginProfileDrag(drag), 220);
+  }
+
+  function moveProfileDragCandidate(event) {
+    const drag = state.profileDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    drag.clientX = event.clientX;
+    drag.clientY = event.clientY;
+    if (!drag.started) {
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 8) {
+        drag.cancelled = true;
+        finishProfileDrag(drag);
+      }
+      return;
+    }
+    event.preventDefault();
+    moveDraggedProfileCard(drag, event.clientX, event.clientY);
+  }
+
+  function endProfileDragCandidate(event) {
+    const drag = state.profileDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const started = drag.started;
+    const cancelled = event.type === 'pointercancel' || event.type === 'lostpointercapture';
+    finishProfileDrag(drag, cancelled);
+    if (!started) return;
+    state.suppressProfileClickUntil = Date.now() + 450;
+    if (cancelled) return;
+    const changedOrder = profileCards().map(item => item.dataset.profileId);
+    saveProfileOrder(changedOrder, drag.originalOrder);
+  }
+
+  async function selectCloudProfile(profileId = elements.cloudProfileSelect.value) {
+    setBusy(true);
+    try {
+      const cloud = await request('POST', '/api/v1/settings/cloud', {
+        action: 'select_profile', profile_id: profileId,
+      });
+      state.cloudConfigured = Boolean(cloud.api_key_configured);
+      renderCloudSettings(cloud);
+      setStatus(`已切换到“${cloud.active_profile_name}”`);
+    } catch (error) { setStatus(error.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function createCloudProfile() {
+    const number = state.cloudProfiles.length + 1;
+    let created = false;
+    setBusy(true);
+    try {
+      const cloud = await request('POST', '/api/v1/settings/cloud', {
+        action: 'create_profile', name: `新方案 ${number}`,
+      });
+      state.cloudConfigured = Boolean(cloud.api_key_configured);
+      renderCloudSettings(cloud);
+      created = true;
+      setStatus('已新建模型方案，请填写后保存');
+    } catch (error) { setStatus(error.message, true); }
+    finally {
+      setBusy(false);
+      if (created) startProfileRename(elements.cloudProfileSelect.value);
+    }
+  }
+
+  async function deleteCloudProfile(profileId = elements.cloudProfileSelect.value) {
+    const active = state.cloudProfiles.find(profile => profile.id === profileId);
+    if (!active || state.cloudProfiles.length <= 1) return;
+    const confirmed = await confirmAction({
+      title: '删除模型方案？',
+      message: `将删除“${active.name}”及其连接和模型设置。其他方案不受影响。`,
+      confirmLabel: '删除方案',
+      destructive: true,
+    });
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      const cloud = await request('POST', '/api/v1/settings/cloud', {
+        action: 'delete_profile', profile_id: active.id,
+      });
+      state.cloudConfigured = Boolean(cloud.api_key_configured);
+      renderCloudSettings(cloud);
+      setStatus('模型方案已删除');
+    } catch (error) { setStatus(error.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function startProfileRename(profileId) {
+    if (profileId !== elements.cloudProfileSelect.value) {
+      await selectCloudProfile(profileId);
+      if (profileId !== elements.cloudProfileSelect.value) return;
+    }
+    const card = [...elements.profileTabs.querySelectorAll('.profile-card')]
+      .find(item => item.dataset.profileId === profileId);
+    if (!card || card.classList.contains('editing')) return;
+    const tab = card.querySelector('.profile-select');
+    if (!tab) return;
+    const originalName = card.dataset.profileName || tab.textContent || '未命名方案';
+    const editor = document.createElement('input');
+    editor.type = 'text';
+    editor.className = 'profile-name-editor';
+    editor.maxLength = 40;
+    editor.value = originalName;
+    editor.setAttribute('aria-label', '编辑方案名称');
+    card.classList.add('editing');
+    tab.replaceWith(editor);
+    const finish = commit => {
+      if (!card.classList.contains('editing')) return;
+      const nextName = commit ? normalizeWhitespace(editor.value) : originalName;
+      const restoredTab = document.createElement('button');
+      restoredTab.type = 'button';
+      restoredTab.className = 'profile-select';
+      restoredTab.dataset.profileId = profileId;
+      restoredTab.setAttribute('role', 'tab');
+      restoredTab.setAttribute('aria-selected', String(profileId === elements.cloudProfileSelect.value));
+      restoredTab.textContent = nextName || originalName;
+      editor.replaceWith(restoredTab);
+      card.dataset.profileName = nextName || originalName;
+      card.classList.remove('editing');
+      if (nextName && profileId === elements.cloudProfileSelect.value) {
+        elements.cloudProfileName.value = nextName;
+      }
+      if (nextName && nextName !== originalName) {
+        state.profileNameSave = state.profileNameSave.then(() => saveProfileName(profileId, nextName, originalName, card));
+      }
+    };
+    editor.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); finish(true); }
+      if (event.key === 'Escape') { event.preventDefault(); finish(false); }
+    });
+    editor.addEventListener('blur', () => finish(true));
+    editor.focus({ preventScroll: true });
+    editor.select();
+  }
+
+  async function saveProfileName(profileId, name, previousName, card) {
+    try {
+      const cloud = await request('POST', '/api/v1/settings/cloud', {
+        action: 'rename_profile', profile_id: profileId, name,
+      });
+      const saved = (cloud.profiles || []).find(profile => profile.id === profileId);
+      const savedName = saved?.name || name;
+      const profile = state.cloudProfiles.find(item => item.id === profileId);
+      if (profile) profile.name = savedName;
+      const tab = card.querySelector('.profile-select');
+      if (tab) {
+        tab.textContent = savedName;
+        tab.setAttribute('aria-label', `选择“${savedName}”`);
+      }
+      card.dataset.profileName = savedName;
+      card.classList.add('just-saved');
+      window.setTimeout(() => card.classList.remove('just-saved'), 1100);
+      if (profileId === elements.cloudProfileSelect.value) elements.cloudProfileName.value = savedName;
+    } catch (error) {
+      const profile = state.cloudProfiles.find(item => item.id === profileId);
+      if (profile) profile.name = previousName;
+      const tab = card.querySelector('.profile-select');
+      if (tab) tab.textContent = previousName;
+      card.dataset.profileName = previousName;
+      if (profileId === elements.cloudProfileSelect.value) elements.cloudProfileName.value = previousName;
+      setStatus(error.message || '方案名称保存失败', true);
+    }
+  }
+
+  function readCustomHeaders() {
+    const headers = {};
+    const lines = elements.customHeaders.value.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const separator = line.indexOf(':');
+      if (separator <= 0) throw new Error('自定义请求头请按“名称: 值”逐行填写');
+      const name = line.slice(0, separator).trim();
+      const value = line.slice(separator + 1).trim();
+      if (!name || !value) throw new Error('自定义请求头请填写完整的名称和值');
+      if (Object.prototype.hasOwnProperty.call(headers, name)) throw new Error(`重复的自定义请求头：${name}`);
+      headers[name] = value;
+    }
+    return headers;
+  }
+
+  function addConnectionOptions(body) {
+    const customHeaders = readCustomHeaders();
+    if (elements.clearCustomHeaders.checked && Object.keys(customHeaders).length) {
+      throw new Error('请填写新的自定义请求头，或勾选移除已保存的请求头，二者择一');
+    }
+    body.request_compatibility = elements.requestCompatibility.value || 'standard';
+    if (Object.keys(customHeaders).length) body.extra_headers = customHeaders;
+    if (elements.clearCustomHeaders.checked) body.clear_extra_headers = true;
+    return body;
+  }
+
+  async function testCloudConnection() {
+    setConnectionTestStatus('正在测试…');
+    setBusy(true);
+    try {
+      const body = addConnectionOptions({
+        protocol: elements.cloudProtocol.value,
+        base_url: normalizeWhitespace(elements.cloudBaseUrl.value) || 'https://api.openai.com',
+      });
+      const key = elements.cloudApiKey.value.trim();
+      if (key) body.api_key = key;
+      const started = await request('POST', '/api/v1/settings/cloud/test/start', body, { timeoutMs: 5000 });
+      const deadline = Date.now() + CONNECTION_TEST_TIMEOUT_MS;
+      let result;
+      while (Date.now() < deadline) {
+        await delay(CONNECTION_TEST_POLL_INTERVAL_MS);
+        const snapshot = await request('GET', `/api/v1/settings/cloud/test/${encodeURIComponent(started.test_id)}`, undefined, { timeoutMs: 5000 });
+        if (snapshot.status === 'succeeded') {
+          result = snapshot.result;
+          break;
+        }
+        if (snapshot.status === 'failed') throw new Error(snapshot.message || '连接测试失败');
+      }
+      if (!result) throw new Error('连接测试未完成');
+      setAvailableModels(elements.cloudProfileSelect.value, result.models);
+      setConnectionTestStatus('✓ 可连接', 'success');
+      setStatus('可连接');
+    } catch (error) {
+      setConnectionTestStatus('✕ 不可连接', 'error');
+      setStatus('不可连接', true);
+    }
+    finally { setBusy(false); }
+  }
+
   async function saveCloudSettings() {
     setBusy(true);
     try {
-      const body = {
+      await state.profileNameSave;
+      const body = addConnectionOptions({
+        action: 'save_profile',
+        profile_id: elements.cloudProfileSelect.value,
+        name: normalizeWhitespace(elements.cloudProfileName.value),
+        protocol: elements.cloudProtocol.value,
         model: normalizeWhitespace(elements.cloudModel.value),
         routing_model: normalizeWhitespace(elements.routingModel.value),
         reasoning_effort: elements.classificationReasoningEffort.value,
         routing_reasoning_effort: elements.routingReasoningEffort.value,
-        max_concurrent_requests: Number(elements.maxConcurrentRequests.value),
-        base_url: normalizeWhitespace(elements.cloudBaseUrl.value) || 'https://api.openai.com/v1',
-      };
+        pipeline: { max_concurrent_requests: Number(elements.maxConcurrentRequests.value) },
+        base_url: normalizeWhitespace(elements.cloudBaseUrl.value) || 'https://api.openai.com',
+      });
       const key = elements.cloudApiKey.value.trim();
       if (key) body.api_key = key;
       const cloud = await request('POST', '/api/v1/settings/cloud', body);
       state.cloudConfigured = Boolean(cloud.api_key_configured);
-      elements.cloudApiKey.value = '';
+      renderCloudSettings(cloud);
       closeSettings();
       setStatus('设置已保存，正在验证服务…');
       await connectService();
@@ -1200,9 +1732,7 @@
   }
 
   function collectCards() {
-    const cards = collectCardsFromDocument(document, location.href);
-    if (!cards.length) throw new Error('未找到题目卡片，请确认当前位于题湖题库题目列表页面');
-    return cards;
+    return collectCardsFromDocument(document, location.href);
   }
 
   async function fetchPageDocument(pageUrl) {
@@ -2448,6 +2978,10 @@
     state.results.clear();
     try {
       const cards = collectCards();
+      if (!cards.length) {
+        setStatus('当前页暂无可识别题目。');
+        return;
+      }
       setStatus(`正在读取 ${cards.length} 道题目的属性文本…`);
       const fetched = await runPool(cards, ATTRIBUTE_CONCURRENCY, fetchAttribute);
       const questions = [];
@@ -2535,6 +3069,10 @@
     if (state.busy) return;
     try {
       const cards = collectCards();
+      if (!cards.length) {
+        setStatus('当前页暂无题目，无需清除缓存。');
+        return;
+      }
       const exerciseIds = [...new Set(cards.map(card => card.exerciseId))];
       const confirmed = await confirmAction({
         title: '清除本页缓存？',
@@ -2621,6 +3159,12 @@
       closeConfirmation(false);
       return;
     }
+    if (!elements.historyDateSheet.hidden) {
+      event.preventDefault();
+      closeHistoryDatePicker();
+      elements.historyDateRange.focus({ preventScroll: true });
+      return;
+    }
     if (!elements.historyView.hidden) {
       closeHistory();
       elements.history.focus({ preventScroll: true });
@@ -2632,17 +3176,57 @@
     else if (elements.panel.classList.contains('open')) setOpen(false);
   });
   elements.saveCloud.addEventListener('click', saveCloudSettings);
+  elements.profileTabs.addEventListener('pointerdown', startProfileDragCandidate);
+  elements.profileTabs.addEventListener('pointermove', moveProfileDragCandidate);
+  elements.profileTabs.addEventListener('pointerup', endProfileDragCandidate);
+  elements.profileTabs.addEventListener('pointercancel', endProfileDragCandidate);
+  elements.profileTabs.addEventListener('lostpointercapture', endProfileDragCandidate);
+  window.addEventListener('pointerup', endProfileDragCandidate, true);
+  window.addEventListener('pointercancel', endProfileDragCandidate, true);
+  elements.profileTabs.addEventListener('click', event => {
+    if (Date.now() < state.suppressProfileClickUntil) {
+      event.preventDefault();
+      return;
+    }
+    const target = event.target instanceof Element ? event.target.closest('button') : null;
+    const profileId = target?.dataset.profileId;
+    if (!profileId) return;
+    if (target.classList.contains('profile-delete')) {
+      deleteCloudProfile(profileId);
+      return;
+    }
+    if (target.classList.contains('profile-edit')) {
+      startProfileRename(profileId);
+      return;
+    }
+    selectCloudProfile(profileId);
+  });
+  elements.createCloudProfile.addEventListener('click', createCloudProfile);
+  elements.cloudProtocol.addEventListener('change', clearAvailableModels);
+  elements.cloudBaseUrl.addEventListener('input', clearAvailableModels);
+  elements.cloudApiKey.addEventListener('input', clearAvailableModels);
+  elements.requestCompatibility.addEventListener('change', clearAvailableModels);
+  elements.customHeaders.addEventListener('input', clearAvailableModels);
+  elements.clearCustomHeaders.addEventListener('change', clearAvailableModels);
+  elements.testCloudConnection.addEventListener('click', testCloudConnection);
   elements.classify.addEventListener('click', classifyPage);
   elements.exportAllQuestions.addEventListener('click', exportAllFocusQuestions);
   elements.classifyFocus.addEventListener('click', classifyFocus);
   elements.restoreFocus.addEventListener('click', restoreSavedFocusQueue);
   elements.acceptAll.addEventListener('click', acceptAllSuggestions);
   elements.history.addEventListener('click', openHistory);
+  elements.historyDateRange.addEventListener('click', openHistoryDatePicker);
+  elements.historyDateBackdrop.addEventListener('click', closeHistoryDatePicker);
+  elements.historyMonthPrev.addEventListener('click', () => moveHistoryCalendarMonth(-1));
+  elements.historyMonthNext.addEventListener('click', () => moveHistoryCalendarMonth(1));
+  elements.historyCalendarGrid.addEventListener('click', event => {
+    const dateButton = event.target.closest('.history-calendar-day[data-date]');
+    if (dateButton && !dateButton.disabled) chooseHistoryDate(dateButton.dataset.date);
+  });
   elements.backHistory.addEventListener('click', () => {
     closeHistory();
     elements.history.focus({ preventScroll: true });
   });
-  elements.captureHistory.addEventListener('click', captureHistoryReport);
   elements.exportHistory.addEventListener('click', exportHistoryReport);
   elements.clearCache.addEventListener('click', clearCurrentPageCache);
   elements.confirmCancel.addEventListener('click', () => closeConfirmation(false));

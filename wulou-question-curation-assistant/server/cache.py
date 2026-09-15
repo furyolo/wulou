@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -304,15 +304,49 @@ class ResultCache:
             ).fetchone()
         return {"record_id": cursor.lastrowid, "moved_at": row[0]}
 
-    def catalogue_move_report(self, now: datetime | None = None) -> dict[str, Any]:
-        """按 UTC+8 的今日范围汇报每题最近一次移动。"""
+    def catalogue_move_report(
+        self,
+        now: datetime | None = None,
+        selected_date: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, Any]:
+        """按 UTC+8 的指定日期或日期范围汇报每题最近一次移动。"""
         utc8 = timezone(timedelta(hours=8))
         current_time = now or datetime.now(timezone.utc)
         if current_time.tzinfo is None:
             raise ValueError("工作成果查询时间必须携带时区")
-        local_today = current_time.astimezone(utc8).date()
-        local_start = datetime.combine(local_today, time.min, tzinfo=utc8)
-        local_end = local_start + timedelta(days=1)
+
+        def parse_local_date(value: str | None) -> date:
+            try:
+                return date.fromisoformat(value or "")
+            except (TypeError, ValueError) as error:
+                raise ValueError("日期必须使用 YYYY-MM-DD 格式") from error
+
+        if selected_date is not None and (start_date is not None or end_date is not None):
+            raise ValueError("日期与日期范围不能同时提供")
+        if selected_date is not None:
+            local_start_date = parse_local_date(selected_date)
+            local_end_date = local_start_date
+            period_label = f"{local_start_date.isoformat()} 工作成果"
+        elif start_date is not None or end_date is not None:
+            if start_date is None or end_date is None:
+                raise ValueError("日期范围必须同时提供起始日期和截止日期")
+            local_start_date = parse_local_date(start_date)
+            local_end_date = parse_local_date(end_date)
+            if local_end_date < local_start_date:
+                raise ValueError("截止日期不能早于起始日期")
+            period_label = (
+                f"{local_start_date.isoformat()} 工作成果"
+                if local_start_date == local_end_date
+                else f"{local_start_date.isoformat()} 至 {local_end_date.isoformat()} 工作成果"
+            )
+        else:
+            local_start_date = current_time.astimezone(utc8).date()
+            local_end_date = local_start_date
+            period_label = f"{local_start_date.isoformat()} 今日"
+        local_start = datetime.combine(local_start_date, time.min, tzinfo=utc8)
+        local_end = datetime.combine(local_end_date + timedelta(days=1), time.min, tzinfo=utc8)
         # SQLite CURRENT_TIMESTAMP 以 UTC 的 YYYY-MM-DD HH:MM:SS 保存；采用左闭右开区间，
         # 可以准确包含北京时间 00:00:00，又不会包含次日零点的记录。
         utc_start = local_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -344,8 +378,10 @@ class ResultCache:
                 "classified_count": len(records),
                 "topics": topics,
                 "period": {
-                    "label": f"{local_today.isoformat()} 今日",
-                    "date": local_today.isoformat(),
+                    "label": period_label,
+                    "date": local_start_date.isoformat(),
+                    "start_date": local_start_date.isoformat(),
+                    "end_date": local_end_date.isoformat(),
                     "timezone": "UTC+08:00",
                     "utc_start": utc_start,
                     "utc_end": utc_end,

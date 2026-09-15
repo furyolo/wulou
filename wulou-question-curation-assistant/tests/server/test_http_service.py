@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -196,8 +197,42 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(saved["exercise_id"], body["exercise_id"])
 
+    def test_catalogue_move_history_can_be_filtered_by_utc8_date(self) -> None:
+        body = {
+            "exercise_id": "move-history-filter", "stable_code": "CS2026DATE001",
+            "source_catalogue_id": "old-leaf", "target_catalogue_id": "new-leaf",
+            "original_path": ["专题1：实数", "【大题】", "旧分类"],
+            "target_path": ["专题4：分式方程与不等式", "【大题】", "解不等式"],
+        }
+        self.assertEqual(self.request("POST", "/api/v1/history/catalogue-moves", body)[0], 201)
+        self.state.cache._connection.execute(
+            "UPDATE catalogue_move_history SET moved_at = ? WHERE exercise_id = ?",
+            ("2026-09-11 16:00:00", body["exercise_id"]),
+        )
+        self.state.cache._connection.commit()
+        status, report = self.request("GET", "/api/v1/history/catalogue-moves?date=2026-09-12")
+        self.assertEqual(status, 200)
+        self.assertEqual(report["summary"]["period"]["label"], "2026-09-12 工作成果")
+        self.assertEqual(report["records"][0]["stable_code"], "CS2026DATE001")
+        range_status, ranged = self.request(
+            "GET", "/api/v1/history/catalogue-moves?start_date=2026-09-11&end_date=2026-09-12"
+        )
+        self.assertEqual(range_status, 200)
+        self.assertEqual(ranged["summary"]["period"]["label"], "2026-09-11 至 2026-09-12 工作成果")
+        self.assertEqual(ranged["summary"]["period"]["start_date"], "2026-09-11")
+        self.assertEqual(ranged["summary"]["period"]["end_date"], "2026-09-12")
+        invalid_status, invalid = self.request("GET", "/api/v1/history/catalogue-moves?date=2026/09/12")
+        self.assertEqual(invalid_status, 400)
+        self.assertIn("YYYY-MM-DD", invalid["message"])
+        invalid_range_status, invalid_range = self.request(
+            "GET", "/api/v1/history/catalogue-moves?start_date=2026-09-12&end_date=2026-09-11"
+        )
+        self.assertEqual(invalid_range_status, 400)
+        self.assertIn("截止日期", invalid_range["message"])
+
     def test_cloud_settings_save_key_without_returning_it(self) -> None:
         status, payload = self.request("POST", "/api/v1/settings/cloud", {
+            "protocol": "chat_completions",
             "model": "test-cloud-model", "routing_model": "test-routing-model",
             "reasoning_effort": "high", "routing_reasoning_effort": "medium",
             "max_concurrent_requests": 5,
@@ -205,6 +240,7 @@ class HttpServiceTests(unittest.TestCase):
         })
         self.assertEqual(status, 200)
         self.assertEqual(payload["model"], "test-cloud-model")
+        self.assertEqual(payload["protocol"], "chat_completions")
         self.assertEqual(payload["routing_model"], "test-routing-model")
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["routing_reasoning_effort"], "medium")
@@ -212,10 +248,154 @@ class HttpServiceTests(unittest.TestCase):
         self.assertTrue(payload["api_key_configured"])
         self.assertNotIn("api_key", payload)
         persisted = yaml.safe_load((self.temp_path / "settings.yaml").read_text(encoding="utf-8"))
-        self.assertEqual(persisted["classifier"]["cloud"]["api_key"], "test-secret-key-123")
-        self.assertEqual(persisted["classifier"]["cloud"]["routing_model"], "test-routing-model")
-        self.assertEqual(persisted["classifier"]["cloud"]["routing_reasoning_effort"], "medium")
-        self.assertEqual(persisted["classifier"]["cloud"]["max_concurrent_requests"], 5)
+        active_id = persisted["classifier"]["cloud_profiles"]["active_id"]
+        active = next(item for item in persisted["classifier"]["cloud_profiles"]["profiles"] if item["id"] == active_id)
+        self.assertEqual(active["api_key"], "test-secret-key-123")
+        self.assertEqual(active["protocol"], "chat_completions")
+        self.assertEqual(active["routing_model"], "test-routing-model")
+        self.assertEqual(active["routing_reasoning_effort"], "medium")
+        self.assertEqual(persisted["classifier"]["pipeline"]["max_concurrent_requests"], 5)
+
+    def test_cloud_profile_keeps_generic_connection_compatibility_private(self) -> None:
+        status, payload = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "save_profile", "name": "兼容网关", "model": "test-model",
+            "protocol": "chat_completions", "base_url": "https://api.example.test",
+            "request_compatibility": "go_http",
+            "extra_headers": {"X-Workspace": "math-curation"},
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["request_compatibility"], "go_http")
+        self.assertEqual(payload["custom_header_names"], ["X-Workspace"])
+        self.assertNotIn("extra_headers", payload)
+        persisted = yaml.safe_load((self.temp_path / "settings.yaml").read_text(encoding="utf-8"))
+        active = persisted["classifier"]["cloud_profiles"]["profiles"][0]
+        self.assertEqual(active["request_compatibility"], "go_http")
+        self.assertEqual(active["extra_headers"], {"X-Workspace": "math-curation"})
+
+        status, rejected = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "save_profile", "profile_id": active["id"], "name": "兼容网关", "model": "test-model",
+            "extra_headers": {"Authorization": "must-not-overwrite"},
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("不能覆盖", rejected["message"])
+
+    def test_cloud_connection_test_uses_draft_without_persisting_it(self) -> None:
+        with patch("server.main.OpenAIChatCompletionsProvider") as provider_class:
+            provider_class.return_value.test_connection.return_value = {
+                "protocol": "anthropic_messages", "model": "claude-test", "message": "连接成功",
+            }
+            status, payload = self.request("POST", "/api/v1/settings/cloud/test", {
+                "protocol": "anthropic_messages", "model": "claude-test",
+                "base_url": "https://api.anthropic.com/v1", "api_key": "test-secret-key-123",
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["protocol"], "anthropic_messages")
+        settings = provider_class.call_args.args[0]
+        self.assertEqual(settings["api_key"], "test-secret-key-123")
+        self.assertEqual(settings["protocol"], "anthropic_messages")
+        self.assertFalse((self.temp_path / "settings.yaml").read_text(encoding="utf-8").find("claude-test") >= 0)
+
+    def test_cloud_connection_rejects_chatgpt_internal_backend_endpoint(self) -> None:
+        status, payload = self.request("POST", "/api/v1/settings/cloud/test", {
+            "protocol": "responses", "model": "gpt-test",
+            "base_url": "https://chatgpt.com/backend-api/codex", "api_key": "test-secret-key-123",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("登录态内部接口", payload["message"])
+
+    def test_cloud_connection_test_can_be_started_and_polled(self) -> None:
+        with patch("server.main.OpenAIChatCompletionsProvider") as provider_class:
+            provider_class.return_value.test_connection.return_value = {
+                "protocol": "responses", "model": "gpt-test", "message": "基础连通成功",
+            }
+            status, started = self.request("POST", "/api/v1/settings/cloud/test/start", {
+                "protocol": "responses", "model": "gpt-test",
+                "base_url": "https://api.example.test/v1", "api_key": "test-secret-key-123",
+            })
+            self.assertEqual(status, 202)
+            for _ in range(20):
+                status, snapshot = self.request("GET", f"/api/v1/settings/cloud/test/{started['test_id']}")
+                if snapshot["status"] != "running":
+                    break
+                time.sleep(0.01)
+        self.assertEqual(status, 200)
+        self.assertEqual(snapshot["status"], "succeeded")
+        self.assertEqual(snapshot["result"]["model"], "gpt-test")
+
+    def test_cloud_profiles_switch_independently_and_share_processing_speed(self) -> None:
+        _, first = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "save_profile", "name": "GPT", "model": "gpt-model",
+            "routing_model": "gpt-route", "reasoning_effort": "high", "routing_reasoning_effort": "medium",
+            "base_url": "https://gpt.example.test/v1", "api_key": "gpt-secret-key-123",
+            "pipeline": {"max_concurrent_requests": 2},
+        })
+        self.assertEqual(first["active_profile_name"], "GPT")
+        gpt_id = first["active_profile_id"]
+        status, created = self.request("POST", "/api/v1/settings/cloud", {"action": "create_profile", "name": "DeepSeek"})
+        self.assertEqual(status, 200)
+        deepseek_id = created["active_profile_id"]
+        self.assertNotEqual(gpt_id, deepseek_id)
+        status, saved = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "save_profile", "profile_id": deepseek_id, "name": "DeepSeek", "model": "deepseek-model",
+            "routing_model": "", "reasoning_effort": "medium", "routing_reasoning_effort": "low",
+            "base_url": "https://deepseek.example.test/v1", "api_key": "deepseek-secret-key-123",
+            "pipeline": {"max_concurrent_requests": 4},
+        })
+        self.assertEqual(saved["model"], "deepseek-model")
+        self.assertEqual(saved["max_concurrent_requests"], 4)
+        status, switched = self.request("POST", "/api/v1/settings/cloud", {"action": "select_profile", "profile_id": gpt_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(switched["active_profile_name"], "GPT")
+        self.assertEqual(switched["model"], "gpt-model")
+        self.assertEqual(switched["max_concurrent_requests"], 4)
+        self.assertNotIn("api_key", switched)
+
+    def test_cloud_profiles_can_be_reordered_without_changing_active_profile(self) -> None:
+        _, first = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "save_profile", "name": "第一", "model": "first-model",
+        })
+        first_id = first["active_profile_id"]
+        _, second = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "create_profile", "name": "第二",
+        })
+        second_id = second["active_profile_id"]
+        _, third = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "create_profile", "name": "第三",
+        })
+        third_id = third["active_profile_id"]
+        status, reordered = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "reorder_profiles", "profile_ids": [third_id, first_id, second_id],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in reordered["profiles"]], [third_id, first_id, second_id])
+        self.assertEqual(reordered["active_profile_id"], third_id)
+        persisted = yaml.safe_load((self.temp_path / "settings.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [item["id"] for item in persisted["classifier"]["cloud_profiles"]["profiles"]],
+            [third_id, first_id, second_id],
+        )
+
+    def test_cloud_profile_name_can_be_saved_without_resaving_other_settings(self) -> None:
+        _, saved = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "save_profile", "name": "旧名称", "model": "test-model",
+            "protocol": "chat_completions", "routing_model": "test-route",
+            "reasoning_effort": "high", "routing_reasoning_effort": "medium",
+            "base_url": "https://api.example.test", "api_key": "test-secret-key-123",
+            "pipeline": {"max_concurrent_requests": 4},
+        })
+        status, renamed = self.request("POST", "/api/v1/settings/cloud", {
+            "action": "rename_profile", "profile_id": saved["active_profile_id"], "name": "新名称",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(renamed["active_profile_name"], "新名称")
+        self.assertEqual(renamed["model"], "test-model")
+        self.assertEqual(renamed["protocol"], "chat_completions")
+        self.assertEqual(renamed["routing_model"], "test-route")
+        self.assertEqual(renamed["max_concurrent_requests"], 4)
+        persisted = yaml.safe_load((self.temp_path / "settings.yaml").read_text(encoding="utf-8"))
+        active = persisted["classifier"]["cloud_profiles"]["profiles"][0]
+        self.assertEqual(active["name"], "新名称")
+        self.assertEqual(active["api_key"], "test-secret-key-123")
 
     def test_interactive_job_returns_accepted_and_progress_can_be_polled(self) -> None:
         body = {

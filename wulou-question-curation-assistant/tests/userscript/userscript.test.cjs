@@ -341,7 +341,7 @@ test('工作成果导出为包含概览和目录变更的独立 HTML', () => {
       moved_at: '2026-09-11 08:00:00',
     }],
   });
-  assert.match(html, /题目分类今日成果汇总/);
+  assert.match(html, /题目分类成果汇总（2026-09-12 工作成果）/);
   assert.match(html, /CS2026REPORT001/);
   assert.match(html, /实数综合计算/);
   assert.match(html, /解不等式/);

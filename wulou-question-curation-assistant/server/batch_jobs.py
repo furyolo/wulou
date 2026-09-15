@@ -16,11 +16,13 @@ class BatchStore:
         self.db.execute("CREATE TABLE IF NOT EXISTS batch_jobs (job_id TEXT PRIMARY KEY, provider_batch_id TEXT, status TEXT NOT NULL, input_file TEXT NOT NULL, result_file TEXT, metadata_json TEXT NOT NULL)")
         self.db.commit()
 
-    def create(self, jsonl: str, questions: list[dict[str, Any]]) -> dict[str, Any]:
+    def create(self, jsonl: str, questions: list[dict[str, Any]], cloud_profile_id: str | None = None) -> dict[str, Any]:
         job_id = f"batch-{uuid.uuid4().hex}"
         input_file = self.root / f"{job_id}.jsonl"
         with input_file.open("w", encoding="utf-8", newline="\n") as file: file.write(jsonl)
         metadata = {"job_id": job_id, "status": "exported", "question_count": len(questions), "exercise_ids": [str(q["exercise_id"]) for q in questions], "questions": questions}
+        if cloud_profile_id:
+            metadata["cloud_profile_id"] = cloud_profile_id
         self.db.execute("INSERT INTO batch_jobs VALUES (?, NULL, ?, ?, NULL, ?)", (job_id, "exported", str(input_file), json.dumps(metadata, ensure_ascii=False)))
         self.db.commit(); return metadata
 

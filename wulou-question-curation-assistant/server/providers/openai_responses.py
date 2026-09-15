@@ -1,6 +1,6 @@
-"""OpenAI Responses 与 Batch API 适配器。
+"""Responses、Chat Completions 与 Claude Messages 协议适配器。
 
-不依赖 SDK，便于接入兼容 ``/v1/responses`` 的云端网关。
+不依赖 SDK；内部分类语义统一，只有请求和结构化结果在协议边界转换。
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from typing import Any
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -28,15 +29,36 @@ class CloudProviderError(RuntimeError):
 
 
 class OpenAIChatCompletionsProvider:
-    """以 Responses 协议请求云端分类模型；保留旧类名以兼容本机导入。"""
+    """以选定协议请求云端分类模型；保留旧类名以兼容本机导入。"""
 
-    provider_name = "openai_responses"
+    PROTOCOLS = {"responses", "chat_completions", "anthropic_messages"}
+    SYSTEM_INSTRUCTION = "你是中考数学目录审核器。网页目录只是弱提示；实际题目和 Skill 决策协议优先。只返回符合指定结构的结果。"
+
+    @staticmethod
+    def normalize_base_url(value: Any) -> str:
+        """接受 API 根地址；未写版本路径时统一补上 /v1。"""
+        base_url = str(value or "https://api.openai.com").strip().rstrip("/")
+        parsed = urlparse(base_url)
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        # 兼容 /v1、/v1beta 等已有 API 版本路径，避免重复拼接。
+        version = segments[-1].lower() if segments else ""
+        if version != "v1" and not version.startswith("v1beta"):
+            base_url = f"{base_url}/v1"
+        return base_url
 
     def __init__(self, settings: dict[str, Any]) -> None:
         self.model = str(settings.get("model", "")).strip()
+        self.allow_empty_model = bool(settings.get("allow_empty_model", False))
         self.api_key_env = str(settings.get("api_key_env", "OPENAI_API_KEY")).strip()
         self.api_key = str(settings.get("api_key", "")).strip()
-        self.base_url = str(settings.get("base_url", "https://api.openai.com/v1")).rstrip("/")
+        self.base_url = self.normalize_base_url(settings.get("base_url", "https://api.openai.com"))
+        self.protocol = str(settings.get("protocol", "responses")).strip().lower()
+        self.request_compatibility = str(settings.get("request_compatibility", "standard")).strip().lower()
+        configured_headers = settings.get("extra_headers")
+        self.extra_headers = {
+            str(name): str(value) for name, value in configured_headers.items()
+            if str(name).strip() and str(value).strip()
+        } if isinstance(configured_headers, dict) else {}
         self.reasoning_effort = str(settings.get("reasoning_effort", "high")).strip().lower()
         # 目录方案是粗粒度结构设计：先并发提取短题目特征，再一次性综合，不能沿用逐题精分的高推理配置。
         self.directory_reasoning_effort = str(settings.get("directory_reasoning_effort", "low")).strip().lower()
@@ -49,8 +71,11 @@ class OpenAIChatCompletionsProvider:
         # 这是网络失联保护，不是页面分类的业务时限。兼容旧配置的 180 秒也提升到 600 秒，
         # 防止上游已经完成但本机先断开并重复计费。
         self.timeout_seconds = max(600, int(settings.get("timeout_seconds", 600)))
-        if not self.model:
+        if not self.model and not self.allow_empty_model:
             raise ValueError("cloud.model 不能为空")
+        if self.protocol not in self.PROTOCOLS:
+            raise ValueError("cloud.protocol 必须是 responses、chat_completions 或 anthropic_messages")
+        self.provider_name = self.protocol
         if self.reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("cloud.reasoning_effort 必须是 none、low、medium、high、xhigh 或 max")
         if self.directory_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
@@ -84,6 +109,17 @@ class OpenAIChatCompletionsProvider:
             "按通行的中学数学运算优先级解释题干和答案：乘方优先于一元正负号，"
             "未写括号的正负号不自动并入幂底。可由标准优先级唯一确定的表达式不得仅因未额外加括号而返回 review；"
             "只有存在两个均符合题干、且不能由答案或上下文排除的解释时，才可判为表达式歧义。"
+        )
+
+    @staticmethod
+    def _topic_routing_instruction() -> str:
+        """统一多小问跨知识点题的专题路由优先级。"""
+        return (
+            "同一道含多个跨知识点小问的题必须作为整题路由，不能按小问拆分。先比较各知识点对整题主结论、"
+            "核心难点和最困难非例行推理的作用；存在明确核心时归入该知识点所属专题。仅在候选核心无法区分轻重时，"
+            "才从完整必备知识中选择目录顺序最晚的前置专题；更晚的常规计算、铺垫或辅助代入不得压过明确核心。"
+            "专题10之前的非复合题或上述核心并列题按最晚必备知识点路由；从专题10“三角形”起及后续专题的【大题】"
+            "仍按最终解题核心突破口路由。"
         )
 
     @staticmethod
@@ -209,7 +245,7 @@ class OpenAIChatCompletionsProvider:
                 },
             },
         }
-        return self._responses_request("math_question_classification", [prompt], schema)
+        return self._protocol_request("math_question_classification", [prompt], schema)
 
     def build_routing_request(self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any]) -> dict[str, Any]:
         """构造不受网页目录限制的全局专题路由请求。"""
@@ -221,7 +257,8 @@ class OpenAIChatCompletionsProvider:
             "question": self._question(question),
             "all_topics_in_order": topics,
             "instructions": [
-                "先分析，再选专题；不得从 page_scope_hint 直接抄专题。专题10之前的基础或前置知识专题按最晚必备知识点路由；从专题10“三角形”起及后续专题的【大题】按最终解题核心突破口路由。",
+                "先分析，再选专题；不得从 page_scope_hint 直接抄专题。",
+                self._topic_routing_instruction(),
                 "all_topics_in_order 是完整候选范围。",
                 "含 sin、cos、tan、cot 或特殊角三角函数值时，必须把三角函数列为必备知识点。",
                 "题干、公式或答案不足时返回 review，不得猜测。",
@@ -260,7 +297,8 @@ class OpenAIChatCompletionsProvider:
             "policy": self._policy(rules),
             "all_topics_in_order": topics,
             "instructions": [
-                "列出完整解题不可缺少的知识点。专题10之前的基础或前置知识专题选择目录顺序中最晚的必备专题；从专题10“三角形”起及后续专题的【大题】选择最终解题的核心突破口所属专题，不能因扇形面积、旋转、坐标或代数运算等辅助步骤改变归属。",
+                "列出完整解题不可缺少的知识点。",
+                self._topic_routing_instruction(),
                 "网页目录只是弱提示；不得从 page_scope_hint 直接抄专题。",
                 "含 sin、cos、tan、cot 或特殊角三角函数值时，必须把三角函数列为必备知识点。",
                 "题干、公式或答案不足时返回 review，不得猜测；reason 仅保留短句。",
@@ -291,7 +329,7 @@ class OpenAIChatCompletionsProvider:
     def route_fast_batch(
         self, questions: list[dict[str, Any]], taxonomy: Any, rules: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        payload = self._decode(self._request("POST", "/responses", self.build_batch_routing_request(questions, taxonomy, rules)))
+        payload = self._decode(self._request("POST", self._protocol_path(), self.build_batch_routing_request(questions, taxonomy, rules)))
         return self._batch_rows(payload, questions, "专题路由")
 
     def build_topic_batch_request(
@@ -319,7 +357,8 @@ class OpenAIChatCompletionsProvider:
             "all_topics_in_order": taxonomy.topic_catalog(),
             "directory_catalog": catalog,
             "instructions": [
-                "先独立复核 topic_routing 是否符合分阶段规则：专题10之前检查是否遗漏更晚的必备专题；专题10及后续的【大题】检查是否把辅助步骤误作核心考点。若发现应改到其他专题，必须设置 self_check_passed=false、status=review、reroute_topic_id=修正专题，并将目录目标留空；服务端会加载修正专题的详细目录后重新分类。",
+                "先独立复核 topic_routing 是否符合分阶段规则及同题多小问归属机制：检查是否把辅助或铺垫知识误作核心，或在核心并列时遗漏更晚的必备专题；专题10及后续的【大题】还要检查是否把辅助步骤误作核心考点。若发现应改到其他专题，必须设置 self_check_passed=false、status=review、reroute_topic_id=修正专题，并将目录目标留空；服务端会加载修正专题的详细目录后重新分类。",
+                self._topic_routing_instruction(),
                 "自检通过后，只在已路由专题内按首要数学对象确定三级、按主问或决定性条件确定四级。",
                 "directory_catalog 仅是当前已路由专题的详细目录，不代表完整专题目录；不得据此声称系统缺少其他专题目录。",
                 "当前题属于【大题】时，directory_catalog 已限定为该专题的【大题】二级目录；只能在其三级、四级目录中选择。" if is_large_question else "当前题不限定为【大题】；按 directory_catalog 选择可用目录。",
@@ -385,7 +424,7 @@ class OpenAIChatCompletionsProvider:
         routings: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         request = self.build_topic_batch_request(questions, topic_id, taxonomy, rules, routings)
-        rows = self._batch_rows(self._decode(self._request("POST", "/responses", request)), questions, "专题内分类")
+        rows = self._batch_rows(self._decode(self._request("POST", self._protocol_path(), request)), questions, "专题内分类")
         for row in rows:
             row["routing"] = routings[str(row["exercise_id"])]
             row["self_check"] = {
@@ -408,7 +447,8 @@ class OpenAIChatCompletionsProvider:
             "policy": self._policy(rules),
             "directory_catalog": taxonomy.classification_catalog(),
             "instructions": [
-                "每题先列出完整必备知识点，再按分阶段规则选专题：专题10之前按最晚必备知识点；从专题10“三角形”起及后续专题的【大题】按最终解题核心突破口，辅助的扇形面积、旋转、坐标或代数运算不得改变归属。",
+                "每题先列出完整必备知识点，再按分阶段规则选专题。",
+                self._topic_routing_instruction(),
                 "page_scope_hint 和 site_context 只作弱提示；与实际题目冲突时必须忽略。",
                 "在选定专题内，按首要数学对象确定三级，按主问或决定性条件确定四级。",
                 "逐题检查显式符号与目录的含/不含语义；无法唯一命中时返回 review。",
@@ -469,7 +509,7 @@ class OpenAIChatCompletionsProvider:
         if not questions or len(questions) > 10:
             raise ValueError("快速批量分类每次必须包含 1-10 道题")
         request = self.build_fast_batch_request(questions, taxonomy, rules)
-        payload = self._decode(self._request("POST", "/responses", request))
+        payload = self._decode(self._request("POST", self._protocol_path(), request))
         rows = payload.get("results")
         if not isinstance(rows, list):
             raise CloudProviderError("云端模型未返回批量 results 数组")
@@ -585,7 +625,7 @@ class OpenAIChatCompletionsProvider:
             "math_directory_refactor", static_context, dynamic_context, schema,
             reasoning_effort=request_effort,
         )
-        return self._decode(self._request_with_retry("POST", "/responses", request))
+        return self._decode(self._request_with_retry("POST", self._protocol_path(), request))
 
     @staticmethod
     def _clip_directory_text(value: Any, limit: int) -> str:
@@ -637,7 +677,7 @@ class OpenAIChatCompletionsProvider:
                 "questions": [self._directory_question(question) for question in batch],
             }
             request = self._structured_request("math_directory_question_signals", prompt, schema, reasoning_effort=self.directory_reasoning_effort)
-            payload = self._decode(self._request_with_retry("POST", "/responses", request))
+            payload = self._decode(self._request_with_retry("POST", self._protocol_path(), request))
             rows = payload.get("signals") if isinstance(payload, dict) else None
             if not isinstance(rows, list):
                 raise CloudProviderError("目录题目特征未返回 signals 数组")
@@ -685,30 +725,55 @@ class OpenAIChatCompletionsProvider:
     def _structured_request(
         self, name: str, prompt: dict[str, Any], schema: dict[str, Any], reasoning_effort: str | None = None
     ) -> dict[str, Any]:
-        return self._responses_request(name, [prompt], schema, reasoning_effort=reasoning_effort)
+        return self._protocol_request(name, [prompt], schema, reasoning_effort=reasoning_effort)
 
     def _staged_structured_request(
         self, name: str, static_context: dict[str, Any], dynamic_context: dict[str, Any], schema: dict[str, Any],
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """把固定 Skill/目录和动态题目拆成连续消息，便于兼容网关复用共同前缀。"""
-        return self._responses_request(name, [static_context, dynamic_context], schema, reasoning_effort=reasoning_effort)
+        return self._protocol_request(name, [static_context, dynamic_context], schema, reasoning_effort=reasoning_effort)
 
-    def _responses_request(
+    def _protocol_request(
         self, name: str, contexts: list[dict[str, Any]], schema: dict[str, Any], reasoning_effort: str | None = None
     ) -> dict[str, Any]:
-        """按 Responses API 生成请求；连续 input 消息让固定上下文位于动态题目前。"""
-        request: dict[str, Any] = {
+        """将统一的分类请求转换为所选协议的结构化输出请求。"""
+        encoded_contexts = [json.dumps(context, ensure_ascii=False, separators=(",", ":")) for context in contexts]
+        effort = reasoning_effort or self.reasoning_effort
+        if self.protocol == "responses":
+            return {
+                "model": self.model,
+                "instructions": self.SYSTEM_INSTRUCTION,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": context}]} for context in encoded_contexts],
+                "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
+                "reasoning": {"effort": effort},
+            }
+        if self.protocol == "chat_completions":
+            return {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.SYSTEM_INSTRUCTION},
+                    *[{"role": "user", "content": context} for context in encoded_contexts],
+                ],
+                "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
+                "reasoning_effort": effort,
+            }
+        # Claude Messages 的 tool_use 以 input_schema 强制返回对象，比仅提示“输出 JSON”更可靠。
+        return {
             "model": self.model,
-            "instructions": "你是中考数学目录审核器。网页目录只是弱提示；实际题目和 Skill 决策协议优先。只返回符合 JSON Schema 的结果。",
-            "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": json.dumps(context, ensure_ascii=False, separators=(",", ":"))}]}
-                for context in contexts
-            ],
-            "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
-            "reasoning": {"effort": reasoning_effort or self.reasoning_effort},
+            "max_tokens": 4096,
+            "system": self.SYSTEM_INSTRUCTION,
+            "messages": [{"role": "user", "content": context} for context in encoded_contexts],
+            "tools": [{"name": "submit_classification", "description": "提交符合分类规则的 JSON 结果。", "input_schema": schema}],
+            "tool_choice": {"type": "tool", "name": "submit_classification"},
         }
-        return request
+
+    def _protocol_path(self) -> str:
+        return {
+            "responses": "/responses",
+            "chat_completions": "/chat/completions",
+            "anthropic_messages": "/messages",
+        }[self.protocol]
 
     @staticmethod
     def _batch_rows(payload: dict[str, Any], questions: list[dict[str, Any]], label: str) -> list[dict[str, Any]]:
@@ -730,7 +795,7 @@ class OpenAIChatCompletionsProvider:
 
     def classify(self, question: dict[str, Any], taxonomy: Any, rules: dict[str, Any]) -> dict[str, Any]:
         """实时精准分类：全局专题路由、专题内目录分类与第二阶段自检。"""
-        routing = self._decode(self._request("POST", "/responses", self.build_routing_request(question, taxonomy, rules)))
+        routing = self._decode(self._request("POST", self._protocol_path(), self.build_routing_request(question, taxonomy, rules)))
         topic_id = routing.get("latest_topic_id")
         if routing.get("status") != "routed" or not taxonomy.topic(str(topic_id)):
             return {
@@ -766,7 +831,55 @@ class OpenAIChatCompletionsProvider:
             current_topic_id = corrected_topic_id
         return decision
 
+    @staticmethod
+    def _listed_models(payload: dict[str, Any]) -> list[str]:
+        """从 OpenAI/Claude 及兼容网关的模型目录中提取可选模型名。"""
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            rows = payload.get("models")
+        if not isinstance(rows, list):
+            return []
+        models: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            value = row if isinstance(row, str) else (
+                row.get("id") or row.get("model") or row.get("name") if isinstance(row, dict) else ""
+            )
+            model = str(value or "").strip()
+            if model and model not in seen:
+                seen.add(model)
+                models.append(model)
+        return models[:500]
+
+    def test_connection(self) -> dict[str, Any]:
+        """只读取模型目录验证连接；不携带模型名，也不触发模型生成。"""
+        try:
+            # OpenAI 兼容接口和 Claude 原生接口均提供模型目录；它只验证地址和认证。
+            catalog = self._request("GET", "/models", None, timeout_seconds=10)
+            return {
+                "protocol": self.protocol, "models": self._listed_models(catalog), "check": "model_catalog",
+                "message": "可连接",
+            }
+        except CloudProviderError as error:
+            # 有些兼容网关不实现 Models API。404/405 仍说明接口可达；前端不必
+            # 打扰用户说明这个兼容差异，诊断信息则保留在服务端调用链中。
+            if "HTTP 401" in str(error) or "HTTP 403" in str(error):
+                raise
+            if "HTTP 404" in str(error) or "HTTP 405" in str(error):
+                return {
+                    "protocol": self.protocol, "models": [], "check": "endpoint_reachable",
+                    "message": "可连接",
+                }
+            raise
+
     def create_batch_jsonl(self, questions: list[dict[str, Any]], taxonomy: Any, rules: dict[str, Any]) -> str:
+        """生成本地批任务台账。
+
+        OpenAI 系协议每行是其 Batch JSONL 请求；Claude 每行是 Message Batch 的
+        ``{custom_id, params}`` 请求。两者都留为 JSONL，只是提交时由协议适配器转成
+        供应商所需的载荷。
+        """
+        endpoint = "/v1/responses" if self.protocol == "responses" else "/v1/chat/completions"
         lines: list[str] = []
         for question in questions:
             # Provider Batch 无法在同一个作业内串联三次依赖调用，因此给每题完整候选；
@@ -774,13 +887,25 @@ class OpenAIChatCompletionsProvider:
             candidates = taxonomy.all_targets()
             if not candidates:
                 raise ValueError(f"题目 {question.get('exercise_id')} 没有可用目录")
-            lines.append(json.dumps({
-                "custom_id": f"exercise-{question['exercise_id']}-{uuid.uuid4().hex[:10]}",
-                "method": "POST", "url": "/v1/responses", "body": self.build_request(question, candidates, rules),
-            }, ensure_ascii=False, separators=(",", ":")))
+            request = self.build_request(question, candidates, rules)
+            custom_id = f"exercise-{question['exercise_id']}-{uuid.uuid4().hex[:10]}"
+            if self.protocol == "anthropic_messages":
+                lines.append(json.dumps({"custom_id": custom_id, "params": request}, ensure_ascii=False, separators=(",", ":")))
+            else:
+                lines.append(json.dumps({
+                    "custom_id": custom_id, "method": "POST", "url": endpoint, "body": request,
+                }, ensure_ascii=False, separators=(",", ":")))
         return "\n".join(lines) + ("\n" if lines else "")
 
     def submit_batch(self, jsonl_bytes: bytes) -> dict[str, Any]:
+        if self.protocol == "anthropic_messages":
+            try:
+                requests = [json.loads(line) for line in jsonl_bytes.decode("utf-8").splitlines() if line.strip()]
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise CloudProviderError("Claude 批处理本地任务文件无效") from error
+            if not requests or any(not isinstance(item, dict) or not isinstance(item.get("params"), dict) for item in requests):
+                raise CloudProviderError("Claude 批处理本地任务内容无效")
+            return self._normalize_anthropic_batch(self._request("POST", "/messages/batches", {"requests": requests}))
         boundary = f"----wulou{uuid.uuid4().hex}"
         chunks = [
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n".encode(),
@@ -788,13 +913,67 @@ class OpenAIChatCompletionsProvider:
             jsonl_bytes, f"\r\n--{boundary}--\r\n".encode(),
         ]
         file_info = self._request("POST", "/files", b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        return self._request("POST", "/batches", {"input_file_id": file_info["id"], "endpoint": "/v1/responses", "completion_window": "24h"})
+        endpoint = "/v1/responses" if self.protocol == "responses" else "/v1/chat/completions"
+        return self._request("POST", "/batches", {"input_file_id": file_info["id"], "endpoint": endpoint, "completion_window": "24h"})
 
     def get_batch(self, provider_batch_id: str) -> dict[str, Any]:
+        if self.protocol == "anthropic_messages":
+            return self._normalize_anthropic_batch(self._request("GET", f"/messages/batches/{provider_batch_id}"))
         return self._request("GET", f"/batches/{provider_batch_id}")
 
     def get_file_content(self, file_id: str) -> bytes:
         return self._request("GET", f"/files/{file_id}/content", raw=True)
+
+    def get_batch_result_content(self, provider_batch: dict[str, Any]) -> bytes:
+        """下载已完成批任务的原始 JSONL；差异仅保留在协议边界。"""
+        if self.protocol != "anthropic_messages":
+            output_file_id = str(provider_batch.get("output_file_id", "")).strip()
+            if not output_file_id:
+                raise CloudProviderError("OpenAI 批处理未提供结果文件")
+            return self.get_file_content(output_file_id)
+        results_url = str(provider_batch.get("results_url", "")).strip()
+        if not results_url:
+            raise CloudProviderError("Claude 批处理未提供结果地址")
+        return self._request("GET", self._anthropic_result_path(results_url), raw=True)
+
+    def batch_result_decision(self, record: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        """从供应商 JSONL 的一行提取统一分类结果；失败项返回 None。"""
+        custom_id = str(record.get("custom_id", "")).strip()
+        if not custom_id:
+            return "", None
+        if self.protocol == "anthropic_messages":
+            result = record.get("result")
+            if not isinstance(result, dict) or result.get("type") != "succeeded":
+                return custom_id, None
+            message = result.get("message")
+            return custom_id, self._decode(message) if isinstance(message, dict) else None
+        response = record.get("response")
+        body = response.get("body") if isinstance(response, dict) else None
+        status_code = response.get("status_code") if isinstance(response, dict) else 0
+        if not isinstance(body, dict) or int(status_code or 0) >= 300:
+            return custom_id, None
+        return custom_id, self._decode(body)
+
+    @staticmethod
+    def _normalize_anthropic_batch(batch: dict[str, Any]) -> dict[str, Any]:
+        """把 Claude 的 processing_status 映射为本地台账已有的 status 语义。"""
+        status = str(batch.get("processing_status", "unknown"))
+        normalized = {"ended": "completed", "in_progress": "in_progress", "canceling": "cancelling"}.get(status, status)
+        return {**batch, "status": normalized}
+
+    def _anthropic_result_path(self, results_url: str) -> str:
+        """将 Claude 返回的相对/绝对 results_url 安全转成当前 base_url 下的路径。"""
+        parsed = urlparse(results_url)
+        base = urlparse(self.base_url)
+        if parsed.scheme and (parsed.scheme != base.scheme or parsed.netloc != base.netloc):
+            raise CloudProviderError("Claude 批处理结果地址与当前接口地址不一致")
+        path = parsed.path or results_url
+        base_path = base.path.rstrip("/")
+        if base_path and path.startswith(f"{base_path}/"):
+            path = path[len(base_path):]
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return path
 
     def _request(
         self,
@@ -810,9 +989,12 @@ class OpenAIChatCompletionsProvider:
             raise CloudProviderError(f"未设置环境变量 {self.api_key_env}")
         body = None if payload is None else (payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         headers = {"Authorization": f"Bearer {key}"}
+        if self.protocol == "anthropic_messages":
+            headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
         if body is not None and not isinstance(payload, bytes): headers["Content-Type"] = "application/json"
         if extra_headers: headers.update(extra_headers)
-        request = Request(self.base_url + path, data=body, method=method, headers=headers)
+        headers.update(self._compatibility_headers())
+        request = Request(self._request_url(path), data=body, method=method, headers=headers)
         try:
             with urlopen(request, timeout=timeout_seconds or self.timeout_seconds) as response:
                 data = response.read()
@@ -836,10 +1018,41 @@ class OpenAIChatCompletionsProvider:
             raise CloudProviderError("云端接口响应必须是 JSON 对象")
         return decoded
 
-    @staticmethod
-    def _decode(response: dict[str, Any]) -> dict[str, Any]:
+    def _compatibility_headers(self) -> dict[str, str]:
+        """按当前模型方案应用可复用的请求兼容预设和自定义头。"""
+        presets = {
+            "standard": {},
+            "go_http": {"User-Agent": "Go-http-client/1.1"},
+        }
+        return {**presets.get(self.request_compatibility, {}), **self.extra_headers}
+
+    def _request_url(self, path: str) -> str:
+        """把接口路径拼到已标准化的根地址，避免已有版本前缀重复。"""
+        request_path = path if path.startswith("/") else f"/{path}"
+        version = urlparse(self.base_url).path.rstrip("/").rsplit("/", 1)[-1]
+        if version and (
+            request_path == f"/{version}"
+            or request_path.startswith(f"/{version}/")
+        ):
+            request_path = request_path[len(version) + 1:] or "/"
+        return self.base_url + request_path
+
+    def _decode(self, response: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(response, dict):
             raise CloudProviderError("云端接口响应必须是 JSON 对象")
+        if self.protocol == "chat_completions":
+            choices = response.get("choices") or []
+            message = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+            return self._decode_json_result(content, "Chat Completions")
+        if self.protocol == "anthropic_messages":
+            for item in response.get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "tool_use" and isinstance(item.get("input"), dict):
+                    return item["input"]
+            text = "".join(str(item.get("text", "")) for item in response.get("content") or [] if isinstance(item, dict) and item.get("type") == "text")
+            return self._decode_json_result(text, "Claude Messages")
         if response.get("status") in {"failed", "cancelled", "incomplete"}:
             error = response.get("error") or response.get("incomplete_details") or {}
             detail = error.get("message") if isinstance(error, dict) else ""
@@ -856,14 +1069,20 @@ class OpenAIChatCompletionsProvider:
                 if isinstance(content, str):
                     break
         if isinstance(content, str):
-            try:
-                decoded = json.loads(content)
-            except json.JSONDecodeError as error:
-                raise CloudProviderError("云端模型返回的分类结果不是有效 JSON") from error
-            if isinstance(decoded, dict):
-                return decoded
-            raise CloudProviderError("云端模型返回的分类结果必须是 JSON 对象")
+            return self._decode_json_result(content, "Responses")
         raise CloudProviderError("云端 Responses 未返回可解析的结构化结果")
+
+    @staticmethod
+    def _decode_json_result(content: Any, protocol_name: str) -> dict[str, Any]:
+        if not isinstance(content, str) or not content.strip():
+            raise CloudProviderError(f"云端 {protocol_name} 未返回可解析的结构化结果")
+        try:
+            decoded = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise CloudProviderError("云端模型返回的分类结果不是有效 JSON") from error
+        if isinstance(decoded, dict):
+            return decoded
+        raise CloudProviderError("云端模型返回的分类结果必须是 JSON 对象")
 
     @staticmethod
     def _http_error_detail(error: HTTPError) -> str:
@@ -882,5 +1101,5 @@ class OpenAIChatCompletionsProvider:
             return ""
 
 
-# 兼容已保存的本地 Python 导入路径；实际请求协议为 Responses。
+# 兼容已保存的本地 Python 导入路径；实际请求协议由模型方案中的 protocol 决定。
 OpenAIResponsesProvider = OpenAIChatCompletionsProvider

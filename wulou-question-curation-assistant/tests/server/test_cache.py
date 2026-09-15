@@ -153,6 +153,19 @@ class ResultCacheTests(unittest.TestCase):
             self.assertEqual(report["summary"]["period"]["utc_start"], "2026-09-11 16:00:00")
             self.assertEqual(report["summary"]["period"]["utc_end"], "2026-09-12 16:00:00")
             self.assertEqual({item["stable_code"] for item in report["records"]}, {"CS2026start", "CS2026end"})
+
+            selected = cache.catalogue_move_report(selected_date="2026-09-11")
+            self.assertEqual(selected["summary"]["period"]["label"], "2026-09-11 工作成果")
+            self.assertEqual({item["stable_code"] for item in selected["records"]}, {"CS2026before"})
+            ranged = cache.catalogue_move_report(start_date="2026-09-11", end_date="2026-09-12")
+            self.assertEqual(ranged["summary"]["period"]["label"], "2026-09-11 至 2026-09-12 工作成果")
+            self.assertEqual(ranged["summary"]["period"]["start_date"], "2026-09-11")
+            self.assertEqual(ranged["summary"]["period"]["end_date"], "2026-09-12")
+            self.assertEqual({item["stable_code"] for item in ranged["records"]}, {"CS2026before", "CS2026start", "CS2026end"})
+            with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+                cache.catalogue_move_report(selected_date="2026/09/11")
+            with self.assertRaisesRegex(ValueError, "截止日期"):
+                cache.catalogue_move_report(start_date="2026-09-12", end_date="2026-09-11")
             cache.close()
 
     def test_legacy_cache_table_is_preserved_during_schema_upgrade(self) -> None:

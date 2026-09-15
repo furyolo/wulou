@@ -43,6 +43,118 @@ class CloudAndBatchTests(unittest.TestCase):
             request = provider.build_routing_request(self.question, self.taxonomy, {"rules": {}})
             self.assertEqual(request["reasoning"]["effort"], effort)
 
+    def test_chat_completions_request_and_response_are_adapted(self) -> None:
+        provider = OpenAIChatCompletionsProvider({"model": "test-model", "protocol": "chat_completions"})
+        request = provider.build_routing_request(self.question, self.taxonomy, {"rules": {}})
+        self.assertEqual(provider._protocol_path(), "/chat/completions")
+        self.assertNotIn("input", request)
+        self.assertEqual(request["messages"][0]["role"], "system")
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertEqual(request["response_format"]["json_schema"]["name"], "math_topic_routing")
+        self.assertEqual(provider._decode({"choices": [{"message": {"content": '{"status":"routed"}'}}]}), {"status": "routed"})
+        line = json.loads(provider.create_batch_jsonl([self.question], self.taxonomy, {"rules": {}}))
+        self.assertEqual(line["url"], "/v1/chat/completions")
+
+    def test_claude_messages_request_and_tool_result_are_adapted(self) -> None:
+        provider = OpenAIChatCompletionsProvider({"model": "test-model", "protocol": "anthropic_messages"})
+        request = provider.build_routing_request(self.question, self.taxonomy, {"rules": {}})
+        self.assertEqual(provider._protocol_path(), "/messages")
+        self.assertNotIn("response_format", request)
+        self.assertEqual(request["tools"][0]["name"], "submit_classification")
+        self.assertEqual(request["tool_choice"], {"type": "tool", "name": "submit_classification"})
+        self.assertEqual(
+            provider._decode({"content": [{"type": "tool_use", "name": "submit_classification", "input": {"status": "routed"}}]}),
+            {"status": "routed"},
+        )
+        line = json.loads(provider.create_batch_jsonl([self.question], self.taxonomy, {"rules": {}}))
+        self.assertTrue(line["custom_id"].startswith("exercise-2529221-"))
+        self.assertIn("params", line)
+        self.assertEqual(line["params"]["tool_choice"], {"type": "tool", "name": "submit_classification"})
+
+    def test_claude_message_batch_submission_polling_and_result_parsing(self) -> None:
+        provider = OpenAIChatCompletionsProvider({"model": "test-model", "protocol": "anthropic_messages", "base_url": "https://api.anthropic.com/v1"})
+        request_line = provider.create_batch_jsonl([self.question], self.taxonomy, {"rules": {}}).encode("utf-8")
+        calls: list[tuple[str, str, object, dict[str, object]]] = []
+
+        def request(method, path, payload=None, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append((method, path, payload, kwargs))
+            if method == "POST":
+                return {"id": "msgbatch_123", "processing_status": "in_progress"}
+            if path == "/messages/batches/msgbatch_123":
+                return {"id": "msgbatch_123", "processing_status": "ended", "results_url": "/v1/messages/batches/msgbatch_123/results"}
+            if path == "/messages/batches/msgbatch_123/results":
+                return (json.dumps({
+                    "custom_id": "exercise-2529221-batch", "result": {"type": "succeeded", "message": {
+                        "content": [{"type": "tool_use", "name": "submit_classification", "input": {"status": "suggested"}}],
+                    }},
+                }) + "\n").encode("utf-8")
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        provider._request = request  # type: ignore[method-assign]
+        submitted = provider.submit_batch(request_line)
+        self.assertEqual(submitted["id"], "msgbatch_123")
+        self.assertEqual(submitted["status"], "in_progress")
+        self.assertEqual(calls[0][1], "/messages/batches")
+        self.assertIn("requests", calls[0][2])
+        completed = provider.get_batch("msgbatch_123")
+        self.assertEqual(completed["status"], "completed")
+        raw = provider.get_batch_result_content(completed)
+        record = json.loads(raw.decode("utf-8"))
+        self.assertEqual(provider.batch_result_decision(record), ("exercise-2529221-batch", {"status": "suggested"}))
+        self.assertEqual(provider.batch_result_decision({"custom_id": "exercise-2529221-error", "result": {"type": "errored"}}), ("exercise-2529221-error", None))
+
+    def test_connection_treats_missing_model_catalog_as_reachable_without_generation(self) -> None:
+        for protocol in ("responses", "chat_completions", "anthropic_messages"):
+            provider = OpenAIChatCompletionsProvider({"model": "test-model", "protocol": protocol})
+            calls: list[tuple[str, str]] = []
+
+            def request(method, request_path, payload, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, request_path))
+                if method == "GET":
+                    raise CloudProviderError("云端模型返回 HTTP 404")
+                raise AssertionError("快速连接测试不应触发模型生成")
+
+            provider._request = request  # type: ignore[method-assign]
+            result = provider.test_connection()
+            self.assertEqual(result["protocol"], protocol)
+            self.assertEqual(result["check"], "endpoint_reachable")
+            self.assertEqual(calls, [("GET", "/models")])
+
+    def test_connection_prefers_non_generating_model_lookup(self) -> None:
+        provider = OpenAIChatCompletionsProvider({"allow_empty_model": True})
+        calls: list[tuple[str, str]] = []
+
+        def request(method, path, payload=None, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append((method, path))
+            return {"data": [{"id": "test-model"}, {"id": "test-model"}, {"id": "other-model"}]}
+
+        provider._request = request  # type: ignore[method-assign]
+        result = provider.test_connection()
+        self.assertEqual(result["check"], "model_catalog")
+        self.assertEqual(result["models"], ["test-model", "other-model"])
+        self.assertEqual(calls, [("GET", "/models")])
+
+    def test_base_url_adds_v1_once(self) -> None:
+        root_provider = OpenAIChatCompletionsProvider({"model": "test-model", "base_url": "https://api.example.test"})
+        existing_version_provider = OpenAIChatCompletionsProvider({"model": "test-model", "base_url": "https://api.example.test/v1/"})
+        self.assertEqual(root_provider.base_url, "https://api.example.test/v1")
+        self.assertEqual(existing_version_provider.base_url, "https://api.example.test/v1")
+        self.assertEqual(root_provider._request_url("/models"), "https://api.example.test/v1/models")
+        self.assertEqual(root_provider._request_url("/v1/responses"), "https://api.example.test/v1/responses")
+
+    def test_request_compatibility_is_configured_per_profile(self) -> None:
+        provider = OpenAIChatCompletionsProvider({
+            "model": "test-model", "request_compatibility": "go_http",
+            "extra_headers": {"X-Workspace": "math-curation"},
+        })
+        self.assertEqual(provider._compatibility_headers(), {
+            "User-Agent": "Go-http-client/1.1", "X-Workspace": "math-curation",
+        })
+        self.assertEqual(
+            OpenAIChatCompletionsProvider({"model": "test-model"})._compatibility_headers(),
+            {},
+        )
+
     def test_directory_signal_requests_use_low_reasoning_and_compact_question_text(self) -> None:
         provider = OpenAIChatCompletionsProvider({
             "model": "test-model", "directory_reasoning_effort": "low", "directory_batch_size": 60,
@@ -139,6 +251,25 @@ class CloudAndBatchTests(unittest.TestCase):
             static_prompt = json.loads(request["input"][0]["content"][0]["text"])
             instruction_texts.append(" ".join(static_prompt.get("instructions") or static_prompt.get("checks") or []))
         self.assertTrue(all("乘方优先于一元正负号" in text for text in instruction_texts))
+
+    def test_all_topic_routing_phases_keep_compound_question_priority(self) -> None:
+        target = self.taxonomy.all_targets()[0]
+        routing = {"latest_topic_id": target.topic_id, "required_knowledge_points": ["整式", "分式"]}
+        requests = [
+            self.provider.build_routing_request(self.question, self.taxonomy, {"rules": {}}),
+            self.provider.build_batch_routing_request([self.question], self.taxonomy, {"rules": {}}),
+            self.provider.build_topic_batch_request(
+                [self.question], target.topic_id, self.taxonomy, {"rules": {}},
+                {self.question["exercise_id"]: routing},
+            ),
+            self.provider.build_fast_batch_request([self.question], self.taxonomy, {"rules": {}}),
+        ]
+        instruction_texts = []
+        for request in requests:
+            static_prompt = json.loads(request["input"][0]["content"][0]["text"])
+            instruction_texts.append(" ".join(static_prompt["instructions"]))
+        self.assertTrue(all("多个跨知识点小问" in text for text in instruction_texts))
+        self.assertTrue(all("候选核心无法区分轻重" in text for text in instruction_texts))
 
     def test_provider_keeps_numbering_mismatched_answer_for_semantic_review(self) -> None:
         question = {

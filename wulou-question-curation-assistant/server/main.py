@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import secrets
 import sys
 import tempfile
 import threading
@@ -16,6 +18,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
@@ -53,6 +56,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS = 1000
 MAX_TOPIC_REROUTES_PER_QUESTION = 2
 ROUTING_PIPELINE_VERSION = 2
+CLOUD_PROFILE_FIELDS = (
+    "protocol", "model", "routing_model", "reasoning_effort", "routing_reasoning_effort",
+    "base_url", "api_key_env", "api_key", "request_compatibility", "extra_headers",
+)
+PROTECTED_REQUEST_HEADERS = {"authorization", "x-api-key", "content-type", "host", "content-length"}
+PIPELINE_FIELDS = (
+    "max_concurrent_requests", "directory_reasoning_effort", "directory_batch_size",
+    "directory_concurrency", "directory_retry_attempts", "directory_request_timeout_seconds",
+    "timeout_seconds",
+)
 
 
 def load_settings(config_path: Path) -> dict[str, Any]:
@@ -110,11 +123,13 @@ class ServiceState:
             json.dumps(self.rules, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
         self.cloud: OpenAIChatCompletionsProvider | None = None
-        if classifier_settings.get("mode") == "cloud_hybrid":
-            self.cloud = OpenAIChatCompletionsProvider(classifier_settings.get("cloud") or {})
+        self._refresh_cloud_provider()
         batch_path = resolve_path(self.config_path, str((classifier_settings.get("batch") or {}).get("storage_path", "../.local-data/batches")))
         self.batches = BatchStore(batch_path)
         self.classification_jobs = ClassificationJobStore()
+        # 连接测试不写入设置，也不能因浏览器对单次长请求的限制而丢失完成状态。
+        self._connection_test_lock = threading.Lock()
+        self._connection_tests: dict[str, dict[str, Any]] = {}
         # 所有实时分类作业共用同一组模型请求槽位，避免两个 Focus 各自按 3 路并发时叠加成 6 路。
         self._llm_slot_condition = threading.Condition()
         self._active_llm_requests = 0
@@ -122,7 +137,8 @@ class ServiceState:
         self.proposals = ProposalStore(cache_path.with_name("directory-proposals.sqlite3"), proposal_minimum)
 
     def cache_key(self, question: dict[str, Any]) -> str:
-        cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
+        cloud_settings = self.active_cloud_settings()
+        profile = self.active_cloud_profile()
         routing_model = str(cloud_settings.get("routing_model", "")).strip()
         directory_effort = str(cloud_settings.get("reasoning_effort", "high")).strip().lower()
         routing_effort = str(cloud_settings.get("routing_reasoning_effort", "medium")).strip().lower()
@@ -132,7 +148,11 @@ class ServiceState:
             self.rule_hash,
             # 模型名相同时，更换 API 协议或提供方也必须重新生成结果。
             # 保持与旧版默认“审核关闭”结果的缓存兼容，避免移除该步骤后无谓重跑全量题目。
-            f"cloud:{self.cloud.provider_name}:{self.cloud.model}:directory:{directory_effort}:route:{routing_model or self.cloud.model}:{routing_effort}:audit:disabled" if self.cloud else "heuristic-v1",
+            (
+                f"cloud:{profile.get('id', '')}:{getattr(self.cloud, 'provider_name', 'cloud')}:{getattr(self.cloud, 'base_url', cloud_settings.get('base_url', ''))}:"
+                f"{getattr(self.cloud, 'model', cloud_settings.get('model', ''))}:directory:{directory_effort}:"
+                f"route:{routing_model or getattr(self.cloud, 'model', cloud_settings.get('model', ''))}:{routing_effort}:audit:disabled"
+            ) if self.cloud else "heuristic-v1",
         ])
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -285,33 +305,241 @@ class ServiceState:
         self.batches.close()
         self.proposals.close()
 
+    def cloud_profiles(self) -> tuple[list[dict[str, Any]], str]:
+        """读取命名模型方案；旧版单 cloud 配置以“默认方案”兼容呈现。"""
+        classifier = self.settings.get("classifier") or {}
+        stored = classifier.get("cloud_profiles") or {}
+        profiles = stored.get("profiles") if isinstance(stored, dict) else None
+        if isinstance(profiles, list) and profiles:
+            normalized = [dict(item) for item in profiles if isinstance(item, dict) and str(item.get("id", "")).strip()]
+            active_id = str(stored.get("active_id", "")).strip()
+            if normalized and any(str(item["id"]) == active_id for item in normalized):
+                return normalized, active_id
+            if normalized:
+                return normalized, str(normalized[0]["id"])
+        legacy = dict(classifier.get("cloud") or {})
+        return [{"id": "default", "name": "默认方案", **legacy}], "default"
+
+    def active_cloud_profile(self) -> dict[str, Any]:
+        profiles, active_id = self.cloud_profiles()
+        return next((item for item in profiles if str(item.get("id")) == active_id), profiles[0])
+
+    def pipeline_settings(self) -> dict[str, Any]:
+        classifier = self.settings.get("classifier") or {}
+        legacy = classifier.get("cloud") or {}
+        configured = classifier.get("pipeline") or {}
+        return {field: configured.get(field, legacy.get(field)) for field in PIPELINE_FIELDS if configured.get(field, legacy.get(field)) is not None}
+
+    def active_cloud_settings(self) -> dict[str, Any]:
+        profile = self.active_cloud_profile()
+        settings = {field: profile[field] for field in CLOUD_PROFILE_FIELDS if field in profile}
+        settings.update(self.pipeline_settings())
+        return settings
+
+    def cloud_for_batch(self, job: dict[str, Any]) -> OpenAIChatCompletionsProvider:
+        """批任务始终使用创建时的模型方案，避免用户切换方案后协议错配。"""
+        profile_id = str(job.get("cloud_profile_id", "")).strip()
+        if not profile_id:
+            return self._require_cloud_provider()
+        profiles, _active_id = self.cloud_profiles()
+        profile = next((item for item in profiles if str(item.get("id")) == profile_id), None)
+        if not profile:
+            raise ValueError("批处理所用的模型方案已被删除")
+        settings = {field: profile[field] for field in CLOUD_PROFILE_FIELDS if field in profile}
+        settings.update(self.pipeline_settings())
+        return OpenAIChatCompletionsProvider(settings)
+
+    def _require_cloud_provider(self) -> OpenAIChatCompletionsProvider:
+        if not self.cloud:
+            raise ValueError("尚未启用 cloud_hybrid 分类器")
+        return self.cloud
+
+    def _refresh_cloud_provider(self) -> None:
+        classifier = self.settings.get("classifier") or {}
+        cloud_settings = self.active_cloud_settings()
+        if classifier.get("mode") == "cloud_hybrid" and str(cloud_settings.get("model", "")).strip():
+            self.cloud = OpenAIChatCompletionsProvider(cloud_settings)
+        else:
+            self.cloud = None
+
+    def _ensure_cloud_profile_store(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        """将旧配置仅在写入时迁移为方案列表，避免启动时意外改写用户文件。"""
+        classifier = self.settings.setdefault("classifier", {})
+        stored = classifier.get("cloud_profiles")
+        if not isinstance(stored, dict) or not isinstance(stored.get("profiles"), list) or not stored["profiles"]:
+            legacy = dict(classifier.get("cloud") or {})
+            profile = {"id": "default", "name": "默认方案"}
+            profile.update({field: legacy[field] for field in CLOUD_PROFILE_FIELDS if field in legacy})
+            legacy_pipeline = {field: legacy[field] for field in PIPELINE_FIELDS if field in legacy}
+            stored = {"active_id": "default", "profiles": [profile]}
+            classifier["cloud_profiles"] = stored
+            classifier.pop("cloud", None)
+        else:
+            legacy_pipeline = {}
+        profiles = stored["profiles"]
+        pipeline = classifier.setdefault("pipeline", {})
+        # 已迁移用户仍可从旧配置继承一次共享处理设置。
+        for field in PIPELINE_FIELDS:
+            if field not in pipeline and field in legacy_pipeline:
+                pipeline[field] = legacy_pipeline[field]
+        return stored, profiles, pipeline
+
+    @staticmethod
+    def _profile_id() -> str:
+        return f"profile-{secrets.token_hex(4)}"
+
+    @staticmethod
+    def _profile_name(value: Any) -> str:
+        name = str(value or "").strip()
+        if not name or len(name) > 40:
+            raise ValueError("方案名称不能为空，且长度不能超过 40")
+        return name
+
+    @staticmethod
+    def _request_compatibility(value: Any) -> str:
+        compatibility = str(value or "standard").strip().lower()
+        if compatibility not in {"standard", "go_http"}:
+            raise ValueError("请求兼容方式无效")
+        return compatibility
+
+    @staticmethod
+    def _extra_headers(value: Any) -> dict[str, str]:
+        if not isinstance(value, dict):
+            raise ValueError("自定义请求头格式无效")
+        if len(value) > 12:
+            raise ValueError("自定义请求头最多 12 项")
+        headers: dict[str, str] = {}
+        seen: set[str] = set()
+        for raw_name, raw_value in value.items():
+            name = str(raw_name or "").strip()
+            header_value = str(raw_value or "").strip()
+            normalized_name = name.lower()
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,80}", name):
+                raise ValueError("自定义请求头名称无效")
+            if normalized_name in PROTECTED_REQUEST_HEADERS:
+                raise ValueError(f"自定义请求头不能覆盖 {name}")
+            if normalized_name in seen or not header_value or len(header_value) > 1_000 or "\r" in header_value or "\n" in header_value:
+                raise ValueError("自定义请求头内容无效")
+            seen.add(normalized_name)
+            headers[name] = header_value
+        return headers
+
+    def _persist_cloud_settings(self) -> None:
+        target_config = self.config_path
+        if target_config.name == "settings.example.yaml":
+            target_config = target_config.with_name("settings.local.yaml")
+        save_settings(target_config, self.settings)
+        self.config_path = target_config
+        self._refresh_cloud_provider()
+        with self._llm_slot_condition:
+            self._llm_slot_condition.notify_all()
+
     def cloud_summary(self) -> dict[str, Any]:
-        cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
+        profile = self.active_cloud_profile()
+        pipeline = self.pipeline_settings()
+        profiles, active_id = self.cloud_profiles()
+        def custom_header_names(item: dict[str, Any]) -> list[str]:
+            headers = item.get("extra_headers")
+            return sorted(str(name) for name in headers) if isinstance(headers, dict) else []
+        profile_summaries = [{
+            "id": str(item.get("id", "")), "name": str(item.get("name", "")),
+            "protocol": str(item.get("protocol", "responses")), "model": str(item.get("model", "")), "routing_model": str(item.get("routing_model", "")),
+            "reasoning_effort": str(item.get("reasoning_effort", "high")),
+            "routing_reasoning_effort": str(item.get("routing_reasoning_effort", "medium")),
+            "request_compatibility": str(item.get("request_compatibility", "standard")),
+            "custom_header_names": custom_header_names(item),
+            "base_url": str(item.get("base_url", "https://api.openai.com/v1")),
+            "api_key_configured": bool(item.get("api_key") or (str(item.get("id")) == active_id and self.cloud and self.cloud.configured)),
+        } for item in profiles]
         return {
             "mode": (self.settings.get("classifier") or {}).get("mode", "heuristic"),
-            "model": cloud_settings.get("model", ""),
-            "routing_model": cloud_settings.get("routing_model", ""),
-            "reasoning_effort": cloud_settings.get("reasoning_effort", "high"),
-            "routing_reasoning_effort": cloud_settings.get("routing_reasoning_effort", "medium"),
+            "active_profile_id": active_id,
+            "active_profile_name": profile.get("name", ""),
+            "profiles": profile_summaries,
+            "protocol": profile.get("protocol", "responses"),
+            "model": profile.get("model", ""),
+            "routing_model": profile.get("routing_model", ""),
+            "reasoning_effort": profile.get("reasoning_effort", "high"),
+            "routing_reasoning_effort": profile.get("routing_reasoning_effort", "medium"),
+            "request_compatibility": profile.get("request_compatibility", "standard"),
+            "custom_header_names": custom_header_names(profile),
             "max_concurrent_requests": self.llm_concurrency(),
-            "base_url": cloud_settings.get("base_url", "https://api.openai.com/v1"),
-            "api_key_env": cloud_settings.get("api_key_env", "OPENAI_API_KEY"),
-            "api_key_configured": bool(cloud_settings.get("api_key") or (self.cloud and self.cloud.configured)),
+            "pipeline": {"max_concurrent_requests": self.llm_concurrency()},
+            "base_url": profile.get("base_url", "https://api.openai.com/v1"),
+            "api_key_env": profile.get("api_key_env", "OPENAI_API_KEY"),
+            "api_key_configured": bool(profile.get("api_key") or (self.cloud and self.cloud.configured)),
         }
 
     def update_cloud_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        existing_cloud = (self.settings.get("classifier") or {}).get("cloud") or {}
+        action = str(payload.get("action", "save_profile")).strip()
+        stored, profiles, pipeline = self._ensure_cloud_profile_store()
+        profile_id = str(payload.get("profile_id") or stored.get("active_id") or "").strip()
+        profile = next((item for item in profiles if str(item.get("id")) == profile_id), None)
+        if action == "create_profile":
+            name = self._profile_name(payload.get("name"))
+            if any(str(item.get("name", "")).casefold() == name.casefold() for item in profiles):
+                raise ValueError("已有同名模型方案")
+            profile = {"id": self._profile_id(), "name": name}
+            profiles.append(profile)
+            stored["active_id"] = profile["id"]
+            self._persist_cloud_settings()
+            return self.cloud_summary()
+        if not profile:
+            raise ValueError("未找到所选模型方案")
+        if action == "select_profile":
+            stored["active_id"] = profile_id
+            self._persist_cloud_settings()
+            return self.cloud_summary()
+        if action == "rename_profile":
+            profile_name = self._profile_name(payload.get("name", profile.get("name")))
+            if any(
+                str(item.get("id")) != profile_id and str(item.get("name", "")).casefold() == profile_name.casefold()
+                for item in profiles
+            ):
+                raise ValueError("已有同名模型方案")
+            profile["name"] = profile_name
+            self._persist_cloud_settings()
+            return self.cloud_summary()
+        if action == "delete_profile":
+            if len(profiles) == 1:
+                raise ValueError("至少保留一套模型方案")
+            profiles.remove(profile)
+            stored["active_id"] = str(profiles[0]["id"]) if stored.get("active_id") == profile_id else str(stored.get("active_id"))
+            self._persist_cloud_settings()
+            return self.cloud_summary()
+        if action == "reorder_profiles":
+            supplied_ids = payload.get("profile_ids")
+            if not isinstance(supplied_ids, list):
+                raise ValueError("模型方案排序格式无效")
+            ordered_ids = [str(item).strip() for item in supplied_ids]
+            known_ids = [str(item.get("id", "")) for item in profiles]
+            if len(ordered_ids) != len(known_ids) or not all(ordered_ids) or set(ordered_ids) != set(known_ids):
+                raise ValueError("模型方案排序与当前方案不一致，请刷新后重试")
+            by_id = {str(item["id"]): item for item in profiles}
+            profiles[:] = [by_id[item_id] for item_id in ordered_ids]
+            self._persist_cloud_settings()
+            return self.cloud_summary()
+        if action != "save_profile":
+            raise ValueError("未知的模型方案操作")
+
         model = str(payload.get("model", "")).strip()
+        protocol = str(payload.get("protocol", profile.get("protocol", "responses"))).strip().lower()
         routing_model = str(payload.get("routing_model", "")).strip()
+        request_compatibility = self._request_compatibility(payload.get("request_compatibility", profile.get("request_compatibility")))
         reasoning_effort = str(payload.get("reasoning_effort", "high")).strip().lower()
         routing_reasoning_effort = str(payload.get("routing_reasoning_effort", "medium")).strip().lower()
         try:
-            max_concurrent_requests = int(payload.get("max_concurrent_requests", existing_cloud.get("max_concurrent_requests", 3)))
+            pipeline_input = payload.get("pipeline") if isinstance(payload.get("pipeline"), dict) else payload
+            max_concurrent_requests = int(pipeline_input.get("max_concurrent_requests", pipeline.get("max_concurrent_requests", 3)))
         except (TypeError, ValueError) as error:
             raise ValueError("LLM 并发数必须是 1 到 5") from error
-        base_url = str(payload.get("base_url", "https://api.openai.com/v1")).strip().rstrip("/")
-        api_key_env = str(payload.get("api_key_env", "OPENAI_API_KEY")).strip()
+        base_url = OpenAIChatCompletionsProvider.normalize_base_url(
+            payload.get("base_url", profile.get("base_url", "https://api.openai.com"))
+        )
+        api_key_env = str(payload.get("api_key_env", profile.get("api_key_env", "OPENAI_API_KEY"))).strip()
         if not model or len(model) > 160: raise ValueError("模型名不能为空，且长度不能超过 160")
+        if protocol not in {"responses", "chat_completions", "anthropic_messages"}:
+            raise ValueError("协议必须是 Responses、Chat Completions 或 Claude Messages")
         if len(routing_model) > 160: raise ValueError("专题路由模型名长度不能超过 160")
         allowed_efforts = {"none", "low", "medium", "high", "xhigh", "max"}
         if reasoning_effort not in allowed_efforts:
@@ -322,39 +550,103 @@ class ServiceState:
             raise ValueError("LLM 并发数必须是 1 到 5")
         if not base_url.startswith(("https://", "http://")): raise ValueError("接口地址必须以 http:// 或 https:// 开头")
         if not api_key_env or len(api_key_env) > 120: raise ValueError("密钥环境变量名无效")
-        classifier = self.settings.setdefault("classifier", {}); cloud = classifier.setdefault("cloud", {})
-        classifier["mode"] = "cloud_hybrid"; cloud.update({
-            "model": model, "base_url": base_url, "api_key_env": api_key_env,
+        classifier = self.settings.setdefault("classifier", {}); classifier["mode"] = "cloud_hybrid"; profile.update({
+            "protocol": protocol, "model": model, "base_url": base_url, "api_key_env": api_key_env,
             "reasoning_effort": reasoning_effort,
             "routing_reasoning_effort": routing_reasoning_effort,
-            "max_concurrent_requests": max_concurrent_requests,
+            "request_compatibility": request_compatibility,
         })
+        pipeline["max_concurrent_requests"] = max_concurrent_requests
+        profile_name = self._profile_name(payload.get("name", profile.get("name")))
+        if any(
+            str(item.get("id")) != profile_id and str(item.get("name", "")).casefold() == profile_name.casefold()
+            for item in profiles
+        ):
+            raise ValueError("已有同名模型方案")
+        profile["name"] = profile_name
         if routing_model:
-            cloud["routing_model"] = routing_model
+            profile["routing_model"] = routing_model
         else:
-            cloud.pop("routing_model", None)
+            profile.pop("routing_model", None)
+        if "extra_headers" in payload:
+            profile["extra_headers"] = self._extra_headers(payload["extra_headers"])
+        elif payload.get("clear_extra_headers") is True:
+            profile.pop("extra_headers", None)
         # 清理旧版本留下的独立审核配置，后续不会再触发第三次模型调用。
-        cloud.pop("audit_mode", None)
-        if payload.get("clear_api_key") is True: cloud.pop("api_key", None)
+        profile.pop("audit_mode", None)
+        if payload.get("clear_api_key") is True: profile.pop("api_key", None)
         elif "api_key" in payload:
             api_key = str(payload.get("api_key") or "").strip()
             if len(api_key) < 8: raise ValueError("API 密钥长度异常；如需清除请使用 clear_api_key")
-            cloud["api_key"] = api_key
-        target_config = self.config_path
-        if target_config.name == "settings.example.yaml":
-            target_config = target_config.with_name("settings.local.yaml")
-        save_settings(target_config, self.settings)
-        self.config_path = target_config
-        self.cloud = OpenAIChatCompletionsProvider(cloud)
-        with self._llm_slot_condition:
-            self._llm_slot_condition.notify_all()
+            profile["api_key"] = api_key
+        stored["active_id"] = profile_id
+        self._persist_cloud_settings()
         return self.cloud_summary()
+
+    def _connection_test_provider(self, payload: dict[str, Any]) -> OpenAIChatCompletionsProvider:
+        """由草稿或已保存方案构造一次性测试客户端，不写入密钥和设置。"""
+        profile = dict(self.active_cloud_profile())
+        settings = {field: profile[field] for field in CLOUD_PROFILE_FIELDS if field in profile}
+        settings.update(self.pipeline_settings())
+        for field in ("protocol", "routing_model", "reasoning_effort", "routing_reasoning_effort", "request_compatibility", "base_url", "api_key_env"):
+            if field in payload:
+                settings[field] = payload[field]
+        if "extra_headers" in payload:
+            settings["extra_headers"] = self._extra_headers(payload["extra_headers"])
+        elif payload.get("clear_extra_headers") is True:
+            settings.pop("extra_headers", None)
+        # 连接测试只读取 /models；即使新方案尚未选择模型也应允许测试。
+        settings["allow_empty_model"] = True
+        if str(payload.get("api_key") or "").strip():
+            settings["api_key"] = str(payload["api_key"]).strip()
+        parsed_url = urlparse(str(settings.get("base_url", "")))
+        if parsed_url.hostname in {"chatgpt.com", "chat.openai.com"} and "/backend-api/" in parsed_url.path:
+            raise ValueError("chatgpt.com/backend-api 是 ChatGPT/Codex 登录态内部接口，不支持 API 密钥直连；请使用公开 API 地址或兼容网关地址")
+        return OpenAIChatCompletionsProvider(settings)
+
+    def test_cloud_connection(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._connection_test_provider(payload).test_connection()
+
+    def start_cloud_connection_test(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """立即返回测试编号，实际网络调用在后台执行，供浏览器短轮询读取。"""
+        provider = self._connection_test_provider(payload)
+        test_id = f"connection-test-{secrets.token_hex(8)}"
+        with self._connection_test_lock:
+            # 仅保存不含密钥的状态和结果；淘汰已结束的旧记录以控制内存。
+            finished = [key for key, item in self._connection_tests.items() if item.get("status") != "running"]
+            for key in finished[:-50]:
+                self._connection_tests.pop(key, None)
+            self._connection_tests[test_id] = {"test_id": test_id, "status": "running"}
+
+        def run() -> None:
+            try:
+                result = provider.test_connection()
+                snapshot: dict[str, Any] = {"test_id": test_id, "status": "succeeded", "result": result}
+            except (ValueError, CloudProviderError) as error:
+                # 详细原因只写入本机服务日志，避免把协议/网关诊断噪音暴露给日常使用者。
+                sys.stderr.write(f"[题湖分类服务] 云端连接测试失败：{error}\n")
+                snapshot = {"test_id": test_id, "status": "failed", "message": str(error)}
+            except Exception as error:
+                traceback.print_exc(file=sys.stderr)
+                snapshot = {"test_id": test_id, "status": "failed", "message": f"连接测试异常：{type(error).__name__}"}
+            with self._connection_test_lock:
+                self._connection_tests[test_id] = snapshot
+
+        threading.Thread(target=run, name=test_id, daemon=True).start()
+        return {"test_id": test_id, "status": "running"}
+
+    def cloud_connection_test(self, test_id: str) -> dict[str, Any]:
+        with self._connection_test_lock:
+            snapshot = self._connection_tests.get(test_id)
+            if not snapshot:
+                raise ValueError("未找到连接测试任务")
+            return dict(snapshot)
 
     def routing_cloud(self) -> OpenAIChatCompletionsProvider | None:
         """专题路由可单独配置模型和推理强度；留空模型时共用目录分类模型。"""
         if not self.cloud:
             return None
-        cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
+        cloud_settings = self.active_cloud_settings()
         routing_model = str(cloud_settings.get("routing_model", "")).strip() or self.cloud.model
         routing_effort = str(cloud_settings.get("routing_reasoning_effort", "medium")).strip().lower()
         directory_effort = str(cloud_settings.get("reasoning_effort", "high")).strip().lower()
@@ -367,7 +659,7 @@ class ServiceState:
 
     def llm_concurrency(self) -> int:
         """限制服务全部实时流水线的总在途请求数，保护网关免受突发并发冲击。"""
-        cloud_settings = (self.settings.get("classifier") or {}).get("cloud") or {}
+        cloud_settings = self.active_cloud_settings()
         try:
             value = int(cloud_settings.get("max_concurrent_requests", 3))
         except (TypeError, ValueError):
@@ -669,6 +961,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         sys.stderr.write("[题湖分类服务] %s\n" % (format % args))
 
     def do_GET(self) -> None:  # noqa: N802
+        request_url = urlparse(self.path)
         if self.path == "/health":
             self._send_json(HTTPStatus.OK, {
                 "status": "ok", "service": "wulou-question-curation-assistant", "host": "127.0.0.1",
@@ -682,8 +975,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/v1/settings/cloud":
             self._send_json(HTTPStatus.OK, self.server.state.cloud_summary()); return
-        if self.path == "/api/v1/history/catalogue-moves":
-            self._send_json(HTTPStatus.OK, self.server.state.cache.catalogue_move_report()); return
+        if request_url.path.startswith("/api/v1/settings/cloud/test/"):
+            test_id = request_url.path.rsplit("/", 1)[-1]
+            try:
+                self._send_json(HTTPStatus.OK, self.server.state.cloud_connection_test(test_id))
+            except ValueError as error:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found", "message": str(error)})
+            return
+        if request_url.path == "/api/v1/history/catalogue-moves":
+            query = parse_qs(request_url.query)
+            date_values = query.get("date", [])
+            start_values = query.get("start_date", [])
+            end_values = query.get("end_date", [])
+            if any(len(values) > 1 for values in (date_values, start_values, end_values)):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "message": "日期参数只能提供一次"}); return
+            try:
+                report = self.server.state.cache.catalogue_move_report(
+                    selected_date=date_values[0] if date_values else None,
+                    start_date=start_values[0] if start_values else None,
+                    end_date=end_values[0] if end_values else None,
+                )
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "message": str(error)}); return
+            self._send_json(HTTPStatus.OK, report); return
         if self.path.startswith("/api/v1/classification-jobs/"):
             job_id = self.path.rsplit("/", 1)[-1]
             self._send_json(HTTPStatus.OK, self.server.state.classification_jobs.snapshot(job_id)); return
@@ -695,13 +1009,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/directory-refactors", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
+        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/directory-refactors", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/settings/cloud/test", "/api/v1/settings/cloud/test/start", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         try:
             payload = self._read_json(maximum_length=12_000_000 if self.path in {"/api/v1/directory-exports", "/api/v1/classification-jobs"} else 2_000_000)
             if self.path == "/api/v1/settings/cloud":
                 self._send_json(HTTPStatus.OK, self.server.state.update_cloud_settings(payload))
+            elif self.path == "/api/v1/settings/cloud/test/start":
+                self._send_json(HTTPStatus.ACCEPTED, self.server.state.start_cloud_connection_test(payload))
+            elif self.path == "/api/v1/settings/cloud/test":
+                self._send_json(HTTPStatus.OK, self.server.state.test_cloud_connection(payload))
             elif self.path == "/api/v1/directory-refactors":
                 self._send_json(HTTPStatus.OK, self.server.state.create_directory_refactor(payload))
             elif self.path == "/api/v1/directory-exports":
@@ -753,33 +1071,38 @@ class RequestHandler(BaseHTTPRequestHandler):
                 questions = payload.get("questions")
                 if not isinstance(questions, list): raise ValueError("questions 必须是数组")
                 if not self.server.state.cloud: raise ValueError("尚未启用 cloud_hybrid 分类器")
-                metadata = self.server.state.batches.create(self.server.state.cloud.create_batch_jsonl(questions, self.server.state.taxonomy, self.server.state.rules), questions)
+                profile = self.server.state.active_cloud_profile()
+                metadata = self.server.state.batches.create(
+                    self.server.state.cloud.create_batch_jsonl(questions, self.server.state.taxonomy, self.server.state.rules),
+                    questions, cloud_profile_id=str(profile.get("id", "")),
+                )
                 self._send_json(HTTPStatus.CREATED, metadata)
             elif self.path == "/api/v1/batches/submit":
-                job_id = str(payload.get("job_id", "")); cloud = self._require_cloud()
+                job_id = str(payload.get("job_id", "")); local_job = self.server.state.batches.get(job_id); cloud = self.server.state.cloud_for_batch(local_job)
                 provider_job = cloud.submit_batch(self.server.state.batches.input_bytes(job_id))
                 self.server.state.batches.update(job_id, status=str(provider_job.get("status", "submitted")), provider_batch_id=str(provider_job["id"]))
                 self._send_json(HTTPStatus.OK, self.server.state.batches.get(job_id))
             elif self.path == "/api/v1/batches/refresh":
-                job_id = str(payload.get("job_id", "")); cloud = self._require_cloud(); local_job = self.server.state.batches.get(job_id)
+                job_id = str(payload.get("job_id", "")); local_job = self.server.state.batches.get(job_id); cloud = self.server.state.cloud_for_batch(local_job)
                 provider_job = cloud.get_batch(str(local_job.get("provider_batch_id", "")))
                 status = str(provider_job.get("status", "unknown"));
-                if status == "completed" and provider_job.get("output_file_id"):
-                    self.server.state.batches.save_result(job_id, cloud.get_file_content(str(provider_job["output_file_id"])))
+                if status == "completed":
+                    self.server.state.batches.save_result(job_id, cloud.get_batch_result_content(provider_job))
                 else: self.server.state.batches.update(job_id, status=status)
                 self._send_json(HTTPStatus.OK, self.server.state.batches.get(job_id))
             elif self.path == "/api/v1/batches/import":
                 job_id = str(payload.get("job_id", "")); job = self.server.state.batches.get(job_id)
                 if job.get("status") != "completed" or not job.get("result_file"): raise ValueError("批处理尚未完成，不能导入")
+                cloud = self.server.state.cloud_for_batch(job)
                 by_id = {str(item["exercise_id"]): item for item in job.get("questions", [])}
                 imported, failed = 0, []
                 for line in Path(str(job["result_file"])).read_text(encoding="utf-8").splitlines():
-                    record = json.loads(line); custom_id = str(record.get("custom_id", "")); exercise_id = custom_id.split("-", 2)[1] if custom_id.startswith("exercise-") else ""
-                    question = by_id.get(exercise_id); body = ((record.get("response") or {}).get("body") or {})
-                    if not question or int((record.get("response") or {}).get("status_code", 0)) >= 300:
+                    record = json.loads(line); custom_id, decision = cloud.batch_result_decision(record) if cloud else ("", None)
+                    exercise_id = custom_id[len("exercise-"):].rsplit("-", 1)[0] if custom_id.startswith("exercise-") and "-" in custom_id[len("exercise-"):] else ""
+                    question = by_id.get(exercise_id)
+                    if not question or decision is None:
                         failed.append(exercise_id or custom_id); continue
-                    decision = self.server.state.cloud._decode(body) if self.server.state.cloud else None
-                    result = validate_model_decision(question, decision or {}, self.server.state.taxonomy, self.server.state.rules)
+                    result = validate_model_decision(question, decision, self.server.state.taxonomy, self.server.state.rules)
                     result["rule_version"] = self.server.state.rule_version; result["cache_hit"] = False
                     self.server.state.attach_model_input_snapshot(question, result)
                     self.server.state.cache_result(question, result)
