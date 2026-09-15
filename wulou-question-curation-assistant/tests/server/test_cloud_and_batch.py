@@ -49,27 +49,48 @@ class CloudAndBatchTests(unittest.TestCase):
         self.assertEqual(provider._protocol_path(), "/chat/completions")
         self.assertNotIn("input", request)
         self.assertEqual(request["messages"][0]["role"], "system")
-        self.assertEqual(request["response_format"]["type"], "json_schema")
-        self.assertEqual(request["response_format"]["json_schema"]["name"], "math_topic_routing")
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        output_contract = json.loads(request["messages"][-1]["content"])
+        self.assertIn("json_schema", output_contract)
+        self.assertIn("latest_topic_id", output_contract["json_schema"]["properties"])
         self.assertEqual(provider._decode({"choices": [{"message": {"content": '{"status":"routed"}'}}]}), {"status": "routed"})
         line = json.loads(provider.create_batch_jsonl([self.question], self.taxonomy, {"rules": {}}))
         self.assertEqual(line["url"], "/v1/chat/completions")
 
-    def test_claude_messages_request_and_tool_result_are_adapted(self) -> None:
+    def test_claude_messages_request_and_json_result_are_adapted(self) -> None:
         provider = OpenAIChatCompletionsProvider({"model": "test-model", "protocol": "anthropic_messages"})
         request = provider.build_routing_request(self.question, self.taxonomy, {"rules": {}})
         self.assertEqual(provider._protocol_path(), "/messages")
         self.assertNotIn("response_format", request)
-        self.assertEqual(request["tools"][0]["name"], "submit_classification")
-        self.assertEqual(request["tool_choice"], {"type": "tool", "name": "submit_classification"})
+        self.assertNotIn("tools", request)
+        claude_schema = request["output_config"]["format"]["schema"]
+        self.assertEqual(request["output_config"]["format"]["type"], "json_schema")
+        self.assertNotIn("minimum", json.dumps(claude_schema))
+        self.assertIn("Must be greater than or equal to 0.", claude_schema["properties"]["confidence"]["description"])
         self.assertEqual(
-            provider._decode({"content": [{"type": "tool_use", "name": "submit_classification", "input": {"status": "routed"}}]}),
+            provider._decode({"content": [{"type": "text", "text": '{"status":"routed"}'}]}),
             {"status": "routed"},
         )
+        with self.assertRaisesRegex(
+            CloudProviderError,
+            r"stop_reason=max_tokens; content=\[thinking\(-\),text\(0\)\]",
+        ):
+            provider._decode({"stop_reason": "max_tokens", "content": [
+                {"type": "thinking", "thinking": "omitted"}, {"type": "text", "text": ""},
+            ]})
         line = json.loads(provider.create_batch_jsonl([self.question], self.taxonomy, {"rules": {}}))
         self.assertTrue(line["custom_id"].startswith("exercise-2529221-"))
         self.assertIn("params", line)
-        self.assertEqual(line["params"]["tool_choice"], {"type": "tool", "name": "submit_classification"})
+        self.assertEqual(line["params"]["output_config"]["format"]["type"], "json_schema")
+
+    def test_claude_schema_transform_preserves_canonical_constraints_locally(self) -> None:
+        schema = {"type": "object", "properties": {"score": {
+            "type": "number", "minimum": 0, "maximum": 1,
+        }}}
+        transformed = OpenAIChatCompletionsProvider._claude_output_schema(schema)
+        self.assertEqual(schema["properties"]["score"]["minimum"], 0)
+        self.assertNotIn("minimum", transformed["properties"]["score"])
+        self.assertIn("Must be less than or equal to 1.", transformed["properties"]["score"]["description"])
 
     def test_claude_message_batch_submission_polling_and_result_parsing(self) -> None:
         provider = OpenAIChatCompletionsProvider({"model": "test-model", "protocol": "anthropic_messages", "base_url": "https://api.anthropic.com/v1"})
@@ -85,7 +106,7 @@ class CloudAndBatchTests(unittest.TestCase):
             if path == "/messages/batches/msgbatch_123/results":
                 return (json.dumps({
                     "custom_id": "exercise-2529221-batch", "result": {"type": "succeeded", "message": {
-                        "content": [{"type": "tool_use", "name": "submit_classification", "input": {"status": "suggested"}}],
+                        "content": [{"type": "text", "text": '{"status":"suggested"}'}],
                     }},
                 }) + "\n").encode("utf-8")
             raise AssertionError(f"unexpected request: {method} {path}")

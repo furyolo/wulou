@@ -67,6 +67,14 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result["classification_method"], "model")
         self.assertTrue(result["needs_review"])
 
+    def test_model_confidence_outside_schema_range_is_rejected(self) -> None:
+        result = validate_model_decision({"exercise_id": "1"}, {
+            "status": "review", "target_level3_id": None, "target_level4_id": None,
+            "confidence": 1.2, "reason": "x", "review_reasons": [],
+            "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+        }, self.taxonomy, self.rules)
+        self.assertEqual(result["review_reasons"], ["invalid_model_confidence"])
+
     def test_leaf_level3_does_not_require_a_level4_target(self) -> None:
         result = validate_model_decision({"exercise_id": "1"}, {
             "status": "review", "target_level3_id": "real-number-application", "target_level4_id": None,

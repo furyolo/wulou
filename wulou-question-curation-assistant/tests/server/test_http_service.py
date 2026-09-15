@@ -15,7 +15,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from server.main import CurationServer, MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS, ServiceState
+from server.main import CurationServer, MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS, ServiceState, public_cloud_error_message
+from server.providers.openai_responses import CloudProviderError
 from server.taxonomy import Taxonomy
 
 
@@ -57,6 +58,16 @@ class HttpServiceTests(unittest.TestCase):
         status, payload = self.request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertEqual(payload["port"], self.server.server_port)
+
+    def test_protocol_diagnostics_are_not_exposed_to_browser_messages(self) -> None:
+        error = CloudProviderError(
+            "云端 Claude Messages 未返回可解析的结构化结果"
+            "（stop_reason=max_tokens; content=[text(0)]）"
+        )
+        message = public_cloud_error_message(error)
+        self.assertNotIn("stop_reason", message)
+        self.assertNotIn("content=[", message)
+        self.assertIn("请稍后重试", message)
 
     def test_taxonomy_is_available_on_loopback_without_token(self) -> None:
         status, payload = self.request("GET", "/api/v1/taxonomy")
@@ -573,7 +584,10 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["failed_exercise_ids"], ["broken-cloud-1"])
         self.assertEqual(snapshot["results"][0]["status"], "review")
-        self.assertIn("云端分类响应格式异常（AttributeError）", snapshot["results"][0]["reason"])
+        self.assertEqual(
+            snapshot["results"][0]["reason"],
+            "云端模型本次未返回可用的分类结果，请稍后重试；若持续出现，请切换兼容的模型方案。",
+        )
 
     def test_second_stage_reroutes_to_corrected_topic_large_question_directory(self) -> None:
         self.state.taxonomy = Taxonomy({

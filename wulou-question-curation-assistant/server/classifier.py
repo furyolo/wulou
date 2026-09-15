@@ -96,6 +96,8 @@ def validate_model_decision(question: dict[str, Any], decision: dict[str, Any], 
         confidence = float(decision.get("confidence", 0))
     except (TypeError, ValueError):
         return _review_result(exercise_id, taxonomy, "模型置信度格式无效", "invalid_model_confidence")
+    if not 0.0 <= confidence <= 1.0:
+        return _review_result(exercise_id, taxonomy, "模型置信度必须在 0 到 1 之间", "invalid_model_confidence")
     raw_review_reasons = decision.get("review_reasons")
     if raw_review_reasons is not None and not isinstance(raw_review_reasons, list):
         return _review_result(exercise_id, taxonomy, "模型复核原因格式无效", "invalid_model_review_reasons")
@@ -138,7 +140,7 @@ def validate_model_decision(question: dict[str, Any], decision: dict[str, Any], 
         "exercise_id": exercise_id, "taxonomy_version": taxonomy.version, "rule_version": str(rules.get("rule_version", "")),
         "status": "suggested" if status == "suggested" and target else "review", "needs_review": needs_review,
         "review_reasons": review_reasons + (["low_confidence"] if status == "suggested" and confidence < auto_threshold else []),
-        "classification_method": "model", "confidence": max(0.0, min(1.0, confidence)),
+        "classification_method": "model", "confidence": confidence,
         "reason": normalize_text(str(decision.get("reason", "云端模型未提供依据")))[:500],
         "target": _target_payload(target) if target else None, "proposal_required": proposal_required,
         "proposal_cluster_id": str(proposal.get("cluster_key")) if proposal_required and proposal.get("cluster_key") else None,

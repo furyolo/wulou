@@ -56,6 +56,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS = 1000
 MAX_TOPIC_REROUTES_PER_QUESTION = 2
 ROUTING_PIPELINE_VERSION = 2
+
+
+def public_cloud_error_message(error: Exception | str) -> str:
+    """将云端协议诊断与面向日常用户的提示分离。"""
+    detail = str(error)
+    if "未返回可解析的结构化结果" in detail or "云端分类响应格式异常" in detail:
+        return "云端模型本次未返回可用的分类结果，请稍后重试；若持续出现，请切换兼容的模型方案。"
+    return detail
+
+
+def log_cloud_error(context: str, error: Exception | str) -> None:
+    """仅在本机服务日志保存脱敏的协议诊断，不回传浏览器。"""
+    sys.stderr.write(f"[题湖分类服务] {context}：{error}\n")
+
+
 CLOUD_PROFILE_FIELDS = (
     "protocol", "model", "routing_model", "reasoning_effort", "routing_reasoning_effort",
     "base_url", "api_key_env", "api_key", "request_compatibility", "extra_headers",
@@ -622,9 +637,11 @@ class ServiceState:
             try:
                 result = provider.test_connection()
                 snapshot: dict[str, Any] = {"test_id": test_id, "status": "succeeded", "result": result}
-            except (ValueError, CloudProviderError) as error:
+            except CloudProviderError as error:
                 # 详细原因只写入本机服务日志，避免把协议/网关诊断噪音暴露给日常使用者。
-                sys.stderr.write(f"[题湖分类服务] 云端连接测试失败：{error}\n")
+                log_cloud_error("云端连接测试失败", error)
+                snapshot = {"test_id": test_id, "status": "failed", "message": public_cloud_error_message(error)}
+            except ValueError as error:
                 snapshot = {"test_id": test_id, "status": "failed", "message": str(error)}
             except Exception as error:
                 traceback.print_exc(file=sys.stderr)
@@ -690,7 +707,8 @@ class ServiceState:
         with self._llm_request_slot():
             try:
                 return operation(*args)
-            except CloudProviderError:
+            except CloudProviderError as error:
+                log_cloud_error("云端分类调用失败", error)
                 raise
             except (AttributeError, KeyError, TypeError) as error:
                 raise CloudProviderError(
@@ -774,7 +792,7 @@ class ServiceState:
             self.rules,
         )
 
-    def _cloud_review_result(self, exercise_id: str, reason: str) -> dict[str, Any]:
+    def _cloud_review_result(self, exercise_id: str, reason: Exception | str) -> dict[str, Any]:
         """把单个云端分批异常安全降级为待人工复核结果。"""
         return {
             "exercise_id": exercise_id,
@@ -785,7 +803,7 @@ class ServiceState:
             "review_reasons": ["cloud_request_failed"],
             "classification_method": "model",
             "confidence": 0.0,
-            "reason": reason,
+            "reason": public_cloud_error_message(reason),
             "target": None,
             "proposal_required": False,
             "proposal_cluster_id": None,
@@ -898,7 +916,7 @@ class ServiceState:
                                 routings = future.result()
                             except CloudProviderError as error:
                                 for question in batch:
-                                    self._put_job_result(job_id, question, self._cloud_review_result(str(question["exercise_id"]), str(error)), failed=True)
+                                    self._put_job_result(job_id, question, self._cloud_review_result(str(question["exercise_id"]), error), failed=True)
                             else:
                                 routed_groups: dict[tuple[str, bool], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
                                 for question, routing in zip(batch, routings, strict=True):
@@ -926,7 +944,7 @@ class ServiceState:
                                 decisions = future.result()
                             except (CloudProviderError, ValueError) as error:
                                 for question in batch:
-                                    self._put_job_result(job_id, question, self._cloud_review_result(str(question["exercise_id"]), str(error)), failed=True)
+                                    self._put_job_result(job_id, question, self._cloud_review_result(str(question["exercise_id"]), error), failed=True)
                             else:
                                 settled_batch: list[dict[str, Any]] = []
                                 settled_decisions: list[dict[str, Any]] = []
@@ -1116,7 +1134,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"results": results})
             else:
                 self._send_json(HTTPStatus.OK, self._classify_one(payload))
-        except (ValueError, TaxonomyError, CloudProviderError) as error:
+        except CloudProviderError as error:
+            log_cloud_error("HTTP 分类请求失败", error)
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "message": public_cloud_error_message(error)})
+        except (ValueError, TaxonomyError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "message": str(error)})
         except Exception as error:
             # 未预期异常必须留下完整堆栈，便于定位不同题目触发的边界；不得记录请求正文或密钥。
@@ -1148,6 +1169,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             return self._classify_one(question)
         except CloudProviderError as error:
+            log_cloud_error("单题云端分类失败", error)
             exercise_id = str(question.get("exercise_id", "")) if isinstance(question, dict) else ""
             return {
                 "exercise_id": exercise_id,
@@ -1158,7 +1180,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "review_reasons": ["cloud_request_failed"],
                 "classification_method": "model",
                 "confidence": 0.0,
-                "reason": str(error),
+                "reason": public_cloud_error_message(error),
                 "target": None,
                 "proposal_required": False,
                 "proposal_cluster_id": None,
@@ -1193,9 +1215,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     uncached, self.server.state.taxonomy, self.server.state.rules
                 )
             except CloudProviderError as error:
+                log_cloud_error("快速批量云端分类失败", error)
                 for question in uncached:
                     exercise_id = str(question["exercise_id"])
-                    result = self._cloud_review_result(exercise_id, str(error))
+                    result = self._cloud_review_result(exercise_id, error)
                     self.server.state.attach_model_input_snapshot(question, result)
                     results_by_id[exercise_id] = result
             else:

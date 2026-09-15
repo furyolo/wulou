@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 import json
 import tempfile
@@ -49,6 +50,12 @@ class DirectoryRefactorTests(unittest.TestCase):
         self.assertEqual(result["audit"]["level4_counts"][0]["count"], 6)
         self.assertNotIn("assignments", result)
         self.assertEqual(result["audit"]["classification_scope"], "directory_outline_only")
+
+    def test_level3_outline_rejects_level4_below_numbered_parent_without_restructure(self) -> None:
+        context = copy.deepcopy(self.context)
+        context["selected_level3"][0]["knowledge_point_id"] = "ZCSQG20260915KP01"
+        with self.assertRaisesRegex(DirectoryRefactorError, "承接四级目录重构"):
+            validate_refactor_plan(context, self.outline_plan([str(index) for index in range(1, 7)]))
 
     def test_level3_outline_rejects_undersized_representative_set(self) -> None:
         plan = self.outline_plan([str(index) for index in range(1, 6)])

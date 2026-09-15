@@ -9,6 +9,7 @@ import json
 import os
 import time
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from typing import Any
@@ -32,7 +33,10 @@ class OpenAIChatCompletionsProvider:
     """以选定协议请求云端分类模型；保留旧类名以兼容本机导入。"""
 
     PROTOCOLS = {"responses", "chat_completions", "anthropic_messages"}
-    SYSTEM_INSTRUCTION = "你是中考数学目录审核器。网页目录只是弱提示；实际题目和 Skill 决策协议优先。只返回符合指定结构的结果。"
+    SYSTEM_INSTRUCTION = (
+        "你是中考数学目录审核器。网页目录只是弱提示；实际题目和 Skill 决策协议优先。"
+        "只返回符合指定 JSON Schema 的 JSON 对象；不要输出 Markdown、代码围栏或其他解释。"
+    )
 
     @staticmethod
     def normalize_base_url(value: Any) -> str:
@@ -188,7 +192,10 @@ class OpenAIChatCompletionsProvider:
     def _confidence(value: Any) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise CloudProviderError("云端模型返回的置信度格式无效")
-        return max(0.0, min(1.0, float(value)))
+        confidence = float(value)
+        if not 0.0 <= confidence <= 1.0:
+            raise CloudProviderError("云端模型返回的置信度必须在 0 到 1 之间")
+        return confidence
 
     @staticmethod
     def _boolean(value: Any, field: str) -> bool:
@@ -749,24 +756,66 @@ class OpenAIChatCompletionsProvider:
                 "reasoning": {"effort": effort},
             }
         if self.protocol == "chat_completions":
+            # 部分 OpenAI 兼容网关只实现 json_object，不支持 json_schema。此时把
+            # Schema 明确放入提示词，仍让模型知道完整的输出契约；本地继续解析 JSON。
+            encoded_contexts.append(json.dumps({
+                "required_output": "Return exactly one JSON object conforming to this JSON Schema.",
+                "json_schema": schema,
+            }, ensure_ascii=False, separators=(",", ":")))
             return {
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": self.SYSTEM_INSTRUCTION},
                     *[{"role": "user", "content": context} for context in encoded_contexts],
                 ],
-                "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
+                "response_format": {"type": "json_object"},
                 "reasoning_effort": effort,
             }
-        # Claude Messages 的 tool_use 以 input_schema 强制返回对象，比仅提示“输出 JSON”更可靠。
+        # Claude 的 Structured Outputs 只接受 JSON Schema 子集。传输层移除
+        # 不支持的约束，但本地保留并校验原始业务 schema，不能借此放宽规则。
         return {
             "model": self.model,
             "max_tokens": 4096,
             "system": self.SYSTEM_INSTRUCTION,
             "messages": [{"role": "user", "content": context} for context in encoded_contexts],
-            "tools": [{"name": "submit_classification", "description": "提交符合分类规则的 JSON 结果。", "input_schema": schema}],
-            "tool_choice": {"type": "tool", "name": "submit_classification"},
+            "output_config": {"format": {"type": "json_schema", "schema": self._claude_output_schema(schema)}},
         }
+
+    @staticmethod
+    def _claude_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        """编译 Claude 可接受的 schema，同时保留完整业务 schema 供本地验证。"""
+        transformed = deepcopy(schema)
+        unsupported_constraints = {
+            "minimum": "Must be greater than or equal to {value}.",
+            "maximum": "Must be less than or equal to {value}.",
+            "multipleOf": "Must be a multiple of {value}.",
+            "minLength": "Must contain at least {value} characters.",
+            "maxLength": "Must contain at most {value} characters.",
+            "maxItems": "Must contain at most {value} items.",
+        }
+
+        def transform(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    transform(item)
+                return
+            if not isinstance(node, dict):
+                return
+            hints = []
+            for key, template in unsupported_constraints.items():
+                if key in node:
+                    hints.append(template.format(value=node.pop(key)))
+            # Claude 只支持值为 0 或 1 的 minItems；其余下放至本地验证。
+            if "minItems" in node and node["minItems"] not in {0, 1}:
+                hints.append(f"Must contain at least {node.pop('minItems')} items.")
+            if hints:
+                description = str(node.get("description", "")).strip()
+                node["description"] = " ".join([*([description] if description else []), *hints])
+            for value in node.values():
+                transform(value)
+
+        transform(transformed)
+        return transformed
 
     def _protocol_path(self) -> str:
         return {
@@ -1052,7 +1101,11 @@ class OpenAIChatCompletionsProvider:
                 if isinstance(item, dict) and item.get("type") == "tool_use" and isinstance(item.get("input"), dict):
                     return item["input"]
             text = "".join(str(item.get("text", "")) for item in response.get("content") or [] if isinstance(item, dict) and item.get("type") == "text")
-            return self._decode_json_result(text, "Claude Messages")
+            return self._decode_json_result(
+                text,
+                "Claude Messages",
+                self._claude_response_diagnostic(response),
+            )
         if response.get("status") in {"failed", "cancelled", "incomplete"}:
             error = response.get("error") or response.get("incomplete_details") or {}
             detail = error.get("message") if isinstance(error, dict) else ""
@@ -1073,9 +1126,29 @@ class OpenAIChatCompletionsProvider:
         raise CloudProviderError("云端 Responses 未返回可解析的结构化结果")
 
     @staticmethod
-    def _decode_json_result(content: Any, protocol_name: str) -> dict[str, Any]:
+    def _claude_response_diagnostic(response: dict[str, Any]) -> str:
+        """生成不含题目、回答或密钥的 Claude 响应形态摘要，供兼容问题定位。"""
+        raw_content = response.get("content")
+        if not isinstance(raw_content, list):
+            content_summary = f"content={type(raw_content).__name__}"
+        else:
+            blocks = []
+            for item in raw_content:
+                if not isinstance(item, dict):
+                    blocks.append(type(item).__name__)
+                    continue
+                block_type = str(item.get("type", "unknown"))[:40]
+                text_length = len(item["text"]) if isinstance(item.get("text"), str) else None
+                blocks.append(f"{block_type}({text_length if text_length is not None else '-'})")
+            content_summary = f"content=[{','.join(blocks)}]"
+        stop_reason = str(response.get("stop_reason", "missing"))[:80]
+        return f"stop_reason={stop_reason}; {content_summary}"
+
+    @staticmethod
+    def _decode_json_result(content: Any, protocol_name: str, diagnostic: str = "") -> dict[str, Any]:
         if not isinstance(content, str) or not content.strip():
-            raise CloudProviderError(f"云端 {protocol_name} 未返回可解析的结构化结果")
+            suffix = f"（{diagnostic}）" if diagnostic else ""
+            raise CloudProviderError(f"云端 {protocol_name} 未返回可解析的结构化结果{suffix}")
         try:
             decoded = json.loads(content)
         except json.JSONDecodeError as error:

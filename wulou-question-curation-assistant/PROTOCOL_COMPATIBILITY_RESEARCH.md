@@ -7,10 +7,10 @@
 | 协议 | 请求入口与鉴权 | 结构化结果 | 本项目的结果读取 |
 | --- | --- | --- | --- |
 | Responses | `POST /responses`，Bearer 密钥 | `text.format: json_schema` | `output_text`，或 `output` 中的 `output_text` |
-| Chat Completions | `POST /chat/completions`，Bearer 密钥 | `response_format.json_schema` | `choices[0].message.content` |
-| Claude Messages | `POST /messages`，`x-api-key` 与 `anthropic-version` | 强制调用带 `input_schema` 的工具 | `content` 中 `tool_use.input` |
+| Chat Completions | `POST /chat/completions`，Bearer 密钥 | `response_format: {type: json_object}`；JSON Schema 随提示词传入以兼容不支持 `json_schema` 的网关 | `choices[0].message.content` |
+| Claude Messages | `POST /messages`，`x-api-key` 与 `anthropic-version` | `output_config.format: {type: json_schema}`；发送前转换为 Claude 支持的 schema 子集 | `content` 中的 `text` JSON |
 
-Claude 没有与 OpenAI JSON Schema 字段同名的结构化输出接口。对分类这种必须得到对象的场景，以 `tool_choice` 强制模型调用 `submit_classification` 工具，比提示模型直接输出 JSON 更稳定。
+Claude 使用 `output_config.format` 而非 OpenAI 的 `response_format`。本项目保留完整业务 schema；对 Claude 发送时移除 `minimum`、`maximum` 等不支持的约束并补入字段说明，响应仍由本地业务校验器严格验证。
 
 ## 业界方案
 

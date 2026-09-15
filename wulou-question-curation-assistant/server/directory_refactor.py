@@ -208,7 +208,9 @@ def validate_refactor_plan(context: dict[str, Any], plan: dict[str, Any]) -> dic
         used_supporting_ids.update(supporting_ids)
         level4_counts[identity] = len(supporting_ids)
 
-    # 父三级已有编号时，只有完整承接重构才可出现四级目录；本 API 不自动执行该高风险流程。
+    # 前端目录方案只生成待审核候选，不执行编号承接、题目迁移或 Excel 写入。
+    # 因而不能在已有编号的三级下自行新增四级；该完整重构由目录整理 Skill 的
+    # 正式写入流程负责，并需在同一事务中承接原编号。
     selected_by_id = {str(item["id"]): item for item in context["selected_level3"]}
     if context["focus"]["level"] == 3:
         source = selected_by_id[context["focus"]["level3_id"]]
