@@ -116,12 +116,29 @@ class ResultCacheTests(unittest.TestCase):
 
             report = cache.catalogue_move_report()
             self.assertEqual(report["summary"]["classified_count"], 2)
-            self.assertEqual(report["summary"]["topics"], ["专题10：三角形", "专题4：分式方程与不等式"])
+            self.assertEqual(report["summary"]["topics"], ["专题1：实数", "专题4：分式方程与不等式"])
             latest = next(item for item in report["records"] if item["stable_code"] == "CS2026MOVE001")
             self.assertEqual(latest["original_path"][0], "专题4：分式方程与不等式")
             self.assertEqual(latest["target_path"][0], "专题10：三角形")
             self.assertEqual(cache.delete_by_exercise_ids(["exercise-1", "exercise-2"]), 0)
             self.assertEqual(cache.catalogue_move_report()["summary"]["classified_count"], 2)
+            cache.close()
+
+    def test_catalogue_move_report_sorts_source_topics_by_topic_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ResultCache(Path(directory) / "cache.sqlite3")
+            for number in (10, 4, 2):
+                cache.record_catalogue_move(
+                    exercise_id=f"exercise-{number}", stable_code=f"CS{number}",
+                    source_catalogue_id=f"source-{number}", target_catalogue_id=f"target-{number}",
+                    original_path=[f"专题{number}：原目录", "【大题】", "知识点"],
+                    target_path=["专题99：现目录", "【大题】", "知识点"],
+                )
+            report = cache.catalogue_move_report()
+            self.assertEqual(
+                report["summary"]["topics"],
+                ["专题2：原目录", "专题4：原目录", "专题10：原目录"],
+            )
             cache.close()
 
     def test_catalogue_move_report_uses_utc8_today_as_a_half_open_utc_interval(self) -> None:

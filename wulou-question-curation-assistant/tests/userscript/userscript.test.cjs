@@ -31,6 +31,7 @@ const {
   focusScopeForNavigationPath,
   acceptAllActionMode,
   manualSelectionPayload,
+  historyRangePreviewEnd,
   CLASSIFICATION_JOB_MAX_QUESTIONS,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
@@ -357,6 +358,15 @@ test('工作成果路径会省略空四级目录', () => {
     '专题1：实数 / 【大题】 / 实数综合计算',
   );
   assert.equal(compactHistoryPath([]), '—');
+});
+
+test('工作成果日期范围在选择截止日期前预览悬停区间', () => {
+  assert.equal(
+    historyRangePreviewEnd({ start: '2026-09-04', end: '' }, '2026-09-10'),
+    '2026-09-10',
+  );
+  assert.equal(historyRangePreviewEnd({ start: '2026-09-04', end: '' }, '2026-09-03'), '2026-09-03');
+  assert.equal(historyRangePreviewEnd({ start: '2026-09-04', end: '2026-09-08' }, '2026-09-10'), '');
 });
 
 

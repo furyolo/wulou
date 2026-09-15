@@ -192,7 +192,7 @@ class HttpServiceTests(unittest.TestCase):
         status, report = self.request("GET", "/api/v1/history/catalogue-moves")
         self.assertEqual(status, 200)
         self.assertEqual(report["summary"]["classified_count"], 1)
-        self.assertEqual(report["summary"]["topics"], ["专题10：三角形"])
+        self.assertEqual(report["summary"]["topics"], ["专题4：分式方程与不等式"])
         self.assertEqual(report["records"][0]["stable_code"], "CS2026MOVE001")
         self.assertEqual(report["records"][0]["original_path"], first["target_path"])
         self.assertEqual(report["records"][0]["target_path"], second["target_path"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from datetime import date, datetime, time, timedelta, timezone
@@ -18,6 +19,7 @@ class ResultCache:
     _MANUAL_TABLE = "manual_classification_overrides"
     _MANUAL_AUDIT_TABLE = "manual_classification_audit"
     _MOVE_HISTORY_TABLE = "catalogue_move_history"
+    _TOPIC_NUMBER = re.compile(r"专题\s*(\d+)")
 
     def __init__(self, database_path: Path) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -372,7 +374,16 @@ class ResultCache:
                 "moved_at": moved_at,
             }
         records = list(latest_by_exercise.values())
-        topics = sorted({record["target_path"][0] for record in records if record["target_path"]})
+        # 工作成果按题目移动前的目录语境汇总，不把现目录/目标目录计入涉及专题。
+        # “专题10”必须排在“专题4”之后，不能采用普通字符串排序。
+        def topic_sort_key(topic: str) -> tuple[int, int, str]:
+            match = self._TOPIC_NUMBER.search(topic)
+            return (0, int(match.group(1)), topic) if match else (1, 0, topic)
+
+        topics = sorted(
+            {record["original_path"][0] for record in records if record["original_path"]},
+            key=topic_sort_key,
+        )
         return {
             "summary": {
                 "classified_count": len(records),

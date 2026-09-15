@@ -520,13 +520,20 @@
     };
   }
 
+  function historyRangePreviewEnd(range, hoveredDate) {
+    const start = normalizeWhitespace(range?.start);
+    const end = normalizeWhitespace(range?.end);
+    const candidate = normalizeWhitespace(hoveredDate);
+    return start && !end && /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : '';
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
-      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, CLASSIFICATION_JOB_MAX_QUESTIONS,
+      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, CLASSIFICATION_JOB_MAX_QUESTIONS,
     };
     return;
   }
@@ -560,6 +567,7 @@
     historyReport: null,
     historyLoadId: 0,
     historyRange: { start: '', end: '' },
+    historyRangePreviewEnd: '',
     historyCalendarMonth: '',
     directoryPlan: null,
     priorityView: null,
@@ -644,7 +652,9 @@
       .model-settings p { margin: -2px 0 0; color: #687a74; font-size: 11px; }
       .profile-actions, .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
       .profile-actions { justify-content: flex-start; }
-      .connection-test-status { min-height: 18px; color: #526660; font-size: 12px; font-weight: 650; line-height: 1.4; }
+      .test-cloud-connection { min-height: 30px; padding: 4px 9px; font-size: 12px; }
+      .connection-test-status { color: #526660; font-size: 12px; font-weight: 650; line-height: 1.4; }
+      .connection-test-status:empty { display: none; }
       .connection-test-status.error { color: #9a3430; }
       .connection-test-status.success { color: #28704d; }
       .advanced-connection { border-top: 1px solid #e4ebe8; margin-top: 2px; padding-top: 8px; }
@@ -678,7 +688,7 @@
       .history-date-sheet[hidden] { display: none; }
       .history-date-sheet { position: fixed; inset: 0; z-index: 2147483003; display: grid; align-items: end; background: rgb(19 49 41 / .34); }
       .history-date-backdrop { position: absolute; inset: 0; border: 0; border-radius: 0; background: transparent; }
-      .history-date-dialog { position: relative; display: grid; gap: 10px; width: min(480px, 100vw); max-height: min(78dvh, 620px); margin: 0 auto; padding: 17px 18px calc(17px + env(safe-area-inset-bottom)); border: 1px solid #d7e1dd; border-bottom: 0; border-radius: 18px 18px 0 0; background: #fff; box-shadow: 0 -14px 42px rgb(19 49 41 / .2); }
+      .history-date-dialog { position: relative; display: grid; gap: 10px; width: min(364px, calc(100vw - 28px)); max-height: min(78dvh, 620px); margin: 0 auto; padding: 17px 18px calc(17px + env(safe-area-inset-bottom)); border: 1px solid #d7e1dd; border-bottom: 0; border-radius: 18px 18px 0 0; background: #fff; box-shadow: 0 -14px 42px rgb(19 49 41 / .2); }
       .history-date-picker-head { display: grid; grid-template-columns: 38px 1fr 38px; align-items: center; gap: 6px; }
       .history-date-picker-head strong { color: #29453d; font-size: 15px; text-align: center; }
       .history-month-prev, .history-month-next { min-height: 34px; padding: 4px; border-color: transparent; background: #eef4f1; color: #31574d; font-size: 20px; line-height: 1; }
@@ -687,6 +697,8 @@
       .history-calendar-day { min-height: 38px; padding: 4px; border-color: transparent; background: transparent; color: #29453d; font-size: 12px; }
       .history-calendar-day:hover:not(:disabled) { background: #e7f2ee; }
       .history-calendar-day.in-range { border-radius: 0; background: #e7f2ee; color: #1d6554; }
+      .history-calendar-day.preview-range { border-radius: 0; background: #c9e7dc; color: #145b4b; }
+      .history-calendar-day.preview-range-end { border-radius: 8px; box-shadow: inset 0 0 0 1px #4f9784; font-weight: 700; }
       .history-calendar-day.range-start, .history-calendar-day.range-end { border-radius: 8px; background: #126b5c; color: #fff; font-weight: 700; }
       .history-calendar-day.today:not(.range-start):not(.range-end) { box-shadow: inset 0 0 0 1px #8ba99f; }
       .history-calendar-day:disabled { color: #c4cfca; cursor: not-allowed; }
@@ -700,7 +712,7 @@
       .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
       .danger { border-color: #b43c35; background: #b43c35; color: #fff; font-weight: 650; }
       .danger:hover { border-color: #8f2f2a; background: #8f2f2a; }
-      @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } .cloud-profile-name { width: 98px; } .history-header { flex-wrap: wrap; } .history-date-range { order: 3; margin-left: 0; } .history-export-actions { margin-left: auto; } }
+      @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } .history-date-dialog { width: calc(100vw - 20px); } .cloud-profile-name { width: 98px; } .history-header { flex-wrap: wrap; } .history-date-range { order: 3; margin-left: 0; } .history-export-actions { margin-left: auto; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
     </style>
     <button class="tab" type="button" aria-label="展开题目分类助手" aria-expanded="false">
@@ -1021,6 +1033,7 @@
     const [year, month] = historyMonthValue(state.historyCalendarMonth).split('-').map(Number);
     const next = new Date(Date.UTC(year, month - 1 + offset, 1));
     state.historyCalendarMonth = historyDateFromParts(next.getUTCFullYear(), next.getUTCMonth() + 1, 1).slice(0, 7);
+    state.historyRangePreviewEnd = '';
     renderHistoryCalendar();
   }
 
@@ -1033,6 +1046,9 @@
     const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
     const start = state.historyRange.start;
     const end = state.historyRange.end;
+    const previewDate = historyRangePreviewEnd(state.historyRange, state.historyRangePreviewEnd);
+    const previewStart = previewDate && previewDate < start ? previewDate : start;
+    const previewEnd = previewDate && previewDate > start ? previewDate : start;
     elements.historyMonthTitle.textContent = `${year} 年 ${month} 月`;
     elements.historyMonthNext.disabled = monthValue >= maxMonth;
     elements.historyCalendarGrid.replaceChildren();
@@ -1055,16 +1071,19 @@
       if (value === start) button.classList.add('range-start');
       if (value === end) button.classList.add('range-end');
       if (start && end && value > start && value < end) button.classList.add('in-range');
+      if (previewDate && value > previewStart && value < previewEnd) button.classList.add('preview-range');
+      if (previewDate && value === previewDate && value !== start) button.classList.add('preview-range-end');
       elements.historyCalendarGrid.append(button);
     }
     elements.historyDateHint.textContent = start && !end
-      ? '请选择截止日期；再次选择同一天即可查询当天。'
+      ? '请选择范围的另一端日期；再次选择同一天即可查询当天。'
       : '先选择起始日期，再选择截止日期。';
   }
 
   function openHistoryDatePicker() {
     if (state.busy) return;
     state.historyCalendarMonth = historyMonthValue(state.historyRange.end || state.historyRange.start || chinaDate());
+    state.historyRangePreviewEnd = '';
     renderHistoryCalendar();
     elements.historyDateSheet.hidden = false;
     elements.historyDateSheet.setAttribute('aria-hidden', 'false');
@@ -1072,6 +1091,7 @@
   }
 
   function closeHistoryDatePicker() {
+    state.historyRangePreviewEnd = '';
     elements.historyDateSheet.hidden = true;
     elements.historyDateSheet.setAttribute('aria-hidden', 'true');
     elements.historyDateRange.setAttribute('aria-expanded', 'false');
@@ -1082,17 +1102,16 @@
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || dateValue > chinaDate()) return;
     if (!state.historyRange.start || state.historyRange.end) {
       state.historyRange = { start: dateValue, end: '' };
+      state.historyRangePreviewEnd = '';
       updateHistoryDateRange();
       renderHistoryCalendar();
       return;
     }
-    if (dateValue < state.historyRange.start) {
-      state.historyRange = { start: dateValue, end: '' };
-      updateHistoryDateRange();
-      renderHistoryCalendar();
-      return;
-    }
-    state.historyRange.end = dateValue;
+    const firstDate = state.historyRange.start;
+    state.historyRange = dateValue < firstDate
+      ? { start: dateValue, end: firstDate }
+      : { start: firstDate, end: dateValue };
+    state.historyRangePreviewEnd = '';
     updateHistoryDateRange();
     closeHistoryDatePicker();
     await loadHistoryForRange();
@@ -3222,6 +3241,19 @@
   elements.historyCalendarGrid.addEventListener('click', event => {
     const dateButton = event.target.closest('.history-calendar-day[data-date]');
     if (dateButton && !dateButton.disabled) chooseHistoryDate(dateButton.dataset.date);
+  });
+  elements.historyCalendarGrid.addEventListener('pointermove', event => {
+    const dateButton = event.target.closest('.history-calendar-day[data-date]');
+    const previewEnd = dateButton && !dateButton.disabled
+      ? historyRangePreviewEnd(state.historyRange, dateButton.dataset.date) : '';
+    if (state.historyRangePreviewEnd === previewEnd) return;
+    state.historyRangePreviewEnd = previewEnd;
+    renderHistoryCalendar();
+  });
+  elements.historyCalendarGrid.addEventListener('pointerleave', () => {
+    if (!state.historyRangePreviewEnd) return;
+    state.historyRangePreviewEnd = '';
+    renderHistoryCalendar();
   });
   elements.backHistory.addEventListener('click', () => {
     closeHistory();
