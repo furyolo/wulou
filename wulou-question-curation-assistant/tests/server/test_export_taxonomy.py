@@ -31,14 +31,17 @@ class ExportTaxonomyTests(unittest.TestCase):
             sheet.cell(4, 2).value = "【大题】"
             sheet.cell(5, 3).value = "实数综合计算（含三角比）"
             sheet.cell(5, 5).value = "TRIG-001"
-            sheet.cell(6, 2).value = "【微专题】三角函数"
-            sheet.cell(7, 3).value = "不得进入大题"
+            sheet.cell(5, 14).value = "须使用三角比完成综合计算。"
+            sheet.cell(6, 4).value = "考法1：三角比综合计算"
+            sheet.cell(6, 14).value = "须由三角比建立边长关系后求值。"
+            sheet.cell(7, 2).value = "【微专题】三角函数"
+            sheet.cell(8, 3).value = "不得进入大题"
             book.save(workbook_path)
             book.close()
 
             exported = MODULE.export_taxonomy(workbook_path, "目录")
 
-        self.assertTrue(exported["taxonomy_version"].startswith("excel-v2-"))
+        self.assertTrue(exported["taxonomy_version"].startswith("excel-v4-"))
         self.assertEqual(len(exported["topics"]), 1)
         topic = exported["topics"][0]
         self.assertEqual(topic["title"], "专题12：锐角三角函数")
@@ -51,10 +54,32 @@ class ExportTaxonomyTests(unittest.TestCase):
             "实数综合计算（含三角比）",
         )
         self.assertEqual(topic["level2"][0]["level3"][0]["source_row"], 5)
+        self.assertEqual(topic["level2"][0]["level3"][0]["classification_basis"], "须使用三角比完成综合计算。")
+        self.assertEqual(topic["level2"][0]["level3"][0]["level4"][0]["classification_basis"], "须由三角比建立边长关系后求值。")
         self.assertEqual(exported["source_sheet"], "目录")
         self.assertEqual(len(exported["source_workbook_sha256"]), 64)
         self.assertNotIn("12.4 一般角的三角函数值", str(exported["topics"]))
         self.assertNotIn("不得进入大题", str(exported["topics"]))
+
+    def test_separates_evidence_ids_from_model_classification_basis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook_path = Path(directory) / "taxonomy.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "目录"
+            sheet.cell(1, 1).value = "专题2：代数式"
+            sheet.cell(2, 2).value = "【大题】"
+            sheet.cell(3, 3).value = "分式化简与求值"
+            sheet.cell(4, 4).value = "考法1：按定义域筛选代入值"
+            sheet.cell(4, 14).value = "须依据原式限制筛出可代入值；现有证据题目ID：CS2025ABC_001、CS2025DEF-002"
+            book.save(workbook_path)
+            book.close()
+
+            exported = MODULE.export_taxonomy(workbook_path, "目录")
+
+        level4 = exported["topics"][0]["level2"][0]["level3"][0]["level4"][0]
+        self.assertEqual(level4["classification_basis"], "须依据原式限制筛出可代入值")
+        self.assertEqual(level4["audit_evidence_exercise_ids"], ["CS2025ABC_001", "CS2025DEF-002"])
 
     def test_reads_workbook_with_blank_page_margin_via_temporary_compatible_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

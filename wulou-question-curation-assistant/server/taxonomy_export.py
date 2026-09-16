@@ -15,9 +15,20 @@ from openpyxl import load_workbook
 
 
 TOPIC_PATTERN = re.compile(r"^专题\s*(\d+)\s*[：:]?\s*(.+)$")
-EXPORT_SCHEMA_VERSION = "v2"
+EXPORT_SCHEMA_VERSION = "v4"
 LOGGER = logging.getLogger(__name__)
 _EMPTY_PAGE_MARGIN = re.compile(rb'\s(?:left|right|top|bottom)=""')
+_AUDIT_EVIDENCE_SUFFIX = re.compile(
+    r"^(?P<basis>.*?)(?:\s*[；;]\s*|\s+)(?:(?:已有\s*|现有\s*|审计\s*)?证据(?:题目)?\s*(?:ID|编号|题号)|"
+    r"evidence\s+(?:exercise|question)\s*(?:ids?|numbers?))\s*[：:]\s*(?P<evidence>.+?)\s*$",
+    re.IGNORECASE,
+)
+_AUDIT_EVIDENCE_ONLY = re.compile(
+    r"^(?:(?:已有\s*|现有\s*|审计\s*)?证据(?:题目)?\s*(?:ID|编号|题号)|evidence\s+(?:exercise|question)\s*(?:ids?|numbers?))"
+    r"\s*[：:]\s*(?P<evidence>.+?)\s*$",
+    re.IGNORECASE,
+)
+_EVIDENCE_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|\d{3,}")
 
 
 def node_id(prefix: str, row: int, title: str) -> str:
@@ -27,6 +38,24 @@ def node_id(prefix: str, row: int, title: str) -> str:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def split_classification_basis(value: Any) -> tuple[str | None, list[str]]:
+    """将目录语义与题号证据分开，题号只供审计而不进入模型目录。"""
+    source = _text(value)
+    if not source:
+        return None, []
+    match = _AUDIT_EVIDENCE_SUFFIX.match(source)
+    if match:
+        basis = match.group("basis").strip(" \t；;") or None
+        evidence_text = match.group("evidence")
+    else:
+        only_match = _AUDIT_EVIDENCE_ONLY.match(source)
+        if not only_match:
+            return source, []
+        basis = None
+        evidence_text = only_match.group("evidence")
+    return basis, list(dict.fromkeys(_EVIDENCE_IDENTIFIER.findall(evidence_text)))
 
 
 def sha256_file(path: Path) -> str:
@@ -77,7 +106,7 @@ def _load_workbook(workbook_path: Path):
 
 
 def export_taxonomy(workbook_path: Path, sheet_name: str) -> dict[str, Any]:
-    """只读提取 A 至 E 列定义的专题、大题、三级和四级目录。"""
+    """只读提取 A、B、C、D、E、N 列定义的目录及其分类边界。"""
     source_path = workbook_path.resolve()
     book, compatible_path = _load_workbook(source_path)
     try:
@@ -110,12 +139,16 @@ def export_taxonomy(workbook_path: Path, sheet_name: str) -> dict[str, Any]:
                 level3_title = _text(sheet.cell(row, 3).value)
                 level4_title = _text(sheet.cell(row, 4).value)
                 knowledge_point_id = _text(sheet.cell(row, 5).value)
+                classification_basis, audit_evidence_ids = split_classification_basis(sheet.cell(row, 14).value)
+                audit_fields = {"audit_evidence_exercise_ids": audit_evidence_ids} if audit_evidence_ids else {}
                 if level3_title:
                     active = {
                         "id": node_id("l3", row, level3_title), "source_row": row,
                         "title": level3_title,
                         "knowledge_point_id": knowledge_point_id or None,
+                        "classification_basis": classification_basis,
                         "level4": [],
+                        **audit_fields,
                     }
                     level3.append(active)
                 elif level4_title and active is not None:
@@ -123,6 +156,8 @@ def export_taxonomy(workbook_path: Path, sheet_name: str) -> dict[str, Any]:
                         "id": node_id("l4", row, level4_title), "source_row": row,
                         "title": level4_title,
                         "knowledge_point_id": knowledge_point_id or None,
+                        "classification_basis": classification_basis,
+                        **audit_fields,
                     })
 
             if level3:

@@ -14,10 +14,10 @@ import yaml
 
 try:
     from .taxonomy import Taxonomy
-    from .taxonomy_export import dump_taxonomy, export_taxonomy, sha256_file
+    from .taxonomy_export import EXPORT_SCHEMA_VERSION, dump_taxonomy, export_taxonomy, sha256_file
 except ImportError:  # 支持由 scripts/start-server.* 直接运行 server/main.py。
     from taxonomy import Taxonomy
-    from taxonomy_export import dump_taxonomy, export_taxonomy, sha256_file
+    from taxonomy_export import EXPORT_SCHEMA_VERSION, dump_taxonomy, export_taxonomy, sha256_file
 
 
 _WORKBOOK_NAME = re.compile(
@@ -72,12 +72,17 @@ def discover_latest_workbook(configured_path: Path) -> Path:
     return max(candidates, key=lambda path: _workbook_sort_key(path, prefix)).resolve()
 
 
-def _existing_source_hash(output_path: Path) -> str | None:
+def _existing_export_metadata(output_path: Path) -> tuple[str | None, str | None]:
     if not output_path.is_file():
-        return None
+        return None, None
     with output_path.open("r", encoding="utf-8") as file:
         raw = yaml.safe_load(file) or {}
-    return str(raw.get("source_workbook_sha256") or "") or None if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return None, None
+    return (
+        str(raw.get("source_workbook_sha256") or "") or None,
+        str(raw.get("taxonomy_version") or "") or None,
+    )
 
 
 def synchronize_taxonomy(
@@ -91,7 +96,9 @@ def synchronize_taxonomy(
 
     workbook_path = discover_latest_workbook(_resolve_path(config_path, str(workbook_settings["path"])))
     source_hash = sha256_file(workbook_path)
-    if _existing_source_hash(output_path) == source_hash:
+    existing_hash, existing_version = _existing_export_metadata(output_path)
+    expected_version_prefix = f"excel-{EXPORT_SCHEMA_VERSION}-"
+    if existing_hash == source_hash and existing_version and existing_version.startswith(expected_version_prefix):
         return TaxonomySyncResult(workbook_path, output_path, "up_to_date")
 
     sheet_name = str(workbook_settings.get("sheet") or "目录")

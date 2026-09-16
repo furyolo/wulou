@@ -71,15 +71,16 @@ class ResultCacheTests(unittest.TestCase):
                 exercise_id="exercise-1",
                 source_catalogue_id="level4-a",
                 stable_code="CS2026TEST001",
+                taxonomy_version="taxonomy-v1",
                 original_target_path=["专题1：实数", "【大题】", "旧分类"],
                 target_path=["专题1：实数", "【大题】", "分母有理化"],
             )
 
-            override = cache.get_manual_override("exercise-1", "level4-a")
+            override = cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v1")
             self.assertIsNotNone(override)
             self.assertEqual(override["target_path"][-1], "分母有理化")
             # 移到人工指定的目标叶子后，目录 ID 已变化，仍要恢复人工终态。
-            moved_override = cache.get_manual_override("exercise-1", "level4-target")
+            moved_override = cache.get_manual_override("exercise-1", "level4-target", "taxonomy-v1")
             self.assertIsNotNone(moved_override)
             self.assertEqual(moved_override["target_path"][-1], "分母有理化")
             self.assertEqual(
@@ -89,7 +90,46 @@ class ResultCacheTests(unittest.TestCase):
                 cache._connection.execute("SELECT COUNT(*) FROM classification_results").fetchone()[0], 0
             )
             self.assertEqual(cache.delete_by_exercise_ids(["exercise-1"]), 0)
-            self.assertIsNotNone(cache.get_manual_override("exercise-1", "level4-a"))
+            self.assertIsNotNone(cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v1"))
+            self.assertIsNone(cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v2"))
+            cache.close()
+
+    def test_legacy_manual_override_without_a_taxonomy_version_is_retained_but_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                CREATE TABLE manual_classification_overrides (
+                    exercise_id TEXT NOT NULL,
+                    source_catalogue_id TEXT NOT NULL,
+                    stable_code TEXT,
+                    original_target_path_json TEXT NOT NULL,
+                    target_path_json TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (exercise_id, source_catalogue_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO manual_classification_overrides (
+                    exercise_id, source_catalogue_id, original_target_path_json, target_path_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                ("exercise-1", "level4-a", '["旧目录"]', '["人工旧目录"]'),
+            )
+            connection.commit()
+            connection.close()
+
+            cache = ResultCache(path)
+
+            self.assertEqual(
+                cache._connection.execute("SELECT COUNT(*) FROM manual_classification_overrides").fetchone()[0], 1
+            )
+            self.assertIsNone(cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v2"))
             cache.close()
 
     def test_catalogue_move_report_keeps_only_latest_move_per_question(self) -> None:

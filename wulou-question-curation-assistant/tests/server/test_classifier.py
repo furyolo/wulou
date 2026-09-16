@@ -151,6 +151,41 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result["status"], "suggested")
         self.assertEqual(result["target"]["topic_id"], "topic-triangle")
 
+    def test_range_domain_example_uses_the_model_selected_directory_without_special_case_rules(self) -> None:
+        taxonomy = Taxonomy({
+            "taxonomy_version": "fraction-boundary-v1",
+            "topics": [{
+                "id": "topic-fraction", "title": "专题2：分式", "order": 2,
+                "level2": [{"id": "fraction-large", "title": "【大题】", "level3": [{
+                    "id": "fraction-simplification", "title": "分式的化简与求值", "knowledge_point_id": None,
+                    "level4": [
+                        {
+                            "id": "fraction-composite", "title": "考法4：分式加减乘除的复合化简",
+                            "classification_basis": "题干直接给出可用参数值。",
+                        },
+                        {
+                            "id": "fraction-range-domain", "title": "考法6：限定取值范围并保证分式有意义",
+                            "classification_basis": "须由分母或约分前限制筛出可代入值，保证原式有意义。",
+                        },
+                    ],
+                }]}],
+            }],
+        })
+        question = {
+            "exercise_id": "range-domain-question",
+            "question_press": "先化简分式，再从0，1，2中选择一个合适的整数代入求值。",
+            "answer_press": "当x=0或1时原式无意义，故只能取x=2。",
+            "scope": {"topic_id": "topic-fraction", "level2_id": "fraction-large"},
+        }
+        result = validate_model_decision(question, {
+            "status": "suggested", "target_level3_id": "fraction-simplification",
+            "target_level4_id": "fraction-range-domain", "confidence": 0.99,
+            "reason": "主问是依据定义域筛选可代入值", "review_reasons": [],
+            "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+        }, taxonomy, self.rules)
+        self.assertEqual(result["status"], "suggested")
+        self.assertEqual(result["target"]["level4_id"], "fraction-range-domain")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -366,6 +366,35 @@ class CloudAndBatchTests(unittest.TestCase):
             sorted({candidate.level4_id for candidate in candidates if candidate.level4_id is not None}) + [None],
         )
 
+    def test_topic_batch_includes_excel_classification_basis_for_each_directory(self) -> None:
+        taxonomy = Taxonomy({
+            "taxonomy_version": "directory-basis-v1",
+            "topics": [{
+                "id": "topic-fraction", "title": "专题2：分式", "order": 2,
+                "level2": [{"id": "fraction-large", "title": "【大题】", "level3": [{
+                    "id": "fraction-simplification", "title": "分式的化简与求值",
+                    "classification_basis": "主对象为含字母分母的分式。",
+                    "level4": [{
+                        "id": "fraction-range-domain", "title": "考法6：限定取值范围并保证分式有意义",
+                        "classification_basis": "须由分母或约分前限制筛出可代入值；证据题目ID：CS2025EXAMPLE001。",
+                    }, {
+                        "id": "fraction-composite", "title": "考法4：分式加减乘除的复合化简",
+                    }],
+                }]}],
+            }],
+        })
+        question = {**self.question, "scope": {"topic_id": "topic-fraction", "level2_id": "fraction-large"}}
+        routing = {question["exercise_id"]: {"latest_topic_id": "topic-fraction", "required_knowledge_points": ["分式"]}}
+        request = self.provider.build_topic_batch_request([question], "topic-fraction", taxonomy, {"rules": {}}, routing)
+        prompt = json.loads(request["input"][0]["content"][0]["text"])
+        level3 = prompt["directory_catalog"][0]["level2"][0]["level3"][0]
+        self.assertEqual(level3["classification_basis"], "主对象为含字母分母的分式。")
+        self.assertEqual(level3["level4"][0]["classification_basis"], "须由分母或约分前限制筛出可代入值")
+        self.assertNotIn("CS2025EXAMPLE001", json.dumps(prompt, ensure_ascii=False))
+        self.assertNotIn("classification_basis", level3["level4"][1])
+        self.assertIn("不能只按标题猜测", " ".join(prompt["instructions"]))
+        self.assertIn("未填写只表示", " ".join(prompt["instructions"]))
+
     def test_fast_batch_maps_each_result_to_skill_validation_shape(self) -> None:
         target = self.taxonomy.all_targets()[0]
         questions = [self.question, {**self.question, "exercise_id": "2529222"}]

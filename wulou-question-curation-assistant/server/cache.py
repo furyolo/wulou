@@ -65,13 +65,16 @@ class ResultCache:
             self._connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self._TABLE}_stable_code ON {self._TABLE}(stable_code)"
             )
-            # 人工修正与模型缓存分表保存：规则或模型更新不能覆盖人工决定。
+            # 人工修正与模型缓存分表保存。人工选择只对作出选择时的目录版本有效；
+            # 目录更新后必须重新让模型基于新目录分类，不能把旧目录下的人工选择
+            # 当作新目录中的最终结论。
             self._connection.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self._MANUAL_TABLE} (
                     exercise_id TEXT NOT NULL,
                     source_catalogue_id TEXT NOT NULL,
                     stable_code TEXT,
+                    taxonomy_version TEXT NOT NULL,
                     original_target_path_json TEXT NOT NULL,
                     target_path_json TEXT NOT NULL,
                     accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -81,6 +84,12 @@ class ResultCache:
                 )
                 """
             )
+            manual_columns = {
+                str(row[1]) for row in self._connection.execute(f"PRAGMA table_info({self._MANUAL_TABLE})")
+            }
+            if "taxonomy_version" not in manual_columns:
+                # 旧记录没有可验证的目录版本，保留供审计，但绝不在新目录中恢复。
+                self._connection.execute(f"ALTER TABLE {self._MANUAL_TABLE} ADD COLUMN taxonomy_version TEXT")
             self._connection.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self._MANUAL_AUDIT_TABLE} (
@@ -88,6 +97,7 @@ class ResultCache:
                     exercise_id TEXT NOT NULL,
                     source_catalogue_id TEXT NOT NULL,
                     stable_code TEXT,
+                    taxonomy_version TEXT,
                     original_target_path_json TEXT NOT NULL,
                     target_path_json TEXT NOT NULL,
                     event_type TEXT NOT NULL,
@@ -95,12 +105,21 @@ class ResultCache:
                 )
                 """
             )
+            audit_columns = {
+                str(row[1]) for row in self._connection.execute(f"PRAGMA table_info({self._MANUAL_AUDIT_TABLE})")
+            }
+            if "taxonomy_version" not in audit_columns:
+                self._connection.execute(f"ALTER TABLE {self._MANUAL_AUDIT_TABLE} ADD COLUMN taxonomy_version TEXT")
             self._connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_stable_code ON {self._MANUAL_TABLE}(stable_code)"
             )
             self._connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_exercise_updated "
                 f"ON {self._MANUAL_TABLE}(exercise_id, updated_at DESC)"
+            )
+            self._connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_exercise_taxonomy_updated "
+                f"ON {self._MANUAL_TABLE}(exercise_id, taxonomy_version, updated_at DESC)"
             )
             # 工作成果只记录题湖已经回读确认的真实移动，独立于可清除的模型缓存。
             self._connection.execute(
@@ -189,41 +208,45 @@ class ResultCache:
             self._connection.commit()
         return cursor.rowcount
 
-    def get_manual_override(self, exercise_id: str, source_catalogue_id: str) -> dict[str, Any] | None:
-        """读取人工修正：当前目录优先，其次是同题最新人工决定。
+    def get_manual_override(
+        self, exercise_id: str, source_catalogue_id: str, taxonomy_version: str
+    ) -> dict[str, Any] | None:
+        """读取当前目录版本的人工修正：当前目录优先，其次是同题最新决定。
 
         题目移动到人工指定的目标叶子后，当前目录 ID 会变成目标目录 ID，
         不能因此退回旧的模型缓存。若同题在当前目录没有记录，采用最新一次
-        已写入题湖的人工决定；当前目录存在记录时仍以其为准。
+        已写入题湖的人工决定；当前目录存在记录时仍以其为准。不同目录版本的
+        人工记录保留审计用途，但不能覆盖当前目录版本的 LLM 分类。
         """
         with self._lock:
             row = self._connection.execute(
                 f"""
-                SELECT stable_code, original_target_path_json, target_path_json, accepted_at, updated_at
+                SELECT stable_code, taxonomy_version, original_target_path_json, target_path_json, accepted_at, updated_at
                 FROM {self._MANUAL_TABLE}
-                WHERE exercise_id = ? AND source_catalogue_id = ?
+                WHERE exercise_id = ? AND source_catalogue_id = ? AND taxonomy_version = ?
                 """,
-                (exercise_id, source_catalogue_id),
+                (exercise_id, source_catalogue_id, taxonomy_version),
             ).fetchone()
             if not row:
                 row = self._connection.execute(
                     f"""
-                    SELECT stable_code, original_target_path_json, target_path_json, accepted_at, updated_at
+                    SELECT stable_code, taxonomy_version, original_target_path_json, target_path_json, accepted_at, updated_at
                     FROM {self._MANUAL_TABLE}
-                    WHERE exercise_id = ?
+                    WHERE exercise_id = ? AND taxonomy_version = ?
                     ORDER BY updated_at DESC, rowid DESC
                     LIMIT 1
                     """,
-                    (exercise_id,),
+                    (exercise_id, taxonomy_version),
                 ).fetchone()
         if not row:
             return None
         return {
             "stable_code": row[0],
-            "original_target_path": json.loads(row[1]),
-            "target_path": json.loads(row[2]),
-            "accepted_at": row[3],
-            "updated_at": row[4],
+            "taxonomy_version": row[1],
+            "original_target_path": json.loads(row[2]),
+            "target_path": json.loads(row[3]),
+            "accepted_at": row[4],
+            "updated_at": row[5],
         }
 
     def put_manual_override(
@@ -232,6 +255,7 @@ class ResultCache:
         exercise_id: str,
         source_catalogue_id: str,
         stable_code: str,
+        taxonomy_version: str,
         original_target_path: list[str],
         target_path: list[str],
     ) -> dict[str, Any]:
@@ -243,29 +267,30 @@ class ResultCache:
             self._connection.execute(
                 f"""
                 INSERT INTO {self._MANUAL_TABLE} (
-                    exercise_id, source_catalogue_id, stable_code,
+                    exercise_id, source_catalogue_id, stable_code, taxonomy_version,
                     original_target_path_json, target_path_json
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exercise_id, source_catalogue_id) DO UPDATE SET
                     stable_code = COALESCE(excluded.stable_code, stable_code),
+                    taxonomy_version = excluded.taxonomy_version,
                     original_target_path_json = excluded.original_target_path_json,
                     target_path_json = excluded.target_path_json,
                     accepted_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (exercise_id, source_catalogue_id, normalized_stable_code, original_json, target_json),
+                (exercise_id, source_catalogue_id, normalized_stable_code, taxonomy_version, original_json, target_json),
             )
             self._connection.execute(
                 f"""
                 INSERT INTO {self._MANUAL_AUDIT_TABLE} (
-                    exercise_id, source_catalogue_id, stable_code,
+                    exercise_id, source_catalogue_id, stable_code, taxonomy_version,
                     original_target_path_json, target_path_json, event_type
-                ) VALUES (?, ?, ?, ?, ?, 'accepted')
+                ) VALUES (?, ?, ?, ?, ?, ?, 'accepted')
                 """,
-                (exercise_id, source_catalogue_id, normalized_stable_code, original_json, target_json),
+                (exercise_id, source_catalogue_id, normalized_stable_code, taxonomy_version, original_json, target_json),
             )
             self._connection.commit()
-        override = self.get_manual_override(exercise_id, source_catalogue_id)
+        override = self.get_manual_override(exercise_id, source_catalogue_id, taxonomy_version)
         if not override:
             raise RuntimeError("人工修正保存后无法读取")
         return override

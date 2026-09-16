@@ -127,6 +127,17 @@ class OpenAIChatCompletionsProvider:
         )
 
     @staticmethod
+    def _directory_boundary_instruction() -> str:
+        """要求模型按工作簿定义的目录边界，而不是按标题联想。"""
+        return (
+            "directory_catalog 中每个 classification_basis 是工作簿定义的可判定纳入/排除边界。"
+            "分类前必须逐项比对同级候选的分类依据，不能只按标题猜测；以题目的主问或决定性条件"
+            "直接满足、且能排除其他同级候选的那一条依据确定末级目录。classification_basis 未填写只表示"
+            "该目录没有额外文字边界，仍须结合目录名称、层级和题目信息继续分类，不得因此直接返回 review。"
+            "若无法得到唯一匹配，才返回 review。"
+        )
+
+    @staticmethod
     def _question(question: dict[str, Any]) -> dict[str, Any]:
         snapshot = build_model_input_snapshot(question)
         question_input = snapshot["question"]
@@ -227,6 +238,7 @@ class OpenAIChatCompletionsProvider:
                 "input_warnings 表示排版可能不完整；只有缺失部分影响分类时才 review，不得凭此臆造答案含有另一道题。",
                 "不得只因编号结构不一致就丢弃答案或返回 review；题干公式在图片中缺失但答案可还原关键关系时，应使用该答案完成判断。",
                 "proposal 只可提出候选，不会创建目录；单题不应形成新目录。",
+                self._directory_boundary_instruction(),
                 self._notation_instruction(),
             ],
         }
@@ -373,6 +385,7 @@ class OpenAIChatCompletionsProvider:
                 "仅当命中的三级目录有四级子目录时才匹配四级；没有四级子目录时三级即末级，target_level4_id 必须为 null。",
                 "input_warnings 仅提示输入风险；答案编号与题干不一致时，须依据数学连续性判断是否属于同一道题，不得直接丢弃答案。",
                 "新目录只能作为候选，单道题不得创建新目录；reason 仅保留短句。",
+                self._directory_boundary_instruction(),
                 self._notation_instruction(),
             ],
         }
@@ -463,6 +476,7 @@ class OpenAIChatCompletionsProvider:
                 "input_warnings 表示排版风险；答案编号与题干不一致时，须依据数学连续性判断是否属于同一道题，不得直接丢弃答案。",
                 "实际题干是分类主依据；题干公式缺失但答案能还原关键关系时，可使用对应答案完成分类；答案明确属于独立题目时才忽略该段。",
                 "只返回 JSON；知识点和说明使用短语，reason 限一短句，不输出推理过程。",
+                self._directory_boundary_instruction(),
                 self._notation_instruction(),
                 "results 必须恰好包含每个 exercise_id 一次。",
             ],

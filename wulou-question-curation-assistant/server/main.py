@@ -107,22 +107,11 @@ class ServiceState:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path.resolve()
         self.settings = load_settings(self.config_path)
-        taxonomy_path = resolve_path(self.config_path, str(self.settings["taxonomy_path"]))
-        generated_taxonomy = PROJECT_ROOT / ".local-data" / "taxonomy.yaml"
-        example_taxonomy = (PROJECT_ROOT / "config" / "taxonomy.example.yaml").resolve()
-        # 本机配置沿用示例路径时，目录快照固定写入 Git 忽略的 .local-data。
-        if self.config_path.name in {"settings.example.yaml", "settings.local.yaml"} and taxonomy_path == example_taxonomy:
-            taxonomy_path = generated_taxonomy
-        sync_result = synchronize_taxonomy(
-            config_path=self.config_path,
-            workbook_settings=self.settings.get("directory_workbook"),
-            output_path=taxonomy_path,
-        )
-        if sync_result.workbook_path:
-            # 目录重构等后续流程必须使用与当前 taxonomy 同一版本的工作簿。
-            self.settings.setdefault("directory_workbook", {})["path"] = str(sync_result.workbook_path)
+        self._taxonomy_refresh_lock = threading.Lock()
+        self.taxonomy_path = self._taxonomy_snapshot_path()
+        sync_result = self._synchronize_taxonomy()
         self.taxonomy_sync_status = sync_result.status
-        self.taxonomy = Taxonomy.from_file(taxonomy_path)
+        self.taxonomy = Taxonomy.from_file(self.taxonomy_path)
         rules_path = resolve_path(self.config_path, str(self.settings["rules_path"]))
         with rules_path.open("r", encoding="utf-8") as file:
             self.rules = yaml.safe_load(file) or {}
@@ -150,6 +139,40 @@ class ServiceState:
         self._active_llm_requests = 0
         proposal_minimum = int((self.rules.get("rules") or {}).get("proposal_minimum_distinct_questions", 3))
         self.proposals = ProposalStore(cache_path.with_name("directory-proposals.sqlite3"), proposal_minimum)
+
+    def _taxonomy_snapshot_path(self) -> Path:
+        """返回本机运行时实际使用的 taxonomy 快照位置。"""
+        taxonomy_path = resolve_path(self.config_path, str(self.settings["taxonomy_path"]))
+        generated_taxonomy = PROJECT_ROOT / ".local-data" / "taxonomy.yaml"
+        example_taxonomy = (PROJECT_ROOT / "config" / "taxonomy.example.yaml").resolve()
+        # 本机配置沿用示例路径时，目录快照固定写入 Git 忽略的 .local-data。
+        if self.config_path.name in {"settings.example.yaml", "settings.local.yaml"} and taxonomy_path == example_taxonomy:
+            return generated_taxonomy
+        return taxonomy_path
+
+    def _synchronize_taxonomy(self):
+        sync_result = synchronize_taxonomy(
+            config_path=self.config_path,
+            workbook_settings=self.settings.get("directory_workbook"),
+            output_path=self.taxonomy_path,
+        )
+        if sync_result.workbook_path:
+            # 目录重构等后续流程必须使用与当前 taxonomy 同一版本的工作簿。
+            self.settings.setdefault("directory_workbook", {})["path"] = str(sync_result.workbook_path)
+        return sync_result
+
+    def refresh_taxonomy(self) -> bool:
+        """在页面读取目录或提交分类前，原子切换到新发现的目录工作簿快照。"""
+        with self._taxonomy_refresh_lock:
+            sync_result = self._synchronize_taxonomy()
+            self.taxonomy_sync_status = sync_result.status
+            if sync_result.status != "updated":
+                return False
+            refreshed = Taxonomy.from_file(self.taxonomy_path)
+            if refreshed.version == self.taxonomy.version:
+                return False
+            self.taxonomy = refreshed
+            return True
 
     def cache_key(self, question: dict[str, Any]) -> str:
         cloud_settings = self.active_cloud_settings()
@@ -196,7 +219,7 @@ class ServiceState:
             and cached.get("routing_pipeline_version") != ROUTING_PIPELINE_VERSION
         ):
             cached = None
-        manual = self.cache.get_manual_override(exercise_id, source_catalogue_id)
+        manual = self.cache.get_manual_override(exercise_id, source_catalogue_id, self.taxonomy.version)
         if not manual:
             if cached:
                 move = self.cache.latest_catalogue_moves([exercise_id]).get(exercise_id)
@@ -204,7 +227,8 @@ class ServiceState:
                     cached = dict(cached)
                     cached["catalogue_move"] = move
             return cached
-        # 人工采纳的路径优先于模型输出；即使模型缓存因规则更新失效，人工结果仍可恢复。
+        # 同一目录版本内，人工采纳的路径优先于模型输出。目录版本更新后，
+        # 旧人工决定不会命中，必须重新让模型按新目录分类。
         result = dict(cached or {
             "exercise_id": exercise_id,
             "status": "suggested",
@@ -223,6 +247,7 @@ class ServiceState:
                 "source": "manual",
                 "original_target_path": manual["original_target_path"],
                 "accepted_at": manual["accepted_at"],
+                "taxonomy_version": manual["taxonomy_version"],
             },
         })
         move = self.cache.latest_catalogue_moves([exercise_id]).get(exercise_id)
@@ -278,6 +303,7 @@ class ServiceState:
             exercise_id=exercise_id,
             source_catalogue_id=source_catalogue_id,
             stable_code=stable_code,
+            taxonomy_version=self.taxonomy.version,
             original_target_path=original_target_path,
             target_path=target_path,
         )
@@ -286,6 +312,7 @@ class ServiceState:
             "source_catalogue_id": source_catalogue_id,
             "target_path": override["target_path"],
             "accepted_at": override["accepted_at"],
+            "taxonomy_version": override["taxonomy_version"],
         }
 
     def save_catalogue_move(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -980,6 +1007,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         request_url = urlparse(self.path)
+        if request_url.path in {"/health", "/api/v1/taxonomy"}:
+            try:
+                self.server.state.refresh_taxonomy()
+            except (ValueError, TaxonomyError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "taxonomy_sync_failed", "message": str(error)})
+                return
         if self.path == "/health":
             self._send_json(HTTPStatus.OK, {
                 "status": "ok", "service": "wulou-question-curation-assistant", "host": "127.0.0.1",
@@ -1032,6 +1065,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json(maximum_length=12_000_000 if self.path in {"/api/v1/directory-exports", "/api/v1/classification-jobs"} else 2_000_000)
+            if self.path in {
+                "/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs",
+                "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications",
+                "/api/v1/directory-refactors", "/api/v1/directory-exports", "/api/v1/batches",
+            }:
+                self.server.state.refresh_taxonomy()
             if self.path == "/api/v1/settings/cloud":
                 self._send_json(HTTPStatus.OK, self.server.state.update_cloud_settings(payload))
             elif self.path == "/api/v1/settings/cloud/test/start":

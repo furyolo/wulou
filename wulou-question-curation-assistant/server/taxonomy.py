@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -26,6 +27,7 @@ class Target:
     level4_id: str | None = None
     level4_title: str | None = None
     level4_knowledge_point_id: str | None = None
+    classification_basis: str | None = None
     include_keywords: tuple[str, ...] = ()
     exclude_keywords: tuple[str, ...] = ()
 
@@ -73,12 +75,15 @@ class Taxonomy:
                                 **base,
                                 level4_id=str(level4["id"]), level4_title=str(level4["title"]),
                                 level4_knowledge_point_id=self._optional_text(level4.get("knowledge_point_id")),
+                                classification_basis=self._semantic_basis(level4.get("classification_basis"))
+                                or self._semantic_basis(level3.get("classification_basis")),
                                 include_keywords=tuple(map(str, level4.get("include_keywords", level3.get("include_keywords", [])))),
                                 exclude_keywords=tuple(map(str, level4.get("exclude_keywords", level3.get("exclude_keywords", [])))),
                             ))
                     else:
                         targets.append(Target(
                             **base,
+                            classification_basis=self._semantic_basis(level3.get("classification_basis")),
                             include_keywords=tuple(map(str, level3.get("include_keywords", []))),
                             exclude_keywords=tuple(map(str, level3.get("exclude_keywords", []))),
                         ))
@@ -101,6 +106,28 @@ class Taxonomy:
     @staticmethod
     def _optional_text(value: Any) -> str | None:
         return str(value) if value not in (None, "") else None
+
+    @staticmethod
+    def _semantic_basis(value: Any) -> str | None:
+        """旧快照可能把证据题号拼在 N 列定义后；模型不得读取这些审计标识。"""
+        source = Taxonomy._optional_text(value)
+        if not source:
+            return None
+        match = re.match(
+            r"^(.*?)(?:\s*[；;]\s*|\s+)(?:(?:已有\s*|现有\s*|审计\s*)?证据(?:题目)?\s*(?:ID|编号|题号)|"
+            r"evidence\s+(?:exercise|question)\s*(?:ids?|numbers?))\s*[：:].*$",
+            source,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip(" \t；;") or None
+        if re.match(
+            r"^(?:(?:已有\s*|现有\s*|审计\s*)?证据(?:题目)?\s*(?:ID|编号|题号)|evidence\s+(?:exercise|question)\s*(?:ids?|numbers?))\s*[：:]",
+            source,
+            re.IGNORECASE,
+        ):
+            return None
+        return source
 
     def candidates(self, topic_id: str | None, level2_id: str | None) -> list[Target]:
         result = self._targets
@@ -152,6 +179,9 @@ class Taxonomy:
                     }
                     if level3.get("knowledge_point_id"):
                         level3_row["knowledge_point_id"] = str(level3["knowledge_point_id"])
+                    level3_basis = self._semantic_basis(level3.get("classification_basis"))
+                    if level3_basis:
+                        level3_row["classification_basis"] = level3_basis
                     level4_rows = []
                     for level4 in level3.get("level4", []):
                         level4_row: dict[str, Any] = {
@@ -160,6 +190,9 @@ class Taxonomy:
                         }
                         if level4.get("knowledge_point_id"):
                             level4_row["knowledge_point_id"] = str(level4["knowledge_point_id"])
+                        level4_basis = self._semantic_basis(level4.get("classification_basis"))
+                        if level4_basis:
+                            level4_row["classification_basis"] = level4_basis
                         include_keywords = level4.get("include_keywords", level3.get("include_keywords", []))
                         exclude_keywords = level4.get("exclude_keywords", level3.get("exclude_keywords", []))
                         if include_keywords:

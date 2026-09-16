@@ -1,4 +1,4 @@
-rule_version: math-exam-directory-curation-2026-09-15.1
+rule_version: math-exam-directory-curation-2026-09-16.1
 source_files:
   - C:\Users\foogl\.codex\skills\math-exam-directory-curation\SKILL.md
   - C:\Users\foogl\.codex\skills\math-exam-directory-curation\references\classification-and-writing-rules.md
@@ -27,6 +27,8 @@ rules:
   require_pairwise_level3_exclusivity: true
   require_leaf_target_unique_match: true
   require_level4_unique_match_when_available: true
+  classification_basis_requires_pairwise_decidable_boundaries: true
+  classification_evidence_is_audit_only: true
   parent_knowledge_point_protection: true
   proposal_minimum_distinct_questions: 3
   proposal_single_question_action: observe
@@ -41,6 +43,8 @@ decision_protocol:
   - 同一题含多个跨知识点小问时，必须作为整题归属，不能按小问拆分。先比较各知识点对整题主结论、核心难点和最困难非例行推理的作用；存在明确核心时归入该知识点。仅在候选核心无法区分轻重时，才以完整必备知识中的最晚前置知识归属；更晚的常规计算、铺垫或辅助代入不得压过明确核心。
   - 再判定分类阶段：专题10之前的非复合题或上述核心并列题，按目录顺序选择最晚必备知识点所属专题；从专题10“三角形”起及后续专题的【大题】，按最终解决问题的核心突破口、决定性性质或证明链主线选择专题。后者不得因扇形面积、旋转、坐标或代数运算等辅助步骤而改变专题归属。
   - 在选定专题内，以首要数学对象或情境确定三级目录。
+  - 四级目录必须逐项读取分类依据（classification_basis / Excel N列），不得只从目录标题推断边界。以题目的主问或决定性条件直接满足、且能排除其他同级候选的那一条依据确定末级目录；分类依据未填写只表示没有额外文字边界，仍须结合目录名称、层级和题目信息继续分类，不得因此直接复核；无法形成唯一匹配时才复核。
+  - 目录分类依据必须是可与同级目录两两区分的语义边界；题号、样题 ID、历史统计等只可保留为审计证据，不得作为模型判断目录归属的输入。批量分类中每个结果仍须依据对应题目的内容和目录语义独立形成；不得把同批其他题的题号、结果或顺序作为归属依据。
   - 对专题10及后续专题的【大题】，用反事实检查区分核心与辅助：去掉候选知识点后主结论的证明或求解主线仍成立时，它只是辅助步骤；主线失效，或该知识点就是最终主问/决定性条件时，才是核心考点。以主问或决定性条件确定四级目录；常规步骤、故事背景和否定性宽泛描述不得压过关键知识特征。
   - 对所有同级候选做两两排他检查；无法唯一命中时必须复核。若三级目录没有四级子目录，则三级即为末级；仅对实际存在四级子目录的三级目录执行四级唯一命中检查。
   - 新目录只可作为候选，单道题不得创建新目录。

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+from copy import deepcopy
 import tempfile
 import threading
 import time
@@ -173,6 +174,39 @@ class HttpServiceTests(unittest.TestCase):
         moved_result = moved_lookup["results"][0]
         self.assertEqual(moved_result["target"]["path"][-1], "分母有理化")
         self.assertEqual(moved_result["manual_override"]["source"], "manual")
+
+    def test_manual_classification_is_not_reused_after_the_taxonomy_changes(self) -> None:
+        body = {
+            "exercise_id": "manual-reclassify-on-taxonomy-change-1",
+            "stable_code": "CS2026MANUAL002",
+            "current_catalogue_id": "level4-a",
+            "question_press": "计算并化简含有分母有理化的根式",
+            "scope": {"topic_id": "topic-01-real-numbers", "level2_id": "topic-01-large"},
+        }
+        saved_status, saved = self.request("POST", "/api/v1/manual-classifications", {
+            **body,
+            "original_target_path": ["专题1：实数", "【大题】", "旧分类"],
+            "target_path": ["专题1：实数", "【大题】", "人工旧分类"],
+        })
+        self.assertEqual(saved_status, 201)
+        old_taxonomy_version = saved["taxonomy_version"]
+
+        updated_taxonomy = deepcopy(self.state.taxonomy.raw)
+        updated_taxonomy["taxonomy_version"] = f"{old_taxonomy_version}-updated"
+        self.state.taxonomy = Taxonomy(updated_taxonomy)
+
+        lookup_status, lookup = self.request(
+            "POST", "/api/v1/cache/classifications/lookup", {"questions": [body]}
+        )
+        self.assertEqual(lookup_status, 200)
+        self.assertEqual(lookup["results"], [])
+        self.assertEqual(lookup["missing_exercise_ids"], [body["exercise_id"]])
+
+        classified_status, classified = self.request("POST", "/api/v1/classify", body)
+        self.assertEqual(classified_status, 200)
+        self.assertFalse(classified["cache_hit"])
+        self.assertEqual(classified["taxonomy_version"], self.state.taxonomy.version)
+        self.assertNotIn("manual_override", classified)
 
     def test_catalogue_move_history_reports_latest_confirmed_move(self) -> None:
         first = {
@@ -555,6 +589,51 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["results"][0]["target"]["level3_id"], target.level3_id)
         self.assertEqual(cloud.calls, ["routing", f"topic:{target.topic_id}"])
+
+    def test_interactive_cloud_job_batches_final_directory_paths_for_throughput(self) -> None:
+        target = self.state.taxonomy.all_targets()[0]
+
+        class StubCloud:
+            configured = True
+            provider_name = "stub"
+            model = "fast-model"
+            reasoning_effort = "medium"
+
+            def __init__(self) -> None:
+                self.final_call_ids: list[list[str]] = []
+
+            def route_fast_batch(self, questions, _taxonomy, _rules):
+                return [{
+                    "exercise_id": str(question["exercise_id"]), "status": "routed",
+                    "required_knowledge_points": ["实数运算"], "latest_topic_id": target.topic_id,
+                    "confidence": 0.96, "reason": "路由完成", "review_reasons": [],
+                } for question in questions]
+
+            def classify_topic_batch(self, questions, _topic_id, _taxonomy, _rules, routings):
+                if len(questions) != 3:
+                    raise AssertionError("同一专题的最终目录判定应复用微批")
+                exercise_ids = [str(question["exercise_id"]) for question in questions]
+                self.final_call_ids.append(exercise_ids)
+                return [{
+                    "exercise_id": exercise_id, "status": "suggested",
+                    "target_level3_id": target.level3_id, "target_level4_id": target.level4_id,
+                    "confidence": 0.96, "reason": "唯一命中", "review_reasons": [],
+                    "proposal": {"kind": "none", "title": None, "cluster_key": None, "reason": None},
+                    "routing": routings[exercise_id],
+                } for exercise_id in exercise_ids]
+
+        cloud = StubCloud()
+        self.state.settings["classifier"] = {"cloud": {"max_concurrent_requests": 1}}
+        self.state.cloud = cloud
+        questions = [{"exercise_id": f"independent-{index}", "question_press": "分母有理化"} for index in range(3)]
+        _, submitted = self.request("POST", "/api/v1/classification-jobs", {"questions": questions})
+        for _ in range(80):
+            _, snapshot = self.request("GET", f"/api/v1/classification-jobs/{submitted['job_id']}")
+            if snapshot["status"] == "completed":
+                break
+            time.sleep(0.01)
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(cloud.final_call_ids, [["independent-0", "independent-1", "independent-2"]])
 
     def test_interactive_cloud_job_recovers_from_unexpected_cloud_attribute_error(self) -> None:
         """上游兼容网关的格式缺陷只能影响当前分批，不能击穿整个作业。"""
