@@ -543,13 +543,19 @@
     return { jsonl: text, preserve_manual_decisions: Boolean(keepManual) };
   }
 
+  // 确认框的确认按钮沿用面板其他按钮的同一套语义：常规操作是主操作（绿），
+  // 只有删除、清缓存这类破坏性操作才用红。以前一律白底，看不出哪个是主操作。
+  function confirmAcceptClass(destructive) {
+    return destructive ? 'danger' : 'primary';
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
-      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, needsDirectoryReview, skillImportBody, CLASSIFICATION_JOB_MAX_QUESTIONS,
+      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, needsDirectoryReview, skillImportBody, confirmAcceptClass, CLASSIFICATION_JOB_MAX_QUESTIONS,
     };
     return;
   }
@@ -665,7 +671,7 @@
       .model-settings { display: grid; gap: 8px; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
       .model-settings h4 { margin: 0; color: #29453d; font-size: 12px; }
       .model-settings p { margin: -2px 0 0; color: #687a74; font-size: 11px; }
-      .profile-actions, .settings-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .profile-actions, .settings-actions, .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
       .profile-actions { justify-content: flex-start; }
       .test-cloud-connection { min-height: 30px; padding: 4px 9px; font-size: 12px; }
       .connection-test-status { color: #526660; font-size: 12px; font-weight: 650; line-height: 1.4; }
@@ -727,7 +733,7 @@
       .confirm-checkbox[hidden] { display: none; }
       .confirm-checkbox { display: flex; align-items: flex-start; gap: 7px; margin-top: 12px; color: #526660; font-size: 12px; line-height: 1.5; cursor: pointer; }
       .confirm-checkbox input { flex: 0 0 auto; margin: 2px 0 0; }
-      .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+      .confirm-actions { margin-top: 16px; }
       .danger { border-color: #b43c35; background: #b43c35; color: #fff; font-weight: 650; }
       .danger:hover { border-color: #8f2f2a; background: #8f2f2a; }
       @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } .history-date-dialog { width: calc(100vw - 20px); } .cloud-profile-name { width: 98px; } .history-header { flex-wrap: wrap; } .history-date-range { order: 3; margin-left: 0; } .history-export-actions { margin-left: auto; } }
@@ -902,7 +908,8 @@
     elements.confirmTitle.textContent = title;
     elements.confirmMessage.textContent = message;
     elements.confirmAccept.textContent = confirmLabel;
-    elements.confirmAccept.classList.toggle('danger', destructive);
+    // 全量赋值而非逐个 toggle，避免上一次调用残留的语义类叠在一起。
+    elements.confirmAccept.className = `confirm-accept ${confirmAcceptClass(destructive)}`;
     if (checkbox) {
       elements.confirmCheckbox.hidden = false;
       elements.confirmCheckboxLabel.textContent = checkbox.label;

@@ -34,6 +34,7 @@ const {
   historyRangePreviewEnd,
   needsDirectoryReview,
   skillImportBody,
+  confirmAcceptClass,
   CLASSIFICATION_JOB_MAX_QUESTIONS,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
@@ -415,4 +416,12 @@ test('导入归类结果的请求体带上保留人工修正的选择', () => {
   assert.equal(skillImportBody('{"items":[]}', false).preserve_manual_decisions, false);
   assert.equal(skillImportBody('{"items":[]}', undefined).preserve_manual_decisions, false);
   assert.equal(skillImportBody('逐行 JSONL', true).jsonl, '逐行 JSONL');
+});
+
+test('确认框的确认按钮与面板按钮同一套语义', () => {
+  // 常规确认（导入归类结果、全部采纳、识别）是主操作，用面板统一的绿底。
+  assert.equal(confirmAcceptClass(false), 'primary');
+  assert.equal(confirmAcceptClass(undefined), 'primary');
+  // 只有删除方案、清除缓存这类破坏性操作才用红底。
+  assert.equal(confirmAcceptClass(true), 'danger');
 });
