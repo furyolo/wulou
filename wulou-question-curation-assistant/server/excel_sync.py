@@ -16,6 +16,17 @@ from typing import Any
 from openpyxl import load_workbook
 
 
+# 只服务于 next_sf_number()：给“今天新发、且署名为 SF 的编号”查重避号。
+# **它不是“这个目录有没有编号”的判据**，别拿它去筛目录。
+#
+# 知识点编号是署名制：谁建的目录谁定编号，任何人都可以用自己的“字母+数字”串，
+# 没有全局统一格式。`ZCSQG<YYYYMMDD>SF<NN>` 只是本机主人的署名写法（`SF` 是主人的
+# 署名），只有主人自己或替主人干活的 Skill **新发**编号时才用它。因此现存目录里会
+# 出现 ZCSQG / ZCSZKH / ZCSZKHcwj / ZCSQGLQ / ZCSQGCYLZ / CSZSDCF 等多种前缀，
+# 同一前缀下日期段与序号段的写法也不统一——这些都是合法的知识点编号，不是“不规范”。
+#
+# 服务端一律按 E 列原值做等值反查（taxonomy.resolve_knowledge_point_id），不校验格式；
+# 任何新增的格式校验都会让现在能用的合法编号突然失效。
 SF_PATTERN = re.compile(r"^ZCSQG(\d{8})SF(\d+)$")
 
 

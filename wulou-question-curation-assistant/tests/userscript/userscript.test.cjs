@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   normalizeWhitespace,
   formatChinaTime,
@@ -424,4 +426,28 @@ test('确认框的确认按钮与面板按钮同一套语义', () => {
   assert.equal(confirmAcceptClass(undefined), 'primary');
   // 只有删除方案、清除缓存这类破坏性操作才用红底。
   assert.equal(confirmAcceptClass(true), 'danger');
+});
+
+test('导出所有题库与导入归类结果同处一行、同一类按钮样式', () => {
+  // 这两个动作互补：题库导出去、归类结果收回来。所以并排放在同一个 .actions 行里，
+  // 并且都不用 .primary —— 绿色在面板里专属于模型动作（识别当前页、识别当前目录
+  // 全部题目、全部采纳）。行宽由 .actions 的两列网格决定，样式由 button 基类决定。
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'userscript', 'wulou-question-curation-assistant.user.js'),
+    'utf8',
+  );
+  const rows = source
+    .split('<div class="actions">')
+    .slice(1)
+    .map((part) => part.slice(0, part.indexOf('</div>')));
+  const pair = rows.filter((row) => row.includes('export-all-questions'));
+  assert.equal(pair.length, 1, '导出所有题库应当只在唯一一行里出现');
+  assert.ok(pair[0].includes('import-skill-results'), '导出与导入应当在同一行');
+  const buttons = pair[0].match(/<button[^>]*>/g) || [];
+  assert.equal(buttons.length, 2, '这一行应当只有这两个按钮');
+  for (const button of buttons) {
+    assert.ok(!/class="[^"]*\bprimary\b/.test(button), `这一行不该出现主按钮样式：${button}`);
+  }
+  // 隐藏的 file input 留在 .actions 外面：非按钮子元素会干扰「独占一行就铺满」的宽度规则。
+  assert.ok(!pair[0].includes('import-skill-results-file'), 'file input 不该塞进这一行');
 });

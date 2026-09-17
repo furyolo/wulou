@@ -625,7 +625,7 @@
       label { display: grid; gap: 4px; font-size: 12px; color: #526660; }
       input, select, textarea { width: 100%; min-height: 36px; border: 1px solid #cfdad5; border-radius: 8px; background: #fff; color: #1f2c2a; padding: 7px 9px; }
       .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
-      .actions > :only-child { grid-column: 1 / -1; }
+      .actions > button:only-of-type { grid-column: 1 / -1; }
       .primary { border-color: #126b5c; background: #126b5c; color: #fff; font-weight: 650; }
       .primary:hover { border-color: #0c5649; background: #0c5649; }
       .status { min-height: 0; margin-top: 2px; padding: 8px 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #f6faf8; color: #526660; font-size: 11px; }
@@ -751,8 +751,8 @@
       <div class="actions"><button class="primary classify-focus" type="button" disabled>识别当前目录全部题目</button></div>
       <div class="actions"><button class="restore-focus" type="button" hidden disabled>恢复上次审核队列</button></div>
       <div class="actions"><button class="primary accept-all" type="button" disabled>全部采纳</button></div>
-      <div class="actions"><button class="primary export-all-questions" type="button" disabled>导出所有题库</button></div>
-      <div class="actions"><button class="import-skill-results" type="button">导入归类结果</button><input class="import-skill-results-file" type="file" accept=".json,.jsonl,.txt,application/json" hidden></div>
+      <div class="actions"><button class="export-all-questions" type="button" disabled>导出所有题库</button><button class="import-skill-results" type="button">导入归类结果</button></div>
+      <input class="import-skill-results-file" type="file" accept=".json,.jsonl,.txt,application/json" hidden>
       <div class="actions"><button class="history" type="button">工作成果</button><button class="clear-cache" type="button" disabled>清除本页缓存</button></div>
        <!-- 批处理仅适合数百题以上的离线任务；保留实现，暂不占用日常实时分类面板。 -->
        <section class="batch-actions" hidden aria-label="高级批处理操作">

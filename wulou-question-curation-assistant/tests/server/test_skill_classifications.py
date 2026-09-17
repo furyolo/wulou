@@ -524,5 +524,71 @@ class SkillImportHttpTests(unittest.TestCase):
         self.assertEqual(status, 404)
 
 
+class KnowledgePointIdFormatTests(unittest.TestCase):
+    """编号只做等值比对，格式不参与判定。
+
+    这条是硬约束，不是口味问题。知识点编号是**署名制**：谁建的目录谁定编号，
+    任何人都可以用自己的“字母+数字”串，没有全局统一格式。`SF` 只是本机主人的
+    署名，所以 `ZCSQG<YYYYMMDD>SF<NN>` 只约束主人自己（和本机 Skill）**新发**的
+    编号；别人建的编号长什么样都算合法。真实目录里的 E 列编号因此有好几种前缀
+    （ZCSQG / ZCSZKH / ZCSZKHcwj / ZCSQGLQ / ZCSQGCYLZ / CSZSDCF 等），服务端靠
+    ``taxonomy.resolve_knowledge_point_id`` 按原值反查。一旦有人在这里补一个
+    “看起来才规范”的格式校验，那些目录就会集体反查不到、被当成没有编号。样本取自
+    2026-09-17 本机运行目录的实况，不要为了整齐而改写。
+    """
+
+    @staticmethod
+    def _taxonomy() -> Taxonomy:
+        return Taxonomy({
+            "taxonomy_version": "excel-v4-formats",
+            "topics": [{
+                "id": "topic-1",
+                "title": "专题4：分式方程与不等式",
+                "order": 1,
+                "level2": [{
+                    "id": "l2-1",
+                    "title": "【大题】",
+                    "level3": [
+                        {"id": "l3-1", "title": "分式方程的应用题（大题）",
+                         "knowledge_point_id": "CSZSDCF15cwj02", "level4": []},
+                        {"id": "l3-2", "title": "实数的应用",
+                         "knowledge_point_id": "ZCSQGLQ202687cwj03", "level4": []},
+                        {"id": "l3-3", "title": "综合实践之三角函数相关",
+                         "knowledge_point_id": "ZCSZKHcwj01", "level4": []},
+                        {"id": "l3-4", "title": "分式的化简与求值",
+                         "knowledge_point_id": None, "level4": [
+                             {"id": "l4-1", "title": "考法4：分式加减乘除的复合化简",
+                              "knowledge_point_id": "ZCSQGCYLZ01060206"},
+                             {"id": "l4-2", "title": "考法6：限定取值范围并保证分式有意义",
+                              "knowledge_point_id": "ZCSQGLQ2023072004020409"},
+                         ]},
+                    ]}]}],
+        })
+
+    def test_non_standard_prefixes_all_resolve(self) -> None:
+        taxonomy = self._taxonomy()
+        cases = (
+            ("CSZSDCF15cwj02", "分式方程的应用题（大题）"),
+            ("ZCSQGLQ202687cwj03", "实数的应用"),
+            ("ZCSZKHcwj01", "综合实践之三角函数相关"),
+            ("ZCSQGCYLZ01060206", "考法4：分式加减乘除的复合化简"),
+            ("ZCSQGLQ2023072004020409", "考法6：限定取值范围并保证分式有意义"),
+            ("  ZCSQGLQ202687cwj03  ", "实数的应用"),
+        )
+        for code, expected_title in cases:
+            with self.subTest(code=code):
+                target, error = taxonomy.resolve_knowledge_point_id(code)
+                self.assertIsNone(error)
+                assert target is not None
+                self.assertEqual(target.level4_title or target.level3_title, expected_title)
+
+    def test_unknown_code_is_reported_as_missing_not_unformatted(self) -> None:
+        """反查失败的原因是"编号不存在"，不能变成"编号不合格式"。"""
+        target, error = self._taxonomy().resolve_knowledge_point_id("ZCSQG20260101SF99")
+        self.assertIsNone(target)
+        self.assertIn("没有该知识点编号", error or "")
+        self.assertNotIn("格式", error or "")
+
+
 if __name__ == "__main__":
     unittest.main()
