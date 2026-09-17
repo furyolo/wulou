@@ -17,7 +17,7 @@ from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import yaml
@@ -263,6 +263,11 @@ class ServiceState:
                 "original_target_path": manual["original_target_path"],
                 "accepted_at": manual["accepted_at"],
                 "taxonomy_version": manual["taxonomy_version"],
+                # 这条结论仍然成立（目标目录在当前目录里解析得到），但它定稿之后目录
+                # 又调整过：落点还在，不影响使用，只是未必仍是最合适的。前端据此加
+                # 一个“待复核”提示，不拦着采纳。目录一变就作废属于另一回事——那种
+                # 记录根本走不到这里。
+                "directory_changed": manual["taxonomy_version"] != self.taxonomy.version,
             },
         })
         move = self.cache.latest_catalogue_moves([exercise_id]).get(exercise_id)
@@ -780,6 +785,18 @@ class ServiceState:
         worker.start()
         return self.classification_jobs.snapshot(job.job_id)
 
+    def _manual_decision_keeper(self, payload: dict[str, Any]) -> Callable[[dict[str, Any]], bool] | None:
+        """导入时要不要保下已有人工决策——与读取层用同一把尺子。
+
+        一条旧人工结论还算不算数，只取决于它的目标目录能否在当前目录里解析到
+        （见 ``_resolved_manual_override``）。导入时的保留判定必须是同一个标准，
+        否则会出现「页面上还显示着人工结论，下次导入却把它覆盖了」这种前后不一；
+        反过来，目标目录已经被撤销的记录本就作废，也不必再占着位置不让覆盖。
+        """
+        if not payload.get("preserve_manual_decisions"):
+            return None
+        return lambda record: bool(self.taxonomy.resolve_published_path(record["target_path"]))
+
     def import_skill_classifications(self, payload: dict[str, Any]) -> dict[str, Any]:
         """导入目录整理 Skill 的逐题归类结果。
 
@@ -806,13 +823,13 @@ class ServiceState:
         if report["dry_run"]:
             return report
         counts = self.cache.put_skill_classifications(
-            plan["rows"], preserve_manual_decisions=bool(payload.get("preserve_manual_decisions"))
+            plan["rows"], keep_manual_decision=self._manual_decision_keeper(payload)
         )
         report.update(counts)
         report["written"] = counts["inserted"] + counts["updated"]
         if counts["skipped_manual_decisions"]:
             report["warnings"].append(
-                f"{counts['skipped_manual_decisions']} 条已有同一目录版本内的人工修正，已按请求保留，未被覆盖。"
+                f"{counts['skipped_manual_decisions']} 条已有仍然成立的人工修正，已按请求保留，未被覆盖。"
             )
         return report
 

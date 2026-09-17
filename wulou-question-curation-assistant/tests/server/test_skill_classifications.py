@@ -178,19 +178,41 @@ class SkillCacheWriteTests(unittest.TestCase):
         self.assertEqual(second, {"inserted": 0, "updated": 1, "skipped_manual_decisions": 0})
 
     def test_preserve_manual_decisions_keeps_human_choice(self) -> None:
+        """给了保留判据就跳过人工记录，且判据只对人工记录求值。"""
         self.cache.put_manual_override(
             exercise_id="2374107", source_catalogue_id="__uncategorized__", stable_code="",
             taxonomy_version="excel-v4-test00000000", original_target_path=[],
             target_path=["专题1：实数", "【大题】", "实数的应用"],
         )
-        report = self.cache.put_skill_classifications(
-            self._rows(), preserve_manual_decisions=True
-        )
+        seen: list[dict] = []
+
+        def keep(record: dict) -> bool:
+            seen.append(record)
+            return True
+
+        report = self.cache.put_skill_classifications(self._rows(), keep_manual_decision=keep)
         self.assertEqual(report["skipped_manual_decisions"], 1)
+        self.assertEqual(report["updated"], 0)
+        self.assertEqual([record["target_path"][-1] for record in seen], ["实数的应用"])
         overrides = self.cache.get_manual_overrides("2374107", "760474748")
         self.assertTrue(overrides)
         self.assertEqual(overrides[0]["source"], "manual")
         self.assertEqual(overrides[0]["target_path"][-1], "实数的应用")
+
+    def test_manual_decision_is_overwritten_when_the_keeper_declines(self) -> None:
+        """判据说不保留（目标目录已失效）时，批量结果照常覆盖并改写来源。"""
+        self.cache.put_manual_override(
+            exercise_id="2374107", source_catalogue_id="__uncategorized__", stable_code="",
+            taxonomy_version="excel-v4-test00000000", original_target_path=[],
+            target_path=["专题1：实数", "【大题】", "已被撤销的三级"],
+        )
+        report = self.cache.put_skill_classifications(
+            self._rows(), keep_manual_decision=lambda record: False
+        )
+        self.assertEqual(report, {"inserted": 0, "updated": 1, "skipped_manual_decisions": 0})
+        overrides = self.cache.get_manual_overrides("2374107", "760474748")
+        self.assertEqual(overrides[0]["source"], "skill")
+        self.assertEqual(overrides[0]["target_path"][-1], "考法2：含分母有理化")
 
 
 class ManualOverrideResolutionTests(unittest.TestCase):
@@ -277,6 +299,17 @@ class ManualOverrideResolutionTests(unittest.TestCase):
         })
         self.assertEqual(report["written"], 1, report)
 
+    def _save_manual(self, target_path: list[str], exercise_id: str = "2374107") -> None:
+        """模拟页面上的人工采纳：写入人工修正表，键用题目当时所在目录。"""
+        self.state.cache.put_manual_override(
+            exercise_id=exercise_id,
+            source_catalogue_id="760474748",
+            stable_code="CS2025JLZKYHM326JKHERAIKKC012",
+            taxonomy_version=self.state.taxonomy.version,
+            original_target_path=[],
+            target_path=target_path,
+        )
+
     def _suggested_path(self, exercise_id: str = "2374107") -> list[str] | None:
         result = self.state.cached_result({
             "exercise_id": exercise_id,
@@ -308,6 +341,63 @@ class ManualOverrideResolutionTests(unittest.TestCase):
 
         self._switch_taxonomy(self._raw_v2())
         self.assertEqual(self._suggested_path(), ["专题1：实数", "【大题】", "实数与数轴"])
+
+    def test_skill_import_keeps_a_manual_decision_that_still_resolves(self) -> None:
+        """导入时的保留判据与读取层同一把尺子：目标目录还在就护住人工结论。
+
+        这条卡住的正是新旧口径的差别——目录版本号已经变了，若照版本号一刀切，
+        一条仍然有效的人工结论会被批量结果白白覆盖。
+        """
+        self._save_manual(["专题1：实数", "【大题】", "实数与数轴"])
+        self._switch_taxonomy(self._raw_v2())
+
+        report = self.state.import_skill_classifications({
+            "preserve_manual_decisions": True,
+            "items": [{
+                "exercise_id": "2374107",
+                "knowledge_point_id": "ZCSQG20260201SF01",
+                "current_catalogue_id": "760474748",
+            }],
+        })
+        self.assertEqual(report["skipped_manual_decisions"], 1, report)
+        self.assertEqual(report["written"], 0, report)
+        self.assertEqual(self._suggested_path(), ["专题1：实数", "【大题】", "实数与数轴"])
+
+    def test_skill_import_replaces_a_manual_decision_whose_target_is_gone(self) -> None:
+        """人工结论的目标目录已被细分掉：读取层本就不会用它，导入时也不必再护着。"""
+        self._save_manual(["专题1：实数", "【大题】", "实数的应用"])
+        self._switch_taxonomy(self._raw_v2())
+
+        report = self.state.import_skill_classifications({
+            "preserve_manual_decisions": True,
+            "items": [{
+                "exercise_id": "2374107",
+                "knowledge_point_id": "ZCSQG20260201SF01",
+                "current_catalogue_id": "760474748",
+            }],
+        })
+        self.assertEqual(report["skipped_manual_decisions"], 0, report)
+        self.assertEqual(report["written"], 1, report)
+        self.assertEqual(
+            self._suggested_path(), ["专题1：实数", "【大题】", "实数的应用", "考法1：直接开方"]
+        )
+
+    def test_result_flags_a_decision_whose_directory_moved_on(self) -> None:
+        """结论仍成立、但定稿后所在专题被调整过：带标记交给界面提示，不影响能否使用。"""
+        question = {
+            "exercise_id": "2374107",
+            "current_catalogue_id": "760474748",
+            "stable_code": "CS2025JLZKYHM326JKHERAIKKC012",
+        }
+        self._save_manual(["专题1：实数", "【大题】", "实数与数轴"])
+        before = self.state.cached_result(question)
+        self.assertFalse(before["manual_override"]["directory_changed"])
+
+        self._switch_taxonomy(self._raw_v2())
+        after = self.state.cached_result(question)
+        self.assertTrue(after["manual_override"]["directory_changed"])
+        # 提示归提示，结论照旧可用、照旧可以采纳。
+        self.assertEqual(after["target"]["path"], ["专题1：实数", "【大题】", "实数与数轴"])
 
 
 class PublishedPathResolutionTests(unittest.TestCase):

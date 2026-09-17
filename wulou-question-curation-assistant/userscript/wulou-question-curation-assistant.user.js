@@ -529,13 +529,27 @@
     return start && !end && /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : '';
   }
 
+  // 人工（或 Skill）结论定稿之后，它所在的专题又调整过目录，但目标目录仍在：
+  // 结论继续生效、照旧可以采纳，只是未必仍是最合适的，所以在题卡上提示复核。
+  // 已采纳的不再提示——那道题的目录已经按这条结论处理过了。
+  function needsDirectoryReview(result) {
+    return Boolean(result && !result.accepted && result.manual_override?.directory_changed);
+  }
+
+  // 导入归类结果时要不要保下已有人工修正。判据在服务端（目标目录在当前目录里还
+  // 解析得到，就算仍然成立），这里只把选择传过去；默认保留，免得人工动手改过的
+  // 结论被批处理无声覆盖。
+  function skillImportBody(text, keepManual) {
+    return { jsonl: text, preserve_manual_decisions: Boolean(keepManual) };
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
-      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, CLASSIFICATION_JOB_MAX_QUESTIONS,
+      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, needsDirectoryReview, skillImportBody, CLASSIFICATION_JOB_MAX_QUESTIONS,
     };
     return;
   }
@@ -710,6 +724,9 @@
       .confirm-dialog { width: min(352px, calc(100vw - 36px)); padding: 18px; border: 1px solid #d7e1dd; border-radius: 16px; background: #fff; box-shadow: 0 22px 56px rgb(19 49 41 / .26); }
       .confirm-dialog h3 { margin: 0; color: #29453d; font-size: 16px; letter-spacing: -.02em; }
       .confirm-dialog p { margin: 8px 0 0; color: #526660; font-size: 13px; }
+      .confirm-checkbox[hidden] { display: none; }
+      .confirm-checkbox { display: flex; align-items: flex-start; gap: 7px; margin-top: 12px; color: #526660; font-size: 12px; line-height: 1.5; cursor: pointer; }
+      .confirm-checkbox input { flex: 0 0 auto; margin: 2px 0 0; }
       .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
       .danger { border-color: #b43c35; background: #b43c35; color: #fff; font-weight: 650; }
       .danger:hover { border-color: #8f2f2a; background: #8f2f2a; }
@@ -761,6 +778,7 @@
         <div class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
           <h3 id="confirm-title">确认操作</h3>
           <p id="confirm-message"></p>
+          <label class="confirm-checkbox" hidden><input type="checkbox" /><span></span></label>
           <div class="confirm-actions"><button class="confirm-cancel" type="button">取消</button><button class="confirm-accept danger" type="button">确认清除</button></div>
         </div>
       </section>
@@ -772,7 +790,7 @@
      cloudProfileSelect: shadow.querySelector('.cloud-profile-select'), cloudProfileName: shadow.querySelector('.cloud-profile-name'), profileTabs: shadow.querySelector('.profile-tabs'), createCloudProfile: shadow.querySelector('.create-cloud-profile'), cloudModelControl: shadow.querySelector('.cloud-model-control'), routingModelControl: shadow.querySelector('.routing-model-control'), cloudModel: null, routingModel: null, classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudProtocol: shadow.querySelector('.cloud-protocol'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), requestCompatibility: shadow.querySelector('.request-compatibility'), customHeaders: shadow.querySelector('.custom-headers'), customHeaderStatus: shadow.querySelector('.custom-header-status'), clearCustomHeaders: shadow.querySelector('.clear-custom-headers'), testCloudConnection: shadow.querySelector('.test-cloud-connection'), connectionTestStatus: shadow.querySelector('.connection-test-status'), saveCloud: shadow.querySelector('.save-cloud'),
     cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), classifyFocus: shadow.querySelector('.classify-focus'), restoreFocus: shadow.querySelector('.restore-focus'), exportAllQuestions: shadow.querySelector('.export-all-questions'), skillImport: shadow.querySelector('.import-skill-results'), skillImportFile: shadow.querySelector('.import-skill-results-file'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), historyDateRange: shadow.querySelector('.history-date-range'), historyDateSheet: shadow.querySelector('.history-date-sheet'), historyDateBackdrop: shadow.querySelector('.history-date-backdrop'), historyMonthPrev: shadow.querySelector('.history-month-prev'), historyMonthNext: shadow.querySelector('.history-month-next'), historyMonthTitle: shadow.querySelector('.history-month-title'), historyCalendarGrid: shadow.querySelector('.history-calendar-grid'), historyDateHint: shadow.querySelector('.history-date-hint'), exportHistory: shadow.querySelector('.export-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
     legend: shadow.querySelector('.legend'), legendList: shadow.querySelector('.legend ul'),
-    confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'),
+    confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'), confirmCheckbox: shadow.querySelector('.confirm-checkbox'), confirmCheckboxInput: shadow.querySelector('.confirm-checkbox input'), confirmCheckboxLabel: shadow.querySelector('.confirm-checkbox span'),
   };
 
   function setOpen(open) {
@@ -875,18 +893,28 @@
     renderAvailableModels(profileId);
   }
 
-  function confirmAction({ title, message, confirmLabel = '确认', destructive = false }) {
+  // checkbox 传入一个对象（{ label, checked }）时，正文下方多一个勾选项；用户的选择
+  // 会就地写回该对象的 checked，调用方按需读取。返回值仍是「确认/取消」的布尔值，
+  // 所以其余调用点不受影响。
+  function confirmAction({ title, message, confirmLabel = '确认', destructive = false, checkbox = null }) {
     if (state.confirmation) return Promise.resolve(false);
     const previousFocus = shadow.activeElement || document.activeElement;
     elements.confirmTitle.textContent = title;
     elements.confirmMessage.textContent = message;
     elements.confirmAccept.textContent = confirmLabel;
     elements.confirmAccept.classList.toggle('danger', destructive);
+    if (checkbox) {
+      elements.confirmCheckbox.hidden = false;
+      elements.confirmCheckboxLabel.textContent = checkbox.label;
+      elements.confirmCheckboxInput.checked = Boolean(checkbox.checked);
+    } else {
+      elements.confirmCheckbox.hidden = true;
+    }
     elements.confirmOverlay.hidden = false;
     elements.confirmOverlay.setAttribute('aria-hidden', 'false');
     elements.confirmAccept.focus({ preventScroll: true });
     return new Promise(resolve => {
-      state.confirmation = { resolve, previousFocus };
+      state.confirmation = { resolve, previousFocus, checkbox };
     });
   }
 
@@ -894,6 +922,7 @@
     const confirmation = state.confirmation;
     if (!confirmation) return;
     state.confirmation = null;
+    if (confirmation.checkbox) confirmation.checkbox.checked = elements.confirmCheckboxInput.checked;
     elements.confirmOverlay.hidden = true;
     elements.confirmOverlay.setAttribute('aria-hidden', 'true');
     if (confirmation.previousFocus?.focus) confirmation.previousFocus.focus({ preventScroll: true });
@@ -2010,12 +2039,20 @@
         return;
       }
       const skipped = (preview.failed || []).length;
+      // 要不要保下已有人工修正，判据在服务端（目标目录在当前目录里还解析得到，就算
+      // 仍然成立），这里只把选择传过去。默认勾上：人工动手改过的，不该被批处理无声
+      // 无息地覆盖掉。
+      const keepManual = {
+        label: '保留已有手工修正（目标目录仍在的人工结论不被覆盖）',
+        checked: true,
+      };
       const confirmed = await confirmAction({
         title: '导入归类结果',
         message: `《${file.name}》共 ${preview.received} 条，可归位 ${preview.resolved} 道题`
           + `${skipped ? `，另有 ${skipped} 条编号对不上会被跳过${skillImportFailureNote(preview)}` : ''}`
           + '。导入后这些题目会显示为「Skill 归类」建议，点采纳时才会写入题湖。',
         confirmLabel: '确认导入',
+        checkbox: keepManual,
       });
       if (!confirmed) {
         setStatus('已取消导入归类结果。');
@@ -2023,7 +2060,7 @@
       }
       setStatus('正在导入归类结果…');
       const report = await request(
-        'POST', '/api/v1/skill-classifications', { jsonl: text },
+        'POST', '/api/v1/skill-classifications', skillImportBody(text, keepManual.checked),
         { timeoutMs: SKILL_IMPORT_TIMEOUT_MS },
       );
       const failures = (report.failed || []).length;
@@ -2254,6 +2291,16 @@
       ? (completionState === 'moved' ? '已移动' : (completionState === 'directory_consistent' ? '目录已一致' : (completionState === 'at_target' ? '已归位' : (isLocalAcceptance ? '已本地采纳' : (isManual ? '人工已采纳' : '已采纳')))))
       : (isLocalAcceptance ? '当前目录无需调整' : (isManual ? '人工修改' : (isSkill ? 'Skill 归类' : (result.status === 'review' ? '待复核' : '建议分类'))));
     header.append(anchor, title);
+    // 人工结论定稿之后，它所在的专题又调整过目录，但目标目录仍在。结论继续生效、
+    // 照旧可以采纳，只是未必仍是最合适的，所以加一个提示让人自己决定要不要重看。
+    // 已采纳的不再提示——采纳过的题，目录已经按这条结论处理过了。
+    if (needsDirectoryReview(result)) {
+      const flag = document.createElement('span');
+      flag.className = 'badge-flag';
+      flag.textContent = '目录已调整 · 建议复核';
+      flag.title = '这条结论定稿之后，它所在的专题又调整过目录。目标目录还在，结论继续有效，但未必仍是最合适的。';
+      header.append(flag);
+    }
 
     const path = document.createElement('button');
     path.type = 'button';
@@ -2492,6 +2539,7 @@
       .${BADGE_CLASS} .badge-header { grid-area: header; display: flex; min-width: 0; align-items: center; gap: 7px; }
       .${BADGE_CLASS} .badge-anchor { display: inline-flex; flex: 0 0 auto; align-items: center; min-height: 21px; padding: 2px 7px; border: 1px solid currentColor; border-radius: 999px; font-size: 11px; font-weight: 700; line-height: 1; }
       .${BADGE_CLASS} strong { min-width: 0; font-size: 13px; }
+      .${BADGE_CLASS} .badge-flag { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 21px; padding: 2px 7px; border: 1px solid #d3a54a; border-radius: 999px; background: #fdf4e0; color: #7a5410; font-size: 11px; font-weight: 600; line-height: 1; white-space: nowrap; }
       .${BADGE_CLASS} .badge-path { grid-area: path; overflow-wrap: anywhere; color: #36564d; font-weight: 600; }
       .${BADGE_CLASS} .badge-path-edit { width: fit-content; max-width: 100%; min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
       .${BADGE_CLASS} .badge-path-edit:hover { background: transparent; color: #126b5c; text-decoration: underline; text-underline-offset: 3px; }

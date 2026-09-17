@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class ResultCache:
@@ -300,8 +300,12 @@ class ResultCache:
             raise RuntimeError("人工修正保存后无法读取")
         return overrides[0]
 
-    def _manual_rows_by_key(self, exercise_ids: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
-        """批量读取现有归类记录，供导入报告如实区分新增与覆盖。"""
+    def _existing_manual_rows(self, exercise_ids: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
+        """批量读取同键的现有归类记录，供导入报告如实区分新增与覆盖。
+
+        一并取回目标路径：调用方要按「目标目录在当前目录里还解析不解析得到」决定
+        要不要保下人工决策，这跟读取层用的是同一把尺子。
+        """
         existing: dict[tuple[str, str], dict[str, Any]] = {}
         unique_ids = sorted({str(item).strip() for item in exercise_ids if str(item).strip()})
         # SQLite 的变量上限按编译参数而定，分块查询避免上千题导入时越界。
@@ -310,35 +314,42 @@ class ResultCache:
             placeholders = ",".join("?" for _ in chunk)
             rows = self._connection.execute(
                 f"""
-                SELECT exercise_id, source_catalogue_id, source, taxonomy_version
+                SELECT exercise_id, source_catalogue_id, source, taxonomy_version, target_path_json
                 FROM {self._MANUAL_TABLE}
                 WHERE exercise_id IN ({placeholders})
                 """,
                 chunk,
             ).fetchall()
-            for exercise_id, source_catalogue_id, source, taxonomy_version in rows:
+            for exercise_id, source_catalogue_id, source, taxonomy_version, target_path_json in rows:
                 existing[(str(exercise_id), str(source_catalogue_id))] = {
                     "source": str(source or "manual"),
                     "taxonomy_version": str(taxonomy_version or ""),
+                    "target_path": json.loads(target_path_json),
                 }
         return existing
 
     def put_skill_classifications(
-        self, rows: list[dict[str, Any]], *, preserve_manual_decisions: bool = False
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        keep_manual_decision: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, int]:
         """批量写入目录整理 Skill 的归类结果。
 
         结果与人工修正在同一张表保存，靠 ``source`` 区分来源，因此审计语义不失真。
         每条写入都追加审计事件，便于事后核对某次导入到底改动了哪些题。
 
-        覆盖规则由 ``preserve_manual_decisions`` 决定：仅在为 True 时，同一 ``taxonomy_version``
-        内已标记为 ``manual`` 的记录才会被跳过（计入 ``skipped_manual_decisions``）。默认 False
-        意味着批量结果直接覆盖同键记录，并把 ``source`` 改写成 ``skill``。
+        ``keep_manual_decision`` 决定要不要保下已有人工决策：只对 ``source='manual'``
+        的现存同键记录求值，返回 True 才跳过（计入 ``skipped_manual_decisions``）。
+        判定权交给调用方，是因为「旧结论还算不算数」要用当前目录来判断，而这是它
+        才拿得到的东西——这样导入时的保留判据与读取层完全一致，不会出现「界面上
+        还显示着人工结论，下次导入却把它覆盖了」。默认 None 表示不做保护：同键记录
+        被批量结果直接覆盖，``source`` 改写成 ``skill``。
         """
         if not rows:
             return {"inserted": 0, "updated": 0, "skipped_manual_decisions": 0}
         with self._lock:
-            previous = self._manual_rows_by_key([str(row["exercise_id"]) for row in rows])
+            previous = self._existing_manual_rows([str(row["exercise_id"]) for row in rows])
             inserted = updated = skipped = 0
             for row in rows:
                 exercise_id = str(row["exercise_id"])
@@ -346,10 +357,10 @@ class ResultCache:
                 taxonomy_version = str(row["taxonomy_version"])
                 known = previous.get((exercise_id, source_catalogue_id))
                 if (
-                    preserve_manual_decisions
+                    keep_manual_decision is not None
                     and known
                     and known["source"] == "manual"
-                    and known["taxonomy_version"] == taxonomy_version
+                    and keep_manual_decision(known)
                 ):
                     skipped += 1
                     continue

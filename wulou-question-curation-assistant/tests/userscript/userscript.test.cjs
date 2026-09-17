@@ -32,6 +32,8 @@ const {
   acceptAllActionMode,
   manualSelectionPayload,
   historyRangePreviewEnd,
+  needsDirectoryReview,
+  skillImportBody,
   CLASSIFICATION_JOB_MAX_QUESTIONS,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
@@ -393,4 +395,24 @@ test('目录移动请求会以建议目录覆盖所有同名旧值', () => {
   ] }, '760476014');
   assert.equal(params.get('exercise_id'), '2508900');
   assert.deepEqual(params.getAll('exercise_catalogue_id'), ['760476014']);
+});
+
+test('只对仍然成立、且目录变动后尚未采纳的结论提示复核', () => {
+  const stale = { source: 'manual', directory_changed: true };
+  assert.equal(needsDirectoryReview({ manual_override: stale }), true);
+  // Skill 归档与人工采纳共用同一套判定，来源不影响是否提示。
+  assert.equal(needsDirectoryReview({ manual_override: { source: 'skill', directory_changed: true } }), true);
+  assert.equal(needsDirectoryReview({ manual_override: { source: 'manual', directory_changed: false } }), false);
+  // 已采纳的题不再提示：它已经按这条结论处理过了。
+  assert.equal(needsDirectoryReview({ manual_override: stale, accepted: true }), false);
+  // 模型建议没有人工结论，也就没有“陈旧”一说。
+  assert.equal(needsDirectoryReview({ target: { path: ['专题1：实数'] } }), false);
+  assert.equal(needsDirectoryReview(null), false);
+});
+
+test('导入归类结果的请求体带上保留人工修正的选择', () => {
+  assert.equal(skillImportBody('{"items":[]}', true).preserve_manual_decisions, true);
+  assert.equal(skillImportBody('{"items":[]}', false).preserve_manual_decisions, false);
+  assert.equal(skillImportBody('{"items":[]}', undefined).preserve_manual_decisions, false);
+  assert.equal(skillImportBody('逐行 JSONL', true).jsonl, '逐行 JSONL');
 });
