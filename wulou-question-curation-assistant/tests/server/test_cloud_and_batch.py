@@ -3,14 +3,22 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 import sys
+from typing import Any
+from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from server.batch_jobs import BatchStore
-from server.providers.openai_responses import CloudProviderError, OpenAIChatCompletionsProvider
+from server.providers.openai_responses import (
+    CloudProviderError,
+    OpenAIChatCompletionsProvider,
+    _TransientCloudError,
+)
 from server.taxonomy import Taxonomy
 
 
@@ -423,6 +431,135 @@ class CloudAndBatchTests(unittest.TestCase):
                 self.assertEqual(store.input_bytes(job["job_id"]), b'{"x":1}\n')
             finally:
                 store.close()
+
+
+class _FakeResponse:
+    """最小化的 urlopen 响应替身，只实现 ``_send_once`` 用到的读取接口。"""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *args: Any) -> bool:
+        return False
+
+
+class CloudRequestRetryTests(unittest.TestCase):
+    """瞬时故障重发：网关没受理的失败要重发，已经受理的读超时不许重发。"""
+
+    def setUp(self) -> None:
+        # 密钥检查发生在网络调用之前，这里给一个假密钥，好让用例走到传输层。
+        self.provider = OpenAIChatCompletionsProvider({"model": "test-model", "api_key": "test-key"})
+
+    def _scripted_sender(self, outcomes: list[Any]) -> tuple[Any, list[str]]:
+        """按顺序重放结果或异常并记录每次尝试；用尽之后重复最后一项。"""
+        calls: list[str] = []
+
+        def send(method, path, payload=None, extra_headers=None, raw=False, timeout_seconds=None):  # type: ignore[no-untyped-def]
+            calls.append(path)
+            outcome = outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return send, calls
+
+    def test_gateway_overload_is_retried_until_it_succeeds(self) -> None:
+        send, calls = self._scripted_sender([_TransientCloudError("云端模型返回 HTTP 502"), {"results": []}])
+        self.provider._send_once = send  # type: ignore[method-assign]
+        with patch("server.providers.openai_responses.time.sleep") as sleep:
+            self.assertEqual(self.provider._request("POST", "/responses", {"x": 1}), {"results": []})
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once()
+
+    def test_exhausted_retries_report_the_attempt_count(self) -> None:
+        send, calls = self._scripted_sender([_TransientCloudError("云端模型返回 HTTP 503")])
+        self.provider._send_once = send  # type: ignore[method-assign]
+        with patch("server.providers.openai_responses.time.sleep"):
+            with self.assertRaises(CloudProviderError) as caught:
+                self.provider._request("POST", "/responses", {"x": 1})
+        self.assertEqual(len(calls), 3)
+        self.assertIn("HTTP 503", str(caught.exception))
+        self.assertIn("已尝试 3 次", str(caught.exception))
+
+    def test_configured_attempt_count_is_respected(self) -> None:
+        provider = OpenAIChatCompletionsProvider({"model": "test-model", "retry_attempts": 2})
+        send, calls = self._scripted_sender([_TransientCloudError("无法连接云端模型")])
+        provider._send_once = send  # type: ignore[method-assign]
+        with patch("server.providers.openai_responses.time.sleep"):
+            with self.assertRaises(CloudProviderError):
+                provider._request("GET", "/models", None)
+        self.assertEqual(len(calls), 2)
+
+    def test_invalid_attempt_count_is_rejected_at_startup(self) -> None:
+        for value in (0, 6, "many"):
+            with self.assertRaises(ValueError):
+                OpenAIChatCompletionsProvider({"model": "test-model", "retry_attempts": value})
+
+    def test_read_timeout_is_never_retried(self) -> None:
+        """请求已送达上游：重发会重复计费，还得让用户再等一个完整超时周期。"""
+        calls: list[str] = []
+
+        def fake_urlopen(request, timeout=None):  # type: ignore[no-untyped-def]
+            calls.append(request.full_url)
+            raise TimeoutError("timed out")
+
+        with patch("server.providers.openai_responses.urlopen", fake_urlopen):
+            with patch("server.providers.openai_responses.time.sleep") as sleep:
+                with self.assertRaises(CloudProviderError) as caught:
+                    self.provider._request("GET", "/models", None)
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+        self.assertIn("未响应", str(caught.exception))
+
+    def test_transport_failures_are_classified_for_retry(self) -> None:
+        """网关过载、限流与连接失败可重发；鉴权、参数一类的 4xx 不重发。"""
+        def status_error(code: int) -> HTTPError:
+            return HTTPError("https://api.example.test/v1/responses", code, "boom", {}, BytesIO(b"{}"))
+
+        with patch("server.providers.openai_responses.urlopen", side_effect=URLError("connection refused")):
+            with self.assertRaises(_TransientCloudError):
+                self.provider._send_once("POST", "/responses", {"x": 1}, None, False, None)
+        for code in (408, 409, 425, 429, 500, 502, 503, 504):
+            with patch("server.providers.openai_responses.urlopen", side_effect=status_error(code)):
+                with self.assertRaises(_TransientCloudError):
+                    self.provider._send_once("POST", "/responses", {"x": 1}, None, False, None)
+        for code in (400, 401, 403, 404, 413, 422):
+            with patch("server.providers.openai_responses.urlopen", side_effect=status_error(code)):
+                with self.assertRaises(CloudProviderError) as caught:
+                    self.provider._send_once("POST", "/responses", {"x": 1}, None, False, None)
+                self.assertNotIsInstance(caught.exception, _TransientCloudError)
+
+    def test_batch_creation_is_never_resent(self) -> None:
+        """批任务没有幂等键：网关抖一下不能让同一批题目被提交两次。"""
+        send, calls = self._scripted_sender([{"id": "file-1"}, _TransientCloudError("云端模型返回 HTTP 503")])
+        self.provider._send_once = send  # type: ignore[method-assign]
+        with patch("server.providers.openai_responses.time.sleep") as sleep:
+            with self.assertRaises(CloudProviderError):
+                self.provider.submit_batch(b'{"custom_id":"a","method":"POST","url":"/v1/responses","body":{}}\n')
+        self.assertEqual(calls, ["/files", "/batches"])
+        sleep.assert_not_called()
+
+    def test_connection_test_rides_out_a_gateway_blip(self) -> None:
+        """连接测试若因一次网关抖动就报失败，用户会误以为自己配置写错了。"""
+        calls: list[str] = []
+
+        def fake_urlopen(request, timeout=None):  # type: ignore[no-untyped-def]
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise URLError("connection reset")
+            return _FakeResponse(b'{"data": [{"id": "test-model"}]}')
+
+        with patch("server.providers.openai_responses.urlopen", fake_urlopen):
+            with patch("server.providers.openai_responses.time.sleep"):
+                result = self.provider.test_connection()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["models"], ["test-model"])
 
 
 if __name__ == "__main__": unittest.main()

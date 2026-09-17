@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,8 +26,25 @@ except ImportError:  # 支持直接运行 server/main.py。
     from model_input import build_model_input_snapshot
 
 
+# 网关过载、限流、上游暂时不可用都属于瞬时故障：请求没有被受理，重发同一个
+# 请求是安全的。其余 4xx（鉴权、参数、路径）重发只会重复失败，因此不在此列。
+RETRYABLE_HTTP_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+DEFAULT_RETRY_ATTEMPTS = 3
+# 首次退避 1.5 秒，随后 3 秒；再叠加一点抖动，避免并发批次同时重发再次撞上限流。
+RETRY_BACKOFF_SECONDS = 1.5
+RETRY_JITTER_SECONDS = 0.4
+
+
 class CloudProviderError(RuntimeError):
     """云端模型请求无法安全完成。"""
+
+
+class _TransientCloudError(CloudProviderError):
+    """一次请求失败，但失败点在网关受理之前，重发同一个请求是安全的。
+
+    刻意与「读超时」区分开：超时说明请求已被上游受理，重发既可能重复计费，
+    又会让调用方再干等一个完整超时周期，所以超时不走重发。
+    """
 
 
 class OpenAIChatCompletionsProvider:
@@ -66,6 +85,15 @@ class OpenAIChatCompletionsProvider:
         # 这是网络失联保护，不是页面分类的业务时限。兼容旧配置的 180 秒也提升到 600 秒，
         # 防止上游已经完成但本机先断开并重复计费。
         self.timeout_seconds = max(600, int(settings.get("timeout_seconds", 600)))
+        # 单次 HTTP 请求的尝试次数（含首次）。只兜瞬时故障，与作业层「把失败批次
+        # 标为待人工复核」互补：这里管网关抽一下，那里管确实算不出来的批次。
+        try:
+            configured_attempts = int(settings.get("retry_attempts", DEFAULT_RETRY_ATTEMPTS))
+        except (TypeError, ValueError) as error:
+            raise ValueError("pipeline.retry_attempts 必须是 1 到 5") from error
+        if not 1 <= configured_attempts <= 5:
+            raise ValueError("pipeline.retry_attempts 必须是 1 到 5")
+        self.retry_attempts = configured_attempts
         if not self.model and not self.allow_empty_model:
             raise ValueError("cloud.model 不能为空")
         if self.protocol not in self.PROTOCOLS:
@@ -757,6 +785,13 @@ class OpenAIChatCompletionsProvider:
         return "\n".join(lines) + ("\n" if lines else "")
 
     def submit_batch(self, jsonl_bytes: bytes) -> dict[str, Any]:
+        """向供应商提交批任务；这条创建路径不做重发。
+
+        批任务没有幂等键：重发一次就可能得到两份并行跑完全部题目的台账，费用翻倍。
+        因此这里的两次写调用都显式 ``retry_attempts=1``。失败时用户重新提交即可，
+        代价是看得见的（对比之下，实时分类请求重发最多多花一次的钱，而且能直接
+        救回一个本来会废掉的批次，所以那条路径保持重发）。
+        """
         if self.protocol == "anthropic_messages":
             try:
                 requests = [json.loads(line) for line in jsonl_bytes.decode("utf-8").splitlines() if line.strip()]
@@ -764,16 +799,18 @@ class OpenAIChatCompletionsProvider:
                 raise CloudProviderError("Claude 批处理本地任务文件无效") from error
             if not requests or any(not isinstance(item, dict) or not isinstance(item.get("params"), dict) for item in requests):
                 raise CloudProviderError("Claude 批处理本地任务内容无效")
-            return self._normalize_anthropic_batch(self._request("POST", "/messages/batches", {"requests": requests}))
+            return self._normalize_anthropic_batch(self._request(
+                "POST", "/messages/batches", {"requests": requests}, retry_attempts=1
+            ))
         boundary = f"----wulou{uuid.uuid4().hex}"
         chunks = [
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n".encode(),
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"classification.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n".encode(),
             jsonl_bytes, f"\r\n--{boundary}--\r\n".encode(),
         ]
-        file_info = self._request("POST", "/files", b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        file_info = self._request("POST", "/files", b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={boundary}"}, retry_attempts=1)
         endpoint = "/v1/responses" if self.protocol == "responses" else "/v1/chat/completions"
-        return self._request("POST", "/batches", {"input_file_id": file_info["id"], "endpoint": endpoint, "completion_window": "24h"})
+        return self._request("POST", "/batches", {"input_file_id": file_info["id"], "endpoint": endpoint, "completion_window": "24h"}, retry_attempts=1)
 
     def get_batch(self, provider_batch_id: str) -> dict[str, Any]:
         if self.protocol == "anthropic_messages":
@@ -842,7 +879,36 @@ class OpenAIChatCompletionsProvider:
         extra_headers: dict[str, str] | None = None,
         raw: bool = False,
         timeout_seconds: int | None = None,
+        retry_attempts: int | None = None,
     ) -> Any:
+        """发送一次云端请求；瞬时故障按指数退避重发。
+
+        默认使用配置里的 ``retry_attempts``。没有幂等键、重复提交会重复计费的写
+        操作（创建批任务）必须显式传 ``retry_attempts=1``，否则网关抖一下就可能让
+        同一批题目被提交两次并重复计费。
+        """
+        attempts = self.retry_attempts if retry_attempts is None else max(1, int(retry_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._send_once(method, path, payload, extra_headers, raw, timeout_seconds)
+            except _TransientCloudError as error:
+                if attempt >= attempts:
+                    # 重试耗尽后转成普通错误：调用方看到的仍是「这次请求失败」，但多一句
+                    # 尝试次数，用户能据此分辨是网关持续异常而不是自己配置写错了。
+                    raise CloudProviderError(f"{error}（已尝试 {attempts} 次）") from error
+                time.sleep(RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER_SECONDS))
+        raise AssertionError("重试循环不可能既没有返回结果也没有抛出异常")
+
+    def _send_once(
+        self,
+        method: str,
+        path: str,
+        payload: Any,
+        extra_headers: dict[str, str] | None,
+        raw: bool,
+        timeout_seconds: int | None,
+    ) -> Any:
+        """发出单个 HTTP 请求，把传输层失败分成「可重发」和「不可重发」两类。"""
         key = self.api_key or os.environ.get(self.api_key_env)
         if not key:
             raise CloudProviderError(f"未设置环境变量 {self.api_key_env}")
@@ -861,10 +927,16 @@ class OpenAIChatCompletionsProvider:
             # 只回显网关返回的错误摘要，不回显请求内容或密钥。
             detail = self._http_error_detail(error)
             suffix = f"：{detail}" if detail else ""
-            raise CloudProviderError(f"云端模型返回 HTTP {error.code}{suffix}") from error
+            message = f"云端模型返回 HTTP {error.code}{suffix}"
+            if error.code in RETRYABLE_HTTP_STATUS:
+                raise _TransientCloudError(message) from error
+            raise CloudProviderError(message) from error
         except URLError as error:
-            raise CloudProviderError("无法连接云端模型") from error
+            # 连接根本没建立起来（或对端在响应前断开），网关没有受理请求。
+            raise _TransientCloudError("无法连接云端模型") from error
         except TimeoutError as error:
+            # 读超时说明请求已经送达上游：重发会重复计费，还要让用户再等一个完整
+            # 超时周期，所以这里刻意不重发，交给作业层把该批标为待人工复核。
             limit = timeout_seconds or self.timeout_seconds
             raise CloudProviderError(f"云端模型在 {limit} 秒内未响应") from error
         if raw:

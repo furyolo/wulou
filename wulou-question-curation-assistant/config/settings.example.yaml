@@ -20,6 +20,7 @@ classifier:
   # pipeline:  # 所有模型方案共享的处理速度与任务编排设置。
   #   max_concurrent_requests: 3
   #   timeout_seconds: 600
+  #   retry_attempts: 3  # 单个请求遇到网关过载/限流/连接失败时的尝试次数（1 到 5；读超时不重发）
   # cloud_profiles:
   #   active_id: gpt
   #   profiles:

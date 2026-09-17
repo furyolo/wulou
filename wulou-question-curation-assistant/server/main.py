@@ -77,7 +77,7 @@ CLOUD_PROFILE_FIELDS = (
 )
 PROTECTED_REQUEST_HEADERS = {"authorization", "x-api-key", "content-type", "host", "content-length"}
 PIPELINE_FIELDS = (
-    "max_concurrent_requests", "timeout_seconds",
+    "max_concurrent_requests", "timeout_seconds", "retry_attempts",
 )
 
 
