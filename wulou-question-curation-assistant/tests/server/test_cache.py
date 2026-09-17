@@ -76,13 +76,13 @@ class ResultCacheTests(unittest.TestCase):
                 target_path=["专题1：实数", "【大题】", "分母有理化"],
             )
 
-            override = cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v1")
-            self.assertIsNotNone(override)
-            self.assertEqual(override["target_path"][-1], "分母有理化")
+            overrides = cache.get_manual_overrides("exercise-1", "level4-a")
+            self.assertTrue(overrides)
+            self.assertEqual(overrides[0]["target_path"][-1], "分母有理化")
             # 移到人工指定的目标叶子后，目录 ID 已变化，仍要恢复人工终态。
-            moved_override = cache.get_manual_override("exercise-1", "level4-target", "taxonomy-v1")
-            self.assertIsNotNone(moved_override)
-            self.assertEqual(moved_override["target_path"][-1], "分母有理化")
+            moved_overrides = cache.get_manual_overrides("exercise-1", "level4-target")
+            self.assertTrue(moved_overrides)
+            self.assertEqual(moved_overrides[0]["target_path"][-1], "分母有理化")
             self.assertEqual(
                 cache._connection.execute("SELECT COUNT(*) FROM manual_classification_audit").fetchone()[0], 1
             )
@@ -90,11 +90,12 @@ class ResultCacheTests(unittest.TestCase):
                 cache._connection.execute("SELECT COUNT(*) FROM classification_results").fetchone()[0], 0
             )
             self.assertEqual(cache.delete_by_exercise_ids(["exercise-1"]), 0)
-            self.assertIsNotNone(cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v1"))
-            self.assertIsNone(cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v2"))
+            # 目录版本号变化不再直接作废记录：读取一律返回候选，是否仍然成立改由
+            # 上层按“目标路径能否在当前目录里解析”判定（见 ServiceState）。
+            self.assertTrue(cache.get_manual_overrides("exercise-1", "level4-a"))
             cache.close()
 
-    def test_legacy_manual_override_without_a_taxonomy_version_is_retained_but_not_reused(self) -> None:
+    def test_legacy_manual_override_without_a_taxonomy_version_is_still_readable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.sqlite3"
             connection = sqlite3.connect(path)
@@ -129,7 +130,11 @@ class ResultCacheTests(unittest.TestCase):
             self.assertEqual(
                 cache._connection.execute("SELECT COUNT(*) FROM manual_classification_overrides").fetchone()[0], 1
             )
-            self.assertIsNone(cache.get_manual_override("exercise-1", "level4-a", "taxonomy-v2"))
+            # 旧表结构缺 source/taxonomy_version 列，仍要能读出来并默认成人工来源；
+            # 它那条 ["人工旧目录"] 只有一级，会在上层解析时被判为失效而丢弃。
+            legacy = cache.get_manual_overrides("exercise-1", "level4-a")
+            self.assertEqual(len(legacy), 1)
+            self.assertEqual(legacy[0]["source"], "manual")
             cache.close()
 
     def test_catalogue_move_report_keeps_only_latest_move_per_question(self) -> None:

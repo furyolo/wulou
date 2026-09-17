@@ -31,6 +31,14 @@ class Target:
     include_keywords: tuple[str, ...] = ()
     exclude_keywords: tuple[str, ...] = ()
 
+    @property
+    def published_path(self) -> list[str]:
+        """题湖目录树里的标题路径：专题 → 二级 → 三级（→ 四级）。"""
+        path = [self.topic_title, self.level2_title, self.level3_title]
+        if self.level4_title:
+            path.append(self.level4_title)
+        return path
+
 
 class Taxonomy:
     def __init__(self, raw: dict[str, Any]) -> None:
@@ -249,8 +257,55 @@ class Taxonomy:
                 return candidate
         return None
 
+    def resolve_published_path(self, path: list[str]) -> Target | None:
+        """按标题路径反查它在当前目录里的落点。
+
+        这是判断旧分类结论是否仍然成立依据：目录被改名、移位或被撤销时解析不到。
+        三级路径只在"该三级没有四级子节点"时成立，所以原结论落在三级、而该三级
+        后来被细分出四级的情形会自然失效。同名路径不唯一时不擅自挑一个，一律返回
+        None，交由上层要求重新确认而不是猜。
+        """
+        segments = [str(segment) for segment in path]
+        if len(segments) not in (3, 4):
+            return None
+        level4_title = segments[3] if len(segments) == 4 else None
+        matches = [
+            target for target in self._targets
+            if target.topic_title == segments[0]
+            and target.level2_title == segments[1]
+            and target.level3_title == segments[2]
+            and target.level4_title == level4_title
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def global_target(self, level3_id: str, level4_id: str | None) -> Target | None:
         return self.target(level3_id, level4_id, None, None)
+
+    def resolve_knowledge_point_id(self, knowledge_point_id: str) -> tuple[Target | None, str | None]:
+        """按 Excel E 列知识点编号反查唯一末级目录。
+
+        编号是本机与外部 Skill 之间唯一稳定的对齐键：本地目录 ID 由 Excel 行号
+        推导，外部无法预知；知识编号写在单元格里，双方都能读到。
+
+        返回 ``(target, 错误说明)``，两者必有其一为空。父三级已有编号时不得再细分
+        四级目录，与分类器和目录整理 Skill 的编号兼容性规则保持一致。
+        """
+        code = str(knowledge_point_id or "").strip()
+        if not code:
+            return None, "缺少知识点编号"
+        level4_hits = [item for item in self._targets if item.level4_knowledge_point_id == code]
+        if len(level4_hits) > 1:
+            return None, f"知识点编号在多个四级目录中重复：{code}"
+        if level4_hits:
+            return level4_hits[0], None
+        level3_hits = [item for item in self._targets if item.level3_knowledge_point_id == code]
+        if not level3_hits:
+            return None, f"当前目录版本中没有该知识点编号：{code}"
+        if len({item.level3_id for item in level3_hits}) > 1:
+            return None, f"知识点编号在多个三级目录中重复：{code}"
+        if any(item.level4_id for item in level3_hits):
+            return None, f"父三级目录已分配知识点编号，不能再细分四级目录：{code}"
+        return level3_hits[0], None
 
     def summary(self) -> dict[str, Any]:
         return {"taxonomy_version": self.version, "topics": self.raw.get("topics", [])}

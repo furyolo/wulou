@@ -19,11 +19,6 @@ classifier:
   # 要启用云端分类时，将 mode 改为 cloud_hybrid，并至少配置一个模型方案。
   # pipeline:  # 所有模型方案共享的处理速度与任务编排设置。
   #   max_concurrent_requests: 3
-  #   directory_reasoning_effort: low
-  #   directory_batch_size: 60
-  #   directory_concurrency: 5
-  #   directory_retry_attempts: 3
-  #   directory_request_timeout_seconds: 90
   #   timeout_seconds: 600
   # cloud_profiles:
   #   active_id: gpt

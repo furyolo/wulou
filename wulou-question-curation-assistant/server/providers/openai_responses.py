@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,14 +63,6 @@ class OpenAIChatCompletionsProvider:
             if str(name).strip() and str(value).strip()
         } if isinstance(configured_headers, dict) else {}
         self.reasoning_effort = str(settings.get("reasoning_effort", "high")).strip().lower()
-        # 目录方案是粗粒度结构设计：先并发提取短题目特征，再一次性综合，不能沿用逐题精分的高推理配置。
-        self.directory_reasoning_effort = str(settings.get("directory_reasoning_effort", "low")).strip().lower()
-        self.directory_batch_size = int(settings.get("directory_batch_size", 60))
-        self.directory_concurrency = int(settings.get("directory_concurrency", 5))
-        self.directory_retry_attempts = int(settings.get("directory_retry_attempts", 3))
-        # 目录方案的单个模型请求正常应在一分钟左右完成。比通用分类的 600 秒
-        # 更短的超时可避免网关无响应时让整个方案长期停在“推理中”。
-        self.directory_request_timeout_seconds = int(settings.get("directory_request_timeout_seconds", 90))
         # 这是网络失联保护，不是页面分类的业务时限。兼容旧配置的 180 秒也提升到 600 秒，
         # 防止上游已经完成但本机先断开并重复计费。
         self.timeout_seconds = max(600, int(settings.get("timeout_seconds", 600)))
@@ -82,16 +73,6 @@ class OpenAIChatCompletionsProvider:
         self.provider_name = self.protocol
         if self.reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("cloud.reasoning_effort 必须是 none、low、medium、high、xhigh 或 max")
-        if self.directory_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
-            raise ValueError("cloud.directory_reasoning_effort 必须是 none、low、medium、high、xhigh 或 max")
-        if not 20 <= self.directory_batch_size <= 100:
-            raise ValueError("cloud.directory_batch_size 必须是 20 到 100")
-        if not 1 <= self.directory_concurrency <= 5:
-            raise ValueError("cloud.directory_concurrency 必须是 1 到 5")
-        if not 1 <= self.directory_retry_attempts <= 5:
-            raise ValueError("cloud.directory_retry_attempts 必须是 1 到 5")
-        if not 30 <= self.directory_request_timeout_seconds <= 180:
-            raise ValueError("cloud.directory_request_timeout_seconds 必须是 30 到 180")
 
     @property
     def configured(self) -> bool:
@@ -557,191 +538,6 @@ class OpenAIChatCompletionsProvider:
         if set(by_id) != expected_ids:
             raise CloudProviderError("云端模型没有返回全部题目的分类结果")
         return [by_id[str(question["exercise_id"])] for question in questions]
-
-    def propose_directory_refactor(self, context: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
-        """按一个已选中的二级或三级目录提出待审核的粗粒度目录方案。"""
-        selected = context["selected_level3"]
-        focus = context["focus"]
-        level3_keys = [str(item["id"]) for item in selected]
-        sampling = context["collection"].get("sampling") or {}
-        is_sampled = sampling.get("mode") == "stratified_page"
-        support_minimum = (
-            context["sampled_level4_candidate_min_count"]
-            if is_sampled else context["minimum_level4_question_count"]
-        )
-        static_context = {
-            "task": "为一个中考数学目录 Focus 设计待人工审核的三级、四级目录优化方案。不得执行写入或逐题分类。",
-            "policy": self._policy(rules),
-            "focus": focus,
-            "old_directory_tree": selected,
-            "reference_directory_tree": context["reference_directory_tree"],
-            "collection": context["collection"],
-            "minimum_level4_question_count": context["minimum_level4_question_count"],
-            "instructions": [
-                "三级目录必须按题干首要数学对象或情境划分；四级目录按最终主问或决定性条件划分。",
-                "目录标题必须剥离单题故事背景；四级标题以“考法N：”开头，且每个四级目录至少有给定最小题量。",
-                "每个三级、四级目录均须提供 basis，简洁说明其数学分类边界、纳入条件或与相邻目录的区分；不得引用具体题号或故事背景。该文字可写入 Excel N 列作为分类依据。",
-                "这是目录骨架优化，不是逐题归类任务。不得输出全部题目的分类结果，也不得要求每道题落入某个四级目录。",
-                "每个新建或保留的四级目录必须提供 supporting_exercise_ids：它们只是符合该目录的题号，用于核验该目录的样本或全量题量，不是数学证明题；这些题号在不同四级目录间不得重复。其余题目无需归属。",
-                "Focus 为三级时，level3 只能保留一个，并使用给定的 key；不得移动到其他三级或新建三级。",
-                "旧目录和同专题其他三级、四级目录只作参考，不能照抄无题量支持的目录。",
-                "collection 记录本轮未能读取的题目或分页；只能基于 questions 中已成功读取的题目提出方案，并在 notes 中说明覆盖缺口，不得臆造缺失题目内容。",
-                "二级 Focus 无法形成满足题量的四级分类时，不要捏造目录；可保留三级末级目录。三级 Focus 且题量达到门槛时必须给出四级分类。",
-                self._notation_instruction(),
-            ],
-        }
-        if is_sampled:
-            # 抽样只改变候选证据门槛，不把数百道完整题干塞入一次请求。
-            # 先用低强度并发提炼短数学特征，再由原目录分类强度完成最终归纳。
-            static_context["instructions"].append(
-                "本轮是分页分层抽样，只产出待审核候选，不得直接写入 Excel。样本中有 3 道不同匹配题才可提出四级目录；应尽量列出最多 6 道实际匹配题。样本中 4 至 6 道为强候选，恰好 3 道为普通候选；少于 3 道必须在 notes 标明证据不足，不得猜测。最终写入前仍须全量核验实际题量不少于 6 道。"
-            )
-            request_effort = self.reasoning_effort
-        else:
-            request_effort = self.directory_reasoning_effort
-        # 无论全量还是抽样，都先并发提取短特征，避免单次请求过大、无进度且易卡住。
-        question_signals, signal_failed_ids = self._directory_question_signals(context["questions"])
-        if signal_failed_ids:
-            context["collection"]["failed_signal_exercise_ids"] = signal_failed_ids
-            static_context["instructions"].append(
-                "部分题目的特征提取请求失败，failed_signal_exercise_ids 中的题只能视为覆盖缺口；不得根据缺失题目猜测目录。"
-            )
-        if not question_signals:
-            raise CloudProviderError("所有抽样题目的数学特征提取均失败，无法生成目录方案")
-        dynamic_context = {
-            "question_signals": question_signals,
-            "question_count": len(context["questions"]),
-            "sampling": sampling,
-        }
-        exercise_ids = [str(question["exercise_id"]) for question in context["questions"]]
-        level4_schema = {
-            "type": "object", "additionalProperties": False, "required": ["key", "title", "basis", "supporting_exercise_ids"],
-            "properties": {
-                "key": {"type": "string"}, "title": {"type": "string"}, "basis": {"type": "string"},
-                "supporting_exercise_ids": {
-                    "type": "array", "minItems": support_minimum,
-                    "maxItems": context["minimum_level4_question_count"],
-                    # 部分兼容网关的 Structured Outputs 不支持 uniqueItems；
-                    # 返回后仍由 directory_refactor 严格校验同目录和跨目录的题号去重。
-                    "items": {"type": "string", "enum": exercise_ids},
-                },
-            },
-        }
-        level3_schema = {
-            "type": "object", "additionalProperties": False, "required": ["key", "title", "basis", "level4"],
-            "properties": {
-                "key": {"type": "string", "enum": level3_keys} if focus["level"] == 3 else {"type": "string"},
-                "title": {"type": "string"}, "basis": {"type": "string"},
-                "level4": {"type": "array", "items": level4_schema},
-            },
-        }
-        schema = {
-            "type": "object", "additionalProperties": False, "required": ["level3", "notes"],
-            "properties": {
-                "level3": {"type": "array", "minItems": 1, "items": level3_schema},
-                "notes": {"type": "array", "items": {"type": "string"}},
-            },
-        }
-        request = self._staged_structured_request(
-            "math_directory_refactor", static_context, dynamic_context, schema,
-            reasoning_effort=request_effort,
-        )
-        return self._decode(self._request_with_retry("POST", self._protocol_path(), request))
-
-    @staticmethod
-    def _clip_directory_text(value: Any, limit: int) -> str:
-        """保留题干头尾，避免长材料题吞掉目录方案的上下文窗口。"""
-        text = " ".join(str(value or "").split())
-        if len(text) <= limit:
-            return text
-        separator = " … "
-        head = max(1, (limit - len(separator)) * 2 // 3)
-        tail = max(1, limit - len(separator) - head)
-        return f"{text[:head]}{separator}{text[-tail:]}"
-
-    def _directory_question(self, question: dict[str, Any]) -> dict[str, Any]:
-        full = self._question(question)
-        return {
-            "exercise_id": full["exercise_id"],
-            "text": self._clip_directory_text(full["text"], 900),
-            "question_latex": self._clip_directory_text(full["question_latex"], 400),
-            "answer": self._clip_directory_text(full["answer"], 300),
-            "answer_latex": self._clip_directory_text(full["answer_latex"], 240),
-            "page_scope_hint": self._clip_directory_text(full["page_scope_hint"], 120),
-        }
-
-    def _directory_question_signals(self, questions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-        """分批并发提取题目数学特征；这是目录归纳的中间摘要，不是逐题分类结果。"""
-        batches = [questions[index:index + self.directory_batch_size] for index in range(0, len(questions), self.directory_batch_size)]
-
-        def request_batch(index: int, batch: list[dict[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
-            exercise_ids = [str(question["exercise_id"]) for question in batch]
-            schema = {
-                "type": "object", "additionalProperties": False, "required": ["signals"],
-                "properties": {"signals": {"type": "array", "minItems": len(batch), "maxItems": len(batch), "items": {
-                    "type": "object", "additionalProperties": False,
-                    "required": ["exercise_id", "primary_object", "main_question", "decisive_condition"],
-                    "properties": {
-                        "exercise_id": {"type": "string", "enum": exercise_ids},
-                        "primary_object": {"type": "string"}, "main_question": {"type": "string"},
-                        "decisive_condition": {"type": "string"},
-                    },
-                }}},
-            }
-            prompt = {
-                "task": "仅提取每道中考数学题的短数学特征，供后续粗粒度目录设计使用；不是目录分类。",
-                "instructions": [
-                    "每道题必须返回一次，字段均用极简数学术语。",
-                    "primary_object 写首要对象或情境；main_question 写最终主问；decisive_condition 写决定性条件或方法。",
-                    "剥离具体故事背景，不给出三级、四级目录名称，不解释推理。",
-                ],
-                "questions": [self._directory_question(question) for question in batch],
-            }
-            request = self._structured_request("math_directory_question_signals", prompt, schema, reasoning_effort=self.directory_reasoning_effort)
-            payload = self._decode(self._request_with_retry("POST", self._protocol_path(), request))
-            rows = payload.get("signals") if isinstance(payload, dict) else None
-            if not isinstance(rows, list):
-                raise CloudProviderError("目录题目特征未返回 signals 数组")
-            by_id = {str(row.get("exercise_id", "")): row for row in rows if isinstance(row, dict)}
-            if len(by_id) != len(batch) or set(by_id) != set(exercise_ids):
-                raise CloudProviderError("目录题目特征没有覆盖当前批次的全部题目")
-            return index, [by_id[exercise_id] for exercise_id in exercise_ids]
-
-        results: list[list[dict[str, Any]] | None] = [None] * len(batches)
-        failed_exercise_ids: list[str] = []
-        with ThreadPoolExecutor(max_workers=min(self.directory_concurrency, len(batches))) as executor:
-            futures = {
-                executor.submit(request_batch, index, batch): batch
-                for index, batch in enumerate(batches)
-            }
-            for future in as_completed(futures):
-                try:
-                    index, rows = future.result()
-                except CloudProviderError:
-                    # 单个特征分批失败不能丢弃其他已完成分批；最终方案会带上覆盖缺口。
-                    failed_exercise_ids.extend(str(question["exercise_id"]) for question in futures[future])
-                    continue
-                results[index] = rows
-        return [row for batch in results if batch for row in batch], failed_exercise_ids
-
-    def _request_with_retry(self, method: str, path: str, payload: Any) -> Any:
-        """目录分析可安全重试瞬时模型或网关失败；参数错误不做无意义重试。"""
-        last_error: CloudProviderError | None = None
-        for attempt in range(self.directory_retry_attempts):
-            try:
-                return self._request(
-                    method, path, payload,
-                    timeout_seconds=self.directory_request_timeout_seconds,
-                )
-            except CloudProviderError as error:
-                message = str(error)
-                if "HTTP 4" in message and "HTTP 429" not in message:
-                    raise
-                last_error = error
-                if attempt + 1 < self.directory_retry_attempts:
-                    time.sleep(1.5 * (2 ** attempt))
-        assert last_error is not None
-        raise CloudProviderError(f"目录模型请求已重试 {self.directory_retry_attempts} 次仍失败：{last_error}") from last_error
 
     def _structured_request(
         self, name: str, prompt: dict[str, Any], schema: dict[str, Any], reasoning_effort: str | None = None

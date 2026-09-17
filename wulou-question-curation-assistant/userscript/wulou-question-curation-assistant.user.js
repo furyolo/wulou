@@ -25,6 +25,8 @@
   // 避免一次性请求过多导致登录态、CSRF 或站点限流问题。
   const ACCEPTANCE_CONCURRENCY = 3;
   const LOCAL_REQUEST_TIMEOUT_MS = 30000;
+  // 导入一份上千题的归类清单要解析并逐条落库，比普通查询慢得多。
+  const SKILL_IMPORT_TIMEOUT_MS = 120000;
   // 连接测试只读取模型详情，不触发模型生成；超过 15 秒可视为未能快速连通。
   const CONNECTION_TEST_TIMEOUT_MS = 15000;
   const CONNECTION_TEST_POLL_INTERVAL_MS = 300;
@@ -569,7 +571,6 @@
     historyRange: { start: '', end: '' },
     historyRangePreviewEnd: '',
     historyCalendarMonth: '',
-    directoryPlan: null,
     priorityView: null,
     focusSnapshot: null,
     pendingFocusRestore: false,
@@ -728,6 +729,7 @@
       <div class="actions"><button class="restore-focus" type="button" hidden disabled>恢复上次审核队列</button></div>
       <div class="actions"><button class="primary accept-all" type="button" disabled>全部采纳</button></div>
       <div class="actions"><button class="primary export-all-questions" type="button" disabled>导出所有题库</button></div>
+      <div class="actions"><button class="import-skill-results" type="button">导入归类结果</button><input class="import-skill-results-file" type="file" accept=".json,.jsonl,.txt,application/json" hidden></div>
       <div class="actions"><button class="history" type="button">工作成果</button><button class="clear-cache" type="button" disabled>清除本页缓存</button></div>
        <!-- 批处理仅适合数百题以上的离线任务；保留实现，暂不占用日常实时分类面板。 -->
        <section class="batch-actions" hidden aria-label="高级批处理操作">
@@ -735,7 +737,6 @@
          <div class="actions"><button class="sync-batch" type="button" disabled>同步批处理结果</button></div>
        </section>
       <div class="status" role="status" aria-live="polite">正在连接服务…</div>
-      <section class="directory-plan" hidden aria-live="polite"><h3>目录重构方案</h3><p class="directory-plan-summary"></p><ul class="directory-plan-list"></ul></section>
       <div class="legend" hidden><h3>当前页状态</h3><ul></ul></div>
       </section>
       <section class="settings-drawer" hidden aria-label="模型设置">
@@ -769,7 +770,7 @@
   const elements = {
     panel: shadow.querySelector('.panel'), tab: shadow.querySelector('.tab'), tabStatus: shadow.querySelector('.tab-status'), close: shadow.querySelector('.close'), mainView: shadow.querySelector('.main-view'), settings: shadow.querySelector('.settings'), settingsDrawer: shadow.querySelector('.settings-drawer'), backSettings: shadow.querySelector('.back-settings'),
      cloudProfileSelect: shadow.querySelector('.cloud-profile-select'), cloudProfileName: shadow.querySelector('.cloud-profile-name'), profileTabs: shadow.querySelector('.profile-tabs'), createCloudProfile: shadow.querySelector('.create-cloud-profile'), cloudModelControl: shadow.querySelector('.cloud-model-control'), routingModelControl: shadow.querySelector('.routing-model-control'), cloudModel: null, routingModel: null, classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudProtocol: shadow.querySelector('.cloud-protocol'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), requestCompatibility: shadow.querySelector('.request-compatibility'), customHeaders: shadow.querySelector('.custom-headers'), customHeaderStatus: shadow.querySelector('.custom-header-status'), clearCustomHeaders: shadow.querySelector('.clear-custom-headers'), testCloudConnection: shadow.querySelector('.test-cloud-connection'), connectionTestStatus: shadow.querySelector('.connection-test-status'), saveCloud: shadow.querySelector('.save-cloud'),
-    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), classifyFocus: shadow.querySelector('.classify-focus'), restoreFocus: shadow.querySelector('.restore-focus'), exportAllQuestions: shadow.querySelector('.export-all-questions'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), historyDateRange: shadow.querySelector('.history-date-range'), historyDateSheet: shadow.querySelector('.history-date-sheet'), historyDateBackdrop: shadow.querySelector('.history-date-backdrop'), historyMonthPrev: shadow.querySelector('.history-month-prev'), historyMonthNext: shadow.querySelector('.history-month-next'), historyMonthTitle: shadow.querySelector('.history-month-title'), historyCalendarGrid: shadow.querySelector('.history-calendar-grid'), historyDateHint: shadow.querySelector('.history-date-hint'), exportHistory: shadow.querySelector('.export-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'), directoryPlan: shadow.querySelector('.directory-plan'), directoryPlanSummary: shadow.querySelector('.directory-plan-summary'), directoryPlanList: shadow.querySelector('.directory-plan-list'),
+    cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), classifyFocus: shadow.querySelector('.classify-focus'), restoreFocus: shadow.querySelector('.restore-focus'), exportAllQuestions: shadow.querySelector('.export-all-questions'), skillImport: shadow.querySelector('.import-skill-results'), skillImportFile: shadow.querySelector('.import-skill-results-file'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), historyDateRange: shadow.querySelector('.history-date-range'), historyDateSheet: shadow.querySelector('.history-date-sheet'), historyDateBackdrop: shadow.querySelector('.history-date-backdrop'), historyMonthPrev: shadow.querySelector('.history-month-prev'), historyMonthNext: shadow.querySelector('.history-month-next'), historyMonthTitle: shadow.querySelector('.history-month-title'), historyCalendarGrid: shadow.querySelector('.history-calendar-grid'), historyDateHint: shadow.querySelector('.history-date-hint'), exportHistory: shadow.querySelector('.export-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
     legend: shadow.querySelector('.legend'), legendList: shadow.querySelector('.legend ul'),
     confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'),
   };
@@ -918,6 +919,7 @@
     elements.classifyFocus.disabled = busy || !state.taxonomy;
     updateFocusRestoreAction();
     elements.exportAllQuestions.disabled = busy || !state.taxonomy;
+    elements.skillImport.disabled = busy;
     elements.history.disabled = busy;
     elements.exportHistory.disabled = busy || !state.historyReport?.records?.length;
     elements.clearCache.disabled = busy || !state.taxonomy;
@@ -1983,52 +1985,62 @@
     };
   }
 
-  function renderDirectoryRefactorPlan(plan, focus) {
-    const counts = new Map((plan.audit?.level4_counts || []).map(item => [
-      `${item.level3_key}\u0000${item.level4_key}`, item,
-    ]));
-    const collection = plan.collection || {};
-    const excelScope = plan.excel_scope || null;
-    const gapCount = (collection.failed_exercise_ids || []).length + (collection.failed_page_urls || []).length + (collection.failed_signal_exercise_ids || []).length;
-    const sampling = collection.sampling || {};
-    const samplingText = sampling.mode === 'stratified_page' ? `；按分页分层抽样 ${plan.audit?.question_count || 0}/${sampling.source_question_count || 0} 道题` : '';
-    const scopeText = excelScope ? `；Excel 将保留第 ${excelScope.container_row} 行锚点，仅作用于 ${excelScope.sheet}!${excelScope.replace_start_row}–${excelScope.replace_end_row} 行` : '';
-    const sampled = sampling.mode === 'stratified_page';
-    const evidenceRule = sampled
-      ? `样本中至少 ${plan.sampled_level4_candidate_min_count || 3} 道匹配题才提出目录；${plan.sampled_level4_strong_candidate_min_count || 4} 道及以上标为强候选。抽样不证明实际题量，写入 Excel 前仍须全量核验不少于 ${plan.minimum_level4_question_count} 道`
-      : `每个四级目录至少有 ${plan.minimum_level4_question_count} 道匹配题目，方案仅列出 ${plan.minimum_level4_question_count} 个题号作题量核验`;
-    elements.directoryPlanSummary.textContent = `${focus.title}：已阅读 ${plan.audit?.question_count || 0} 道题${samplingText}；${evidenceRule}。此处仅生成目录骨架，不进行全量逐题归类${gapCount ? `；另有 ${gapCount} 项采集缺口，方案仅代表已成功读取的题目` : ''}${scopeText}。方案仍需人工审核后才能写入 Excel。`;
-    elements.directoryPlanList.replaceChildren();
-    for (const level3 of (plan.level3 || [])) {
-      const item = document.createElement('li');
-      const children = (level3.level4 || []).map(level4 => {
-        const evidence = counts.get(`${level3.key}\u0000${level4.key}`) || {};
-        const label = sampled ? (evidence.evidence_tier === 'strong_candidate' ? '强候选' : '候选') : '已核验';
-        return `${level4.title}（${label}：${evidence.count || 0} 道匹配题目；依据：${level4.basis || '待审核'}）`;
-      });
-      item.textContent = children.length ? `${level3.title}（依据：${level3.basis || '待审核'}）：${children.join('；')}` : `${level3.title}（依据：${level3.basis || '待审核'}）：三级末级目录`;
-      elements.directoryPlanList.append(item);
-    }
-    elements.directoryPlan.hidden = false;
+  // 目录整理 Skill 在外部会话里运行，拿不到本机回环地址，结论只能由人手工交回。
+  // 交回的只有「题号 + E 列知识点编号」：服务端按当前目录版本反查三级、四级目录，
+  // 写入本地库后与人工修正走同一条读取链路，本页随即就能显示建议。
+  function skillImportFailureNote(report) {
+    const first = (report.failed || [])[0];
+    if (!first) return '';
+    const label = first.exercise_id ? `题目 ${first.exercise_id}` : `第 ${first.item} 条`;
+    return `；首条原因：${label} ${first.message}`;
   }
 
-  function exportDirectoryRefactorPlan() {
-    if (!state.directoryPlan) return;
-    const payload = {
-      ...state.directoryPlan,
-      status: 'review',
-      export_note: '请完成旧—新映射、Excel 行范围锚定和人工审核后，才可将 status 改为 approved。',
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `目录重构审核方案-${chinaDate()}.json`;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    setStatus('已导出待审核目录方案；该文件尚不能直接写入 Excel。');
+  async function importSkillResults(file) {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const text = await file.text();
+      // 先预演：不写任何记录，只回报解析与编号校验结果。上千题的清单盲写风险太高。
+      const preview = await request(
+        'POST', '/api/v1/skill-classifications', { jsonl: text, dry_run: true },
+        { timeoutMs: SKILL_IMPORT_TIMEOUT_MS },
+      );
+      if (!preview.resolved) {
+        setStatus(`《${file.name}》里没有可归位的题目（共 ${preview.received} 条）${skillImportFailureNote(preview)}`, true);
+        return;
+      }
+      const skipped = (preview.failed || []).length;
+      const confirmed = await confirmAction({
+        title: '导入归类结果',
+        message: `《${file.name}》共 ${preview.received} 条，可归位 ${preview.resolved} 道题`
+          + `${skipped ? `，另有 ${skipped} 条编号对不上会被跳过${skillImportFailureNote(preview)}` : ''}`
+          + '。导入后这些题目会显示为「Skill 归类」建议，点采纳时才会写入题湖。',
+        confirmLabel: '确认导入',
+      });
+      if (!confirmed) {
+        setStatus('已取消导入归类结果。');
+        return;
+      }
+      setStatus('正在导入归类结果…');
+      const report = await request(
+        'POST', '/api/v1/skill-classifications', { jsonl: text },
+        { timeoutMs: SKILL_IMPORT_TIMEOUT_MS },
+      );
+      const failures = (report.failed || []).length;
+      const restored = await restoreCachedResults(++state.cacheRestoreId);
+      if (restored.cancelled) return;
+      setStatus(`${[
+        `已导入 ${report.written} 道题的 Skill 归类结果`,
+        failures ? `${failures} 条编号对不上，未归位${skillImportFailureNote(report)}` : '',
+        (report.warnings || [])[0] || '',
+        `本页已显示 ${restored.restored} 条分类建议`,
+      ].filter(Boolean).join('；')}。`, failures ? 'warning' : 'normal');
+    } catch (error) {
+      setStatus(`导入归类结果失败：${error.message}`, true);
+    } finally {
+      setBusy(false);
+      elements.skillImportFile.value = '';
+    }
   }
 
   async function exportAllFocusQuestions() {
@@ -2233,12 +2245,14 @@
     anchor.className = 'badge-anchor';
     anchor.textContent = questionLabel;
     const title = document.createElement('strong');
-    const isManual = result.manual_override?.source === 'manual';
+    const overrideSource = result.manual_override?.source || '';
+    const isManual = overrideSource === 'manual';
+    const isSkill = overrideSource === 'skill';
     const isLocalAcceptance = result.acceptance_mode === 'local';
     const completionState = result.completion_state || '';
     title.textContent = result.accepted
       ? (completionState === 'moved' ? '已移动' : (completionState === 'directory_consistent' ? '目录已一致' : (completionState === 'at_target' ? '已归位' : (isLocalAcceptance ? '已本地采纳' : (isManual ? '人工已采纳' : '已采纳')))))
-      : (isLocalAcceptance ? '当前目录无需调整' : (isManual ? '人工修改' : (result.status === 'review' ? '待复核' : '建议分类')));
+      : (isLocalAcceptance ? '当前目录无需调整' : (isManual ? '人工修改' : (isSkill ? 'Skill 归类' : (result.status === 'review' ? '待复核' : '建议分类'))));
     header.append(anchor, title);
 
     const path = document.createElement('button');
@@ -2263,6 +2277,8 @@
       ? '建议目录与当前目录一致；采纳仅在本地确认，不会发送题湖移动请求'
       : isManual
       ? '人工选择 · 采纳后将提交题湖移动请求'
+      : isSkill
+      ? '目录整理 Skill 归类 · 采纳后将提交题湖移动请求'
       : result.status === 'review'
       ? `${reviewReasonText || '需要人工复核'} · 采纳后将提交题湖移动请求`
       : `${routedTopic ? `路由专题：${routedTopic} · ` : ''}置信度 ${Math.round(result.confidence * 100)}% · 采纳后将提交题湖移动请求`;
@@ -2320,6 +2336,7 @@
       if (acceptanceMode === 'local') {
         // 当前目录已在分类阶段读取并与建议目录比对一致；无需请求题湖，
         // 但人工选择仍必须持久化，避免刷新或进入其他目录范围后被模型缓存覆盖。
+        // Skill 归类结果导入时就已落库，无需再写一次，否则会把来源改写成人工采纳。
         let manualPersistenceError = '';
         if (isManual) {
           try {
@@ -3230,6 +3247,10 @@
   elements.testCloudConnection.addEventListener('click', testCloudConnection);
   elements.classify.addEventListener('click', classifyPage);
   elements.exportAllQuestions.addEventListener('click', exportAllFocusQuestions);
+  elements.skillImport.addEventListener('click', () => elements.skillImportFile.click());
+  elements.skillImportFile.addEventListener('change', event => {
+    void importSkillResults(event.target.files?.[0]);
+  });
   elements.classifyFocus.addEventListener('click', classifyFocus);
   elements.restoreFocus.addEventListener('click', restoreSavedFocusQueue);
   elements.acceptAll.addEventListener('click', acceptAllSuggestions);

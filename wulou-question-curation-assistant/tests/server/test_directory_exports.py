@@ -32,3 +32,8 @@ class DirectoryExportTests(unittest.TestCase):
         self.assertRegex(manifest["created_at"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertEqual(manifest["manual_agent_handoff"]["skill"], "math-exam-directory-curation")
         self.assertNotIn("excel_scope", manifest)
+        # 交接包必须自带回填契约，否则 Skill 无从知道结论该以什么形式回到本机。
+        contract = manifest["import_contract"]
+        self.assertEqual(contract["schema_version"], "skill-classification-import-v1")
+        self.assertEqual(contract["items"][0]["knowledge_point_id"], "E 列知识点编号")
+        self.assertEqual(manifest["evidence_thresholds"]["minimum_level4_question_count"], 6)

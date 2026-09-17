@@ -32,9 +32,9 @@ try:
     from .classification_jobs import ClassificationJobStore
     from .proposals import ProposalStore
     from .model_input import SNAPSHOT_VERSION, build_model_input_snapshot
-    from .directory_refactor import prepare_refactor_context, validate_refactor_plan
-    from .excel_scope import resolve_excel_scope
+    from .directory_refactor import prepare_refactor_context
     from .directory_exports import write_directory_export
+    from .skill_classifications import build_import_plan
     from .taxonomy_sync import synchronize_taxonomy
 except ImportError:  # 支持直接运行 python server/main.py。
     from cache import ResultCache
@@ -46,9 +46,9 @@ except ImportError:  # 支持直接运行 python server/main.py。
     from classification_jobs import ClassificationJobStore
     from proposals import ProposalStore
     from model_input import SNAPSHOT_VERSION, build_model_input_snapshot
-    from directory_refactor import prepare_refactor_context, validate_refactor_plan
-    from excel_scope import resolve_excel_scope
+    from directory_refactor import prepare_refactor_context
     from directory_exports import write_directory_export
+    from skill_classifications import build_import_plan
     from taxonomy_sync import synchronize_taxonomy
 
 
@@ -77,9 +77,7 @@ CLOUD_PROFILE_FIELDS = (
 )
 PROTECTED_REQUEST_HEADERS = {"authorization", "x-api-key", "content-type", "host", "content-length"}
 PIPELINE_FIELDS = (
-    "max_concurrent_requests", "directory_reasoning_effort", "directory_batch_size",
-    "directory_concurrency", "directory_retry_attempts", "directory_request_timeout_seconds",
-    "timeout_seconds",
+    "max_concurrent_requests", "timeout_seconds",
 )
 
 
@@ -205,6 +203,19 @@ class ServiceState:
         """题湖属性表单的叶子目录 ID，可能是三级或四级目录。"""
         return str(question.get("current_catalogue_id", "")).strip() or "__uncategorized__"
 
+    def _resolved_manual_override(self, exercise_id: str, source_catalogue_id: str) -> dict[str, Any] | None:
+        """挑出一条目标目录在当前目录里仍然成立的分类结论。
+
+        taxonomy_version 是整份工作簿的哈希，改一个专题就会让它整体变化；照版本号
+        一刀切，目标落在其他专题的人工结论会被无谓作废。所以改看标题路径还解析不
+        解析得到：还在就继续生效，被改名、移位或撤销才要求模型重新分类。当前目录
+        的记录排在最前，只有它解析不到时才回退到同题的其他候选。
+        """
+        for candidate in self.cache.get_manual_overrides(exercise_id, source_catalogue_id):
+            if self.taxonomy.resolve_published_path(candidate["target_path"]):
+                return candidate
+        return None
+
     def cached_result(self, question: dict[str, Any]) -> dict[str, Any] | None:
         exercise_id = str(question["exercise_id"])
         source_catalogue_id = self.source_catalogue_id(question)
@@ -219,7 +230,7 @@ class ServiceState:
             and cached.get("routing_pipeline_version") != ROUTING_PIPELINE_VERSION
         ):
             cached = None
-        manual = self.cache.get_manual_override(exercise_id, source_catalogue_id, self.taxonomy.version)
+        manual = self._resolved_manual_override(exercise_id, source_catalogue_id)
         if not manual:
             if cached:
                 move = self.cache.latest_catalogue_moves([exercise_id]).get(exercise_id)
@@ -227,24 +238,28 @@ class ServiceState:
                     cached = dict(cached)
                     cached["catalogue_move"] = move
             return cached
-        # 同一目录版本内，人工采纳的路径优先于模型输出。目录版本更新后，
-        # 旧人工决定不会命中，必须重新让模型按新目录分类。
+        # 人工采纳的路径优先于模型输出。旧记录是否仍然算数，看它的目标目录在当前
+        # 目录里还解析不解析得到：还在就继续生效，被改名、移位或撤销才让模型重跑。
+        override_source = manual.get("source") or "manual"
+        reason = "已采纳人工修正" if override_source == "manual" else "目录整理 Skill 归档"
         result = dict(cached or {
             "exercise_id": exercise_id,
             "status": "suggested",
             "confidence": 1.0,
-            "reason": "已采纳人工修正",
+            "reason": reason,
             "review_reasons": [],
         })
         result.update({
             "exercise_id": exercise_id,
             "status": "suggested",
             "confidence": 1.0,
-            "reason": "已采纳人工修正",
+            "reason": reason,
             "review_reasons": [],
             "target": {"path": manual["target_path"]},
             "manual_override": {
-                "source": "manual",
+                # 人工采纳与外部 Skill 批量导入共用这张表，靠 source 区分，
+                # 前端据此标注“人工修改”还是“Skill 归类”。
+                "source": override_source,
                 "original_target_path": manual["original_target_path"],
                 "accepted_at": manual["accepted_at"],
                 "taxonomy_version": manual["taxonomy_version"],
@@ -765,18 +780,41 @@ class ServiceState:
         worker.start()
         return self.classification_jobs.snapshot(job.job_id)
 
-    def create_directory_refactor(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """生成目录重构的只读审核方案；不在此处修改 Excel 或题湖。"""
-        context = prepare_refactor_context(payload, self.taxonomy)
-        if not self.cloud or not self.cloud.configured:
-            raise ValueError("目录重构需要已配置云端模型；未配置时不能凭关键词生成目录")
-        raw_plan = self.cloud.propose_directory_refactor(context, self.rules)
-        plan = validate_refactor_plan(context, raw_plan)
-        # 方案只携带自动定位出的写入范围；这里不写入 Excel，确认阶段仍需单独执行。
-        plan["excel_scope"] = resolve_excel_scope(self.settings, self.config_path, self.taxonomy.raw, context["focus"])
-        plan["taxonomy_version"] = self.taxonomy.version
-        plan["rule_version"] = self.rule_version
-        return plan
+    def import_skill_classifications(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """导入目录整理 Skill 的逐题归类结果。
+
+        外部 Skill 拿不到本机回环地址，也预知不了本地目录 ID，所以只交回「题号 +
+        知识点编号」。这里按当前目录版本反查目录、逐条校验，再写入人工修正表并标记
+        来源为 skill；前端原有的缓存读取链路随即就能展示这些分类建议。
+        """
+        plan = build_import_plan(payload, self.taxonomy)
+        report = {
+            "schema_version": plan["schema_version"],
+            "taxonomy_version": plan["taxonomy_version"],
+            "file_taxonomy_version": plan["file_taxonomy_version"],
+            "received": plan["received"],
+            "resolved": plan["resolved"],
+            "written": 0,
+            "inserted": 0,
+            "updated": 0,
+            "skipped_manual_decisions": 0,
+            "failed": plan["failed"],
+            "warnings": plan["warnings"],
+            "preview": plan["preview"],
+            "dry_run": bool(payload.get("dry_run")),
+        }
+        if report["dry_run"]:
+            return report
+        counts = self.cache.put_skill_classifications(
+            plan["rows"], preserve_manual_decisions=bool(payload.get("preserve_manual_decisions"))
+        )
+        report.update(counts)
+        report["written"] = counts["inserted"] + counts["updated"]
+        if counts["skipped_manual_decisions"]:
+            report["warnings"].append(
+                f"{counts['skipped_manual_decisions']} 条已有同一目录版本内的人工修正，已按请求保留，未被覆盖。"
+            )
+        return report
 
     def create_directory_export(self, payload: dict[str, Any]) -> dict[str, Any]:
         """保存完整题库交接包，供用户手动启动的 Agent 使用。"""
@@ -1060,15 +1098,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/directory-refactors", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/settings/cloud/test", "/api/v1/settings/cloud/test/start", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
+        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/skill-classifications", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/settings/cloud/test", "/api/v1/settings/cloud/test/start", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         try:
-            payload = self._read_json(maximum_length=12_000_000 if self.path in {"/api/v1/directory-exports", "/api/v1/classification-jobs"} else 2_000_000)
+            payload = self._read_json(maximum_length=12_000_000 if self.path in {"/api/v1/directory-exports", "/api/v1/classification-jobs", "/api/v1/skill-classifications"} else 2_000_000)
             if self.path in {
                 "/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs",
                 "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications",
-                "/api/v1/directory-refactors", "/api/v1/directory-exports", "/api/v1/batches",
+                "/api/v1/skill-classifications", "/api/v1/directory-exports", "/api/v1/batches",
             }:
                 self.server.state.refresh_taxonomy()
             if self.path == "/api/v1/settings/cloud":
@@ -1077,8 +1115,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.ACCEPTED, self.server.state.start_cloud_connection_test(payload))
             elif self.path == "/api/v1/settings/cloud/test":
                 self._send_json(HTTPStatus.OK, self.server.state.test_cloud_connection(payload))
-            elif self.path == "/api/v1/directory-refactors":
-                self._send_json(HTTPStatus.OK, self.server.state.create_directory_refactor(payload))
+            elif self.path == "/api/v1/skill-classifications":
+                self._send_json(HTTPStatus.OK, self.server.state.import_skill_classifications(payload))
             elif self.path == "/api/v1/directory-exports":
                 self._send_json(HTTPStatus.CREATED, self.server.state.create_directory_export(payload))
             elif self.path == "/api/v1/manual-classifications":

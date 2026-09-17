@@ -14,10 +14,6 @@ from server.providers.openai_responses import CloudProviderError, OpenAIChatComp
 from server.taxonomy import Taxonomy
 
 
-class _DirectoryRequestCaptured(Exception):
-    """仅用于检查目录方案 Structured Output 请求，不发起真实网络调用。"""
-
-
 class CloudAndBatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.taxonomy = Taxonomy.from_file(ROOT / "config" / "taxonomy.example.yaml")
@@ -175,76 +171,6 @@ class CloudAndBatchTests(unittest.TestCase):
             OpenAIChatCompletionsProvider({"model": "test-model"})._compatibility_headers(),
             {},
         )
-
-    def test_directory_signal_requests_use_low_reasoning_and_compact_question_text(self) -> None:
-        provider = OpenAIChatCompletionsProvider({
-            "model": "test-model", "directory_reasoning_effort": "low", "directory_batch_size": 60,
-        })
-        request = provider._structured_request("directory-signals", {"questions": []}, {"type": "object"}, reasoning_effort="low")
-        self.assertEqual(request["reasoning"]["effort"], "low")
-        compact = provider._directory_question({
-            "exercise_id": "1", "question_press": "甲" * 2_000, "answer_press": "乙" * 1_000,
-        })
-        self.assertLessEqual(len(compact["text"]), 900)
-        self.assertLessEqual(len(compact["answer"]), 300)
-
-    def test_directory_refactor_schema_leaves_unique_items_to_server_validation(self) -> None:
-        class CapturingProvider(OpenAIChatCompletionsProvider):
-            def _directory_question_signals(self, questions):  # type: ignore[no-untyped-def]
-                return ([
-                    {"exercise_id": str(question["exercise_id"]), "primary_object": "实数", "main_question": "计算", "decisive_condition": "运算"}
-                    for question in questions
-                ], [])
-
-            def _request_with_retry(self, method, path, payload):  # type: ignore[no-untyped-def]
-                self.captured_request = payload
-                raise _DirectoryRequestCaptured()
-
-        provider = CapturingProvider({"model": "test-model"})
-        context = {
-            "selected_level3": [{"id": "l3", "title": "实数计算"}],
-            "focus": {"level": 3, "level3_id": "l3"},
-            "reference_directory_tree": [],
-            "collection": {"sampling": {"mode": "stratified_page", "source_question_count": 3}},
-            "questions": [
-                {"exercise_id": "1", "question_press": "题 1"},
-                {"exercise_id": "2", "question_press": "题 2"},
-                {"exercise_id": "3", "question_press": "题 3"},
-            ],
-            "minimum_level4_question_count": 6,
-            "sampled_level4_candidate_min_count": 3,
-            "sampled_level4_strong_candidate_min_count": 4,
-        }
-        with self.assertRaises(_DirectoryRequestCaptured):
-            provider.propose_directory_refactor(context, {"rules": {}})
-        schema = provider.captured_request["text"]["format"]["schema"]
-        supporting_schema = schema["properties"]["level3"]["items"]["properties"]["level4"]["items"]["properties"]["supporting_exercise_ids"]
-        self.assertNotIn("uniqueItems", supporting_schema)
-        self.assertEqual(supporting_schema["minItems"], 3)
-        self.assertEqual(supporting_schema["maxItems"], 6)
-
-    def test_directory_signal_batch_failure_keeps_other_batches(self) -> None:
-        class PartialSignalProvider(OpenAIChatCompletionsProvider):
-            def _structured_request(self, name, prompt, schema, reasoning_effort=None):  # type: ignore[no-untyped-def]
-                return {"exercise_ids": [str(question["exercise_id"]) for question in prompt["questions"]]}
-
-            def _request_with_retry(self, method, path, payload):  # type: ignore[no-untyped-def]
-                exercise_ids = payload["exercise_ids"]
-                if "1" in exercise_ids:
-                    raise CloudProviderError("临时网关失败")
-                return {"signals": [
-                    {"exercise_id": exercise_id, "primary_object": "实数", "main_question": "计算", "decisive_condition": "运算"}
-                    for exercise_id in exercise_ids
-                ]}
-
-            def _decode(self, payload):  # type: ignore[no-untyped-def]
-                return payload
-
-        provider = PartialSignalProvider({"model": "test-model", "directory_batch_size": 20, "directory_concurrency": 2})
-        questions = [{"exercise_id": str(index), "question_press": f"题 {index}"} for index in range(1, 22)]
-        signals, failed_ids = provider._directory_question_signals(questions)
-        self.assertEqual([item["exercise_id"] for item in signals], ["21"])
-        self.assertEqual(failed_ids, [str(index) for index in range(1, 21)])
 
     def test_realtime_routing_sees_all_topics_and_skill_protocol(self) -> None:
         request = self.provider.build_routing_request(

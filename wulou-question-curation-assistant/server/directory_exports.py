@@ -8,6 +8,21 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+try:
+    from .directory_refactor import (
+        MIN_LEVEL4_QUESTION_COUNT,
+        SAMPLED_LEVEL4_CANDIDATE_MIN_COUNT,
+        SAMPLED_LEVEL4_STRONG_CANDIDATE_MIN_COUNT,
+    )
+    from .skill_classifications import IMPORT_SCHEMA_VERSION
+except ImportError:  # 支持直接运行 python server/main.py。
+    from directory_refactor import (
+        MIN_LEVEL4_QUESTION_COUNT,
+        SAMPLED_LEVEL4_CANDIDATE_MIN_COUNT,
+        SAMPLED_LEVEL4_STRONG_CANDIDATE_MIN_COUNT,
+    )
+    from skill_classifications import IMPORT_SCHEMA_VERSION
+
 
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -42,6 +57,27 @@ def write_directory_export(
         "rule_version": rule_version,
         "old_directory_tree": context["selected_level3"],
         "reference_directory_tree": context["reference_directory_tree"],
+        "evidence_thresholds": {
+            "minimum_level4_question_count": context.get("minimum_level4_question_count", MIN_LEVEL4_QUESTION_COUNT),
+            "sampled_level4_candidate_min_count": context.get(
+                "sampled_level4_candidate_min_count", SAMPLED_LEVEL4_CANDIDATE_MIN_COUNT
+            ),
+            "sampled_level4_strong_candidate_min_count": context.get(
+                "sampled_level4_strong_candidate_min_count", SAMPLED_LEVEL4_STRONG_CANDIDATE_MIN_COUNT
+            ),
+        },
+        # 交接包必须自带回填契约：Skill 在外部会话里运行，拿不到本机服务，
+        # 也预知不了本地目录 ID（那是由 Excel 行号推导的），只能靠 E 列编号对齐。
+        "import_contract": {
+            "schema_version": IMPORT_SCHEMA_VERSION,
+            "endpoint": "POST /api/v1/skill-classifications",
+            "items": [{"exercise_id": "题号", "knowledge_point_id": "E 列知识点编号", "stable_code": "可选"}],
+            "notes": [
+                "逐题归类结果只写 exercise_id 与 E 列知识点编号，不要写本地目录 ID 或三级、四级标题路径。",
+                "编号必须取自本清单所依据的目录版本；父三级目录 E 列非空时不得细分四级目录。",
+                "输出可以是 JSON 对象（含 items 数组）、JSON 数组或 JSONL，由使用者在题湖分类助手里导入。",
+            ],
+        },
         "manual_agent_handoff": {
             "skill": "math-exam-directory-curation",
             "instructions": [

@@ -140,6 +140,14 @@ class HttpServiceTests(unittest.TestCase):
         self.assertTrue(lookup["results"][0]["cache_hit"])
 
     def test_manual_classification_overrides_model_cache_in_the_same_directory_context(self) -> None:
+        # 目标必须是示例目录里真实存在的落点：目录被改名或撤销后人工结论会失效，
+        # 这条测的是"仍然成立时它必须压过模型缓存"。
+        target = self.state.taxonomy.global_target(
+            "real-number-calculation", "real-number-calculation-rationalization"
+        )
+        self.assertIsNotNone(target)
+        assert target is not None
+        target_path = target.published_path
         body = {
             "exercise_id": "manual-override-1",
             "stable_code": "CS2026MANUAL001",
@@ -147,8 +155,8 @@ class HttpServiceTests(unittest.TestCase):
         }
         saved_status, saved = self.request("POST", "/api/v1/manual-classifications", {
             **body,
-            "original_target_path": ["专题1：实数", "【大题】", "旧分类"],
-            "target_path": ["专题1：实数", "【大题】", "分母有理化"],
+            "original_target_path": ["专题一 实数", "【大题】", "实数的应用"],
+            "target_path": target_path,
         })
         self.assertEqual(saved_status, 201)
         self.assertEqual(saved["source_catalogue_id"], "level4-a")
@@ -159,7 +167,7 @@ class HttpServiceTests(unittest.TestCase):
         self.assertEqual(lookup_status, 200)
         self.assertEqual(lookup["missing_exercise_ids"], [])
         result = lookup["results"][0]
-        self.assertEqual(result["target"]["path"][-1], "分母有理化")
+        self.assertEqual(result["target"]["path"], target_path)
         self.assertEqual(result["manual_override"]["source"], "manual")
 
         # 题目移到人工指定的目标叶子后，恢复缓存时目录 ID 已变；
@@ -172,10 +180,11 @@ class HttpServiceTests(unittest.TestCase):
         )
         self.assertEqual(moved_lookup_status, 200)
         moved_result = moved_lookup["results"][0]
-        self.assertEqual(moved_result["target"]["path"][-1], "分母有理化")
+        self.assertEqual(moved_result["target"]["path"], target_path)
         self.assertEqual(moved_result["manual_override"]["source"], "manual")
 
-    def test_manual_classification_is_not_reused_after_the_taxonomy_changes(self) -> None:
+    def test_manual_classification_is_not_reused_after_its_target_directory_disappears(self) -> None:
+        """原目标目录被撤销时才不复用；不是版本号一动就整批丢弃。"""
         body = {
             "exercise_id": "manual-reclassify-on-taxonomy-change-1",
             "stable_code": "CS2026MANUAL002",
@@ -183,16 +192,24 @@ class HttpServiceTests(unittest.TestCase):
             "question_press": "计算并化简含有分母有理化的根式",
             "scope": {"topic_id": "topic-01-real-numbers", "level2_id": "topic-01-large"},
         }
+        target = self.state.taxonomy.global_target("real-number-application", None)
+        self.assertIsNotNone(target)
+        assert target is not None
         saved_status, saved = self.request("POST", "/api/v1/manual-classifications", {
             **body,
-            "original_target_path": ["专题1：实数", "【大题】", "旧分类"],
-            "target_path": ["专题1：实数", "【大题】", "人工旧分类"],
+            "original_target_path": [],
+            "target_path": target.published_path,
         })
         self.assertEqual(saved_status, 201)
         old_taxonomy_version = saved["taxonomy_version"]
 
+        # 换版本的同时把该三级目录撤掉：这才是让旧结论失效的真正原因。
         updated_taxonomy = deepcopy(self.state.taxonomy.raw)
         updated_taxonomy["taxonomy_version"] = f"{old_taxonomy_version}-updated"
+        level2 = updated_taxonomy["topics"][0]["level2"][0]
+        level2["level3"] = [
+            item for item in level2["level3"] if item["id"] != "real-number-application"
+        ]
         self.state.taxonomy = Taxonomy(updated_taxonomy)
 
         lookup_status, lookup = self.request(

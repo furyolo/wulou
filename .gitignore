@@ -10,6 +10,9 @@
 /.codex-tmp/
 /.tmp-*/
 
+# WorkBuddy workspace: agent identity and per-project work memory
+/.workbuddy/
+
 # Local runtime and temporary artifacts
 /.venv/
 /wulou-question-curation-assistant/.venv/

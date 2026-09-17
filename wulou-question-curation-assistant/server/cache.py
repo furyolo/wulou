@@ -74,6 +74,7 @@ class ResultCache:
                     exercise_id TEXT NOT NULL,
                     source_catalogue_id TEXT NOT NULL,
                     stable_code TEXT,
+                    source TEXT NOT NULL DEFAULT 'manual',
                     taxonomy_version TEXT NOT NULL,
                     original_target_path_json TEXT NOT NULL,
                     target_path_json TEXT NOT NULL,
@@ -90,6 +91,11 @@ class ResultCache:
             if "taxonomy_version" not in manual_columns:
                 # 旧记录没有可验证的目录版本，保留供审计，但绝不在新目录中恢复。
                 self._connection.execute(f"ALTER TABLE {self._MANUAL_TABLE} ADD COLUMN taxonomy_version TEXT")
+            if "source" not in manual_columns:
+                # 旧记录都产生于人工采纳；外部目录整理 Skill 导入的结果才标为 skill。
+                self._connection.execute(
+                    f"ALTER TABLE {self._MANUAL_TABLE} ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+                )
             self._connection.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self._MANUAL_AUDIT_TABLE} (
@@ -97,6 +103,7 @@ class ResultCache:
                     exercise_id TEXT NOT NULL,
                     source_catalogue_id TEXT NOT NULL,
                     stable_code TEXT,
+                    source TEXT NOT NULL DEFAULT 'manual',
                     taxonomy_version TEXT,
                     original_target_path_json TEXT NOT NULL,
                     target_path_json TEXT NOT NULL,
@@ -110,6 +117,10 @@ class ResultCache:
             }
             if "taxonomy_version" not in audit_columns:
                 self._connection.execute(f"ALTER TABLE {self._MANUAL_AUDIT_TABLE} ADD COLUMN taxonomy_version TEXT")
+            if "source" not in audit_columns:
+                self._connection.execute(
+                    f"ALTER TABLE {self._MANUAL_AUDIT_TABLE} ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+                )
             self._connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self._MANUAL_TABLE}_stable_code ON {self._MANUAL_TABLE}(stable_code)"
             )
@@ -208,46 +219,38 @@ class ResultCache:
             self._connection.commit()
         return cursor.rowcount
 
-    def get_manual_override(
-        self, exercise_id: str, source_catalogue_id: str, taxonomy_version: str
-    ) -> dict[str, Any] | None:
-        """读取当前目录版本的人工修正：当前目录优先，其次是同题最新决定。
+    def get_manual_overrides(self, exercise_id: str, source_catalogue_id: str) -> list[dict[str, Any]]:
+        """按优先级返回人工修正候选：当前目录优先，其后是同题的其他决定（新的在前）。
 
-        题目移动到人工指定的目标叶子后，当前目录 ID 会变成目标目录 ID，
-        不能因此退回旧的模型缓存。若同题在当前目录没有记录，采用最新一次
-        已写入题湖的人工决定；当前目录存在记录时仍以其为准。不同目录版本的
-        人工记录保留审计用途，但不能覆盖当前目录版本的 LLM 分类。
+        题目移动到人工指定的目标叶子后，当前目录 ID 会变成目标目录 ID，所以同题在
+        别的目录下的记录仍要作为候选返回，不能因为目录 ID 变了就退回模型缓存。
+
+        这里不再按 taxonomy_version 过滤：版本号是整表级的（整份工作簿的哈希），
+        照它一刀切会让改动一个专题时、目标落在其他专题的人工结论被无谓作废。
+        记录是否仍然成立改由上层按“目标路径能否在当前目录里解析”判定。
         """
         with self._lock:
-            row = self._connection.execute(
+            rows = self._connection.execute(
                 f"""
-                SELECT stable_code, taxonomy_version, original_target_path_json, target_path_json, accepted_at, updated_at
+                SELECT source, stable_code, taxonomy_version, original_target_path_json, target_path_json, accepted_at, updated_at
                 FROM {self._MANUAL_TABLE}
-                WHERE exercise_id = ? AND source_catalogue_id = ? AND taxonomy_version = ?
+                WHERE exercise_id = ?
+                ORDER BY (source_catalogue_id = ?) DESC, updated_at DESC, rowid DESC
                 """,
-                (exercise_id, source_catalogue_id, taxonomy_version),
-            ).fetchone()
-            if not row:
-                row = self._connection.execute(
-                    f"""
-                    SELECT stable_code, taxonomy_version, original_target_path_json, target_path_json, accepted_at, updated_at
-                    FROM {self._MANUAL_TABLE}
-                    WHERE exercise_id = ? AND taxonomy_version = ?
-                    ORDER BY updated_at DESC, rowid DESC
-                    LIMIT 1
-                    """,
-                    (exercise_id, taxonomy_version),
-                ).fetchone()
-        if not row:
-            return None
-        return {
-            "stable_code": row[0],
-            "taxonomy_version": row[1],
-            "original_target_path": json.loads(row[2]),
-            "target_path": json.loads(row[3]),
-            "accepted_at": row[4],
-            "updated_at": row[5],
-        }
+                (exercise_id, source_catalogue_id),
+            ).fetchall()
+        return [
+            {
+                "source": str(row[0] or "manual"),
+                "stable_code": row[1],
+                "taxonomy_version": row[2],
+                "original_target_path": json.loads(row[3]),
+                "target_path": json.loads(row[4]),
+                "accepted_at": row[5],
+                "updated_at": row[6],
+            }
+            for row in rows
+        ]
 
     def put_manual_override(
         self,
@@ -267,11 +270,12 @@ class ResultCache:
             self._connection.execute(
                 f"""
                 INSERT INTO {self._MANUAL_TABLE} (
-                    exercise_id, source_catalogue_id, stable_code, taxonomy_version,
+                    exercise_id, source_catalogue_id, stable_code, source, taxonomy_version,
                     original_target_path_json, target_path_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, 'manual', ?, ?, ?)
                 ON CONFLICT(exercise_id, source_catalogue_id) DO UPDATE SET
                     stable_code = COALESCE(excluded.stable_code, stable_code),
+                    source = excluded.source,
                     taxonomy_version = excluded.taxonomy_version,
                     original_target_path_json = excluded.original_target_path_json,
                     target_path_json = excluded.target_path_json,
@@ -283,17 +287,111 @@ class ResultCache:
             self._connection.execute(
                 f"""
                 INSERT INTO {self._MANUAL_AUDIT_TABLE} (
-                    exercise_id, source_catalogue_id, stable_code, taxonomy_version,
+                    exercise_id, source_catalogue_id, stable_code, source, taxonomy_version,
                     original_target_path_json, target_path_json, event_type
-                ) VALUES (?, ?, ?, ?, ?, ?, 'accepted')
+                ) VALUES (?, ?, ?, 'manual', ?, ?, ?, 'accepted')
                 """,
                 (exercise_id, source_catalogue_id, normalized_stable_code, taxonomy_version, original_json, target_json),
             )
             self._connection.commit()
-        override = self.get_manual_override(exercise_id, source_catalogue_id, taxonomy_version)
-        if not override:
+        # 刚写入的这条必然是当前目录、且 updated 最新，排在候选首位。
+        overrides = self.get_manual_overrides(exercise_id, source_catalogue_id)
+        if not overrides:
             raise RuntimeError("人工修正保存后无法读取")
-        return override
+        return overrides[0]
+
+    def _manual_rows_by_key(self, exercise_ids: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
+        """批量读取现有归类记录，供导入报告如实区分新增与覆盖。"""
+        existing: dict[tuple[str, str], dict[str, Any]] = {}
+        unique_ids = sorted({str(item).strip() for item in exercise_ids if str(item).strip()})
+        # SQLite 的变量上限按编译参数而定，分块查询避免上千题导入时越界。
+        for start in range(0, len(unique_ids), 400):
+            chunk = unique_ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._connection.execute(
+                f"""
+                SELECT exercise_id, source_catalogue_id, source, taxonomy_version
+                FROM {self._MANUAL_TABLE}
+                WHERE exercise_id IN ({placeholders})
+                """,
+                chunk,
+            ).fetchall()
+            for exercise_id, source_catalogue_id, source, taxonomy_version in rows:
+                existing[(str(exercise_id), str(source_catalogue_id))] = {
+                    "source": str(source or "manual"),
+                    "taxonomy_version": str(taxonomy_version or ""),
+                }
+        return existing
+
+    def put_skill_classifications(
+        self, rows: list[dict[str, Any]], *, preserve_manual_decisions: bool = False
+    ) -> dict[str, int]:
+        """批量写入目录整理 Skill 的归类结果。
+
+        结果与人工修正在同一张表保存，靠 ``source`` 区分来源，因此审计语义不失真。
+        每条写入都追加审计事件，便于事后核对某次导入到底改动了哪些题。
+
+        覆盖规则由 ``preserve_manual_decisions`` 决定：仅在为 True 时，同一 ``taxonomy_version``
+        内已标记为 ``manual`` 的记录才会被跳过（计入 ``skipped_manual_decisions``）。默认 False
+        意味着批量结果直接覆盖同键记录，并把 ``source`` 改写成 ``skill``。
+        """
+        if not rows:
+            return {"inserted": 0, "updated": 0, "skipped_manual_decisions": 0}
+        with self._lock:
+            previous = self._manual_rows_by_key([str(row["exercise_id"]) for row in rows])
+            inserted = updated = skipped = 0
+            for row in rows:
+                exercise_id = str(row["exercise_id"])
+                source_catalogue_id = str(row["source_catalogue_id"])
+                taxonomy_version = str(row["taxonomy_version"])
+                known = previous.get((exercise_id, source_catalogue_id))
+                if (
+                    preserve_manual_decisions
+                    and known
+                    and known["source"] == "manual"
+                    and known["taxonomy_version"] == taxonomy_version
+                ):
+                    skipped += 1
+                    continue
+                stable_code = str(row.get("stable_code", "")).strip() or None
+                original_json = json.dumps(
+                    row.get("original_target_path") or [], ensure_ascii=False, separators=(",", ":")
+                )
+                target_json = json.dumps(
+                    row.get("target_path") or [], ensure_ascii=False, separators=(",", ":")
+                )
+                self._connection.execute(
+                    f"""
+                    INSERT INTO {self._MANUAL_TABLE} (
+                        exercise_id, source_catalogue_id, stable_code, source, taxonomy_version,
+                        original_target_path_json, target_path_json
+                    ) VALUES (?, ?, ?, 'skill', ?, ?, ?)
+                    ON CONFLICT(exercise_id, source_catalogue_id) DO UPDATE SET
+                        stable_code = COALESCE(excluded.stable_code, stable_code),
+                        source = excluded.source,
+                        taxonomy_version = excluded.taxonomy_version,
+                        original_target_path_json = excluded.original_target_path_json,
+                        target_path_json = excluded.target_path_json,
+                        accepted_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (exercise_id, source_catalogue_id, stable_code, taxonomy_version, original_json, target_json),
+                )
+                self._connection.execute(
+                    f"""
+                    INSERT INTO {self._MANUAL_AUDIT_TABLE} (
+                        exercise_id, source_catalogue_id, stable_code, source, taxonomy_version,
+                        original_target_path_json, target_path_json, event_type
+                    ) VALUES (?, ?, ?, 'skill', ?, ?, ?, 'skill_import')
+                    """,
+                    (exercise_id, source_catalogue_id, stable_code, taxonomy_version, original_json, target_json),
+                )
+                if known:
+                    updated += 1
+                else:
+                    inserted += 1
+            self._connection.commit()
+        return {"inserted": inserted, "updated": updated, "skipped_manual_decisions": skipped}
 
     def record_catalogue_move(
         self,

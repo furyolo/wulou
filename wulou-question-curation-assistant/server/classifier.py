@@ -177,9 +177,7 @@ def _review_result(
 
 def _target_payload(target: Target) -> dict[str, Any]:
     data = asdict(target)
-    data["path"] = [target.topic_title, target.level2_title, target.level3_title]
-    if target.level4_title:
-        data["path"].append(target.level4_title)
+    data["path"] = target.published_path
     data.pop("include_keywords", None)
     data.pop("exclude_keywords", None)
     return data
