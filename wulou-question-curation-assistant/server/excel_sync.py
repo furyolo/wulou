@@ -1,33 +1,30 @@
 """Excel 目录的只读预检和受控新版本写入。
 
 基准工作簿永不覆盖；写入仅接受已人工审核的明确目录方案。
+
+资源约定：openpyxl 的 ``Workbook`` **不支持 with 语句**（3.1.5 实测无 ``__enter__``），
+也没有自动关闭机制，必须显式 ``close()``。其中 ``read_only=True`` 打开的句柄会一直占住
+文件（Windows 上表现为改不了名、删不掉），所以每个 ``load_workbook`` 都必须配
+``try/finally: book.close()``；``read_only=False`` 虽不占文件，也一并关闭以免对象滞留内存。
+
+编号约定：知识点编号是**署名制**，谁建的目录谁定编号，现存 E 列会出现 ZCSQG / ZCSZKH /
+ZCSQGLQ / CSZSDCF 等多种前缀，同一前缀下写法也不统一——全都合法。本模块一律按 E 列
+**原值等值反查**（``taxonomy.resolve_knowledge_point_id``），**不做任何格式校验**，因为
+新增校验会让现在能用的合法编号突然失效。
+
+（原 ``next_sf_number()`` / ``SF_PATTERN`` 已于 2026-09-17 删除：全仓无调用方，
+且它是唯一打开 ``read_only=True`` 却遗漏 ``close()`` 的路径。署名制的完整说明见 README。）
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from copy import copy
-from datetime import date
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
-
-
-# 只服务于 next_sf_number()：给“今天新发、且署名为 SF 的编号”查重避号。
-# **它不是“这个目录有没有编号”的判据**，别拿它去筛目录。
-#
-# 知识点编号是署名制：谁建的目录谁定编号，任何人都可以用自己的“字母+数字”串，
-# 没有全局统一格式。`ZCSQG<YYYYMMDD>SF<NN>` 只是本机主人的署名写法（`SF` 是主人的
-# 署名），只有主人自己或替主人干活的 Skill **新发**编号时才用它。因此现存目录里会
-# 出现 ZCSQG / ZCSZKH / ZCSZKHcwj / ZCSQGLQ / ZCSQGCYLZ / CSZSDCF 等多种前缀，
-# 同一前缀下日期段与序号段的写法也不统一——这些都是合法的知识点编号，不是“不规范”。
-#
-# 服务端一律按 E 列原值做等值反查（taxonomy.resolve_knowledge_point_id），不校验格式；
-# 任何新增的格式校验都会让现在能用的合法编号突然失效。
-SF_PATTERN = re.compile(r"^ZCSQG(\d{8})SF(\d+)$")
 
 
 def sha256(path: Path) -> str:
@@ -36,26 +33,19 @@ def sha256(path: Path) -> str:
 
 def inspect_workbook(path: Path, topic_title: str) -> dict[str, Any]:
     book = load_workbook(path, read_only=False, data_only=False)
-    matches: list[dict[str, Any]] = []
-    for sheet in book.worksheets:
-        topic_rows = [row for row in range(1, sheet.max_row + 1) if str(sheet.cell(row, 2).value or "").strip() == topic_title]
-        for topic_row in topic_rows:
-            end = next((row for row in range(topic_row + 1, sheet.max_row + 1) if str(sheet.cell(row, 2).value or "").strip().startswith("专题")), sheet.max_row + 1)
-            large_row = next((row for row in range(topic_row + 1, end) if str(sheet.cell(row, 2).value or "").strip() == "【大题】"), None)
-            matches.append({"sheet": sheet.title, "topic_row": topic_row, "topic_end_row": end - 1, "large_row": large_row})
-    if len(matches) != 1: raise ValueError(f"应唯一找到专题“{topic_title}”，实际找到 {len(matches)} 处")
-    return {"baseline": str(path.resolve()), "baseline_sha256": sha256(path), "sheets": book.sheetnames, "topic": matches[0]}
-
-
-def next_sf_number(folder: Path, today: str | None = None) -> int:
-    today = today or date.today().strftime("%Y%m%d"); maximum = 0
-    for file in folder.glob("★全国中考数学-导出目录*.xlsx"):
-        workbook = load_workbook(file, read_only=True, data_only=False)
-        for sheet in workbook.worksheets:
-            for row in sheet.iter_rows(min_col=5, max_col=5, values_only=True):
-                match = SF_PATTERN.match(str(row[0] or ""))
-                if match and match.group(1) == today: maximum = max(maximum, int(match.group(2)))
-    return maximum + 1
+    try:
+        matches: list[dict[str, Any]] = []
+        for sheet in book.worksheets:
+            topic_rows = [row for row in range(1, sheet.max_row + 1) if str(sheet.cell(row, 2).value or "").strip() == topic_title]
+            for topic_row in topic_rows:
+                end = next((row for row in range(topic_row + 1, sheet.max_row + 1) if str(sheet.cell(row, 2).value or "").strip().startswith("专题")), sheet.max_row + 1)
+                large_row = next((row for row in range(topic_row + 1, end) if str(sheet.cell(row, 2).value or "").strip() == "【大题】"), None)
+                matches.append({"sheet": sheet.title, "topic_row": topic_row, "topic_end_row": end - 1, "large_row": large_row})
+        if len(matches) != 1: raise ValueError(f"应唯一找到专题“{topic_title}”，实际找到 {len(matches)} 处")
+        sheets = list(book.sheetnames)
+    finally:
+        book.close()
+    return {"baseline": str(path.resolve()), "baseline_sha256": sha256(path), "sheets": sheets, "topic": matches[0]}
 
 
 def write_approved_plan(baseline: Path, output: Path, plan_path: Path) -> dict[str, Any]:
@@ -64,23 +54,28 @@ def write_approved_plan(baseline: Path, output: Path, plan_path: Path) -> dict[s
     if plan.get("status") != "approved": raise ValueError("Excel 方案必须先人工审核为 approved")
     if sha256(baseline) != plan.get("baseline_sha256"): raise ValueError("基准工作簿已变化，拒绝写入")
     if output.exists(): raise ValueError("目标文件已存在，拒绝覆盖")
-    book = load_workbook(baseline, data_only=False); sheet = book[plan["sheet"]]
-    insert_at = int(plan["insert_at_row"]); rows = plan.get("rows") or []
-    if not rows: raise ValueError("方案没有待写入目录行")
-    sheet.insert_rows(insert_at, amount=len(rows))
-    for offset, item in enumerate(rows):
-        row = insert_at + offset
-        level = item.get("level")
-        if level not in {3, 4}: raise ValueError("只允许写入三级或四级目录")
-        col = 3 if level == 3 else 4
-        sheet.cell(row, col).value = item["title"]
-        if item.get("knowledge_point_id"): sheet.cell(row, 5).value = item["knowledge_point_id"]
-        if item.get("reason"): sheet.cell(row, 14).value = item["reason"]
-        source_row = insert_at - 1 if insert_at > 1 else insert_at + len(rows)
-        for source_cell in sheet[source_row]:
-            target = sheet.cell(row, source_cell.column); target._style = copy(source_cell._style); target.number_format = source_cell.number_format
-    book.save(output)
-    load_workbook(output, read_only=True).close()
+    book = load_workbook(baseline, data_only=False)
+    try:
+        sheet = book[plan["sheet"]]
+        insert_at = int(plan["insert_at_row"]); rows = plan.get("rows") or []
+        if not rows: raise ValueError("方案没有待写入目录行")
+        sheet.insert_rows(insert_at, amount=len(rows))
+        for offset, item in enumerate(rows):
+            row = insert_at + offset
+            level = item.get("level")
+            if level not in {3, 4}: raise ValueError("只允许写入三级或四级目录")
+            col = 3 if level == 3 else 4
+            sheet.cell(row, col).value = item["title"]
+            if item.get("knowledge_point_id"): sheet.cell(row, 5).value = item["knowledge_point_id"]
+            if item.get("reason"): sheet.cell(row, 14).value = item["reason"]
+            source_row = insert_at - 1 if insert_at > 1 else insert_at + len(rows)
+            for source_cell in sheet[source_row]:
+                target = sheet.cell(row, source_cell.column); target._style = copy(source_cell._style); target.number_format = source_cell.number_format
+        book.save(output)
+    finally:
+        book.close()
+    probe = load_workbook(output, read_only=True)
+    probe.close()
     if sha256(baseline) != plan["baseline_sha256"]: raise ValueError("写入后基准工作簿发生变化")
     return {"output": str(output), "baseline_sha256": plan["baseline_sha256"], "inserted_rows": len(rows)}
 
@@ -108,54 +103,63 @@ def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> di
         raise ValueError("重构方案只能写入三级或四级目录行")
 
     baseline_book = load_workbook(baseline, data_only=False)
-    if sheet_name not in baseline_book.sheetnames:
-        raise ValueError("重构方案引用的工作表不存在")
-    baseline_sheet = baseline_book[sheet_name]
-    if end > baseline_sheet.max_row:
-        raise ValueError("重构范围超出工作表")
-    comparison_max_column = max(baseline_sheet.max_column, 19)
-    baseline_rows = [
-        tuple(cell.value for cell in row)
-        for row in baseline_sheet.iter_rows(max_col=comparison_max_column)
-    ]
+    try:
+        if sheet_name not in baseline_book.sheetnames:
+            raise ValueError("重构方案引用的工作表不存在")
+        baseline_sheet = baseline_book[sheet_name]
+        if end > baseline_sheet.max_row:
+            raise ValueError("重构范围超出工作表")
+        comparison_max_column = max(baseline_sheet.max_column, 19)
+        baseline_rows = [
+            tuple(cell.value for cell in row)
+            for row in baseline_sheet.iter_rows(max_col=comparison_max_column)
+        ]
+    finally:
+        baseline_book.close()
 
     book = load_workbook(baseline, data_only=False)
-    sheet = book[sheet_name]
-    removed = end - start + 1
-    sheet.delete_rows(start, removed)
-    sheet.insert_rows(start, len(rows))
-    style_source_row = start - 1 if start > 1 else start + len(rows)
-    for offset, item in enumerate(rows):
-        row_index = start + offset
-        for source_cell in sheet[style_source_row]:
-            target = sheet.cell(row_index, source_cell.column)
-            target._style = copy(source_cell._style)
-            target.number_format = source_cell.number_format
-        level = int(item["level"])
-        sheet.cell(row_index, 3 if level == 3 else 4).value = str(item["title"])
-        if item.get("knowledge_point_id"):
-            sheet.cell(row_index, 5).value = str(item["knowledge_point_id"])
-        if item.get("reason"):
-            sheet.cell(row_index, 14).value = str(item["reason"])
-        if item.get("question_count") is not None:
-            sheet.cell(row_index, 19).value = int(item["question_count"])
-    book.save(output)
+    try:
+        sheet = book[sheet_name]
+        removed = end - start + 1
+        sheet.delete_rows(start, removed)
+        sheet.insert_rows(start, len(rows))
+        style_source_row = start - 1 if start > 1 else start + len(rows)
+        for offset, item in enumerate(rows):
+            row_index = start + offset
+            for source_cell in sheet[style_source_row]:
+                target = sheet.cell(row_index, source_cell.column)
+                target._style = copy(source_cell._style)
+                target.number_format = source_cell.number_format
+            level = int(item["level"])
+            sheet.cell(row_index, 3 if level == 3 else 4).value = str(item["title"])
+            if item.get("knowledge_point_id"):
+                sheet.cell(row_index, 5).value = str(item["knowledge_point_id"])
+            if item.get("reason"):
+                sheet.cell(row_index, 14).value = str(item["reason"])
+            if item.get("question_count") is not None:
+                sheet.cell(row_index, 19).value = int(item["question_count"])
+        book.save(output)
+    finally:
+        book.close()
 
     reopened = load_workbook(output, data_only=False)
-    output_sheet = reopened[sheet_name]
-    def row_values(row_index: int) -> tuple[Any, ...]:
-        return tuple(output_sheet.cell(row_index, column).value for column in range(1, comparison_max_column + 1))
+    try:
+        output_sheet = reopened[sheet_name]
+        def row_values(row_index: int) -> tuple[Any, ...]:
+            return tuple(output_sheet.cell(row_index, column).value for column in range(1, comparison_max_column + 1))
 
-    # 被替换范围之外，前缀原样不动，后缀仅允许因行数变化整体平移。
-    for row_index in range(1, start):
-        if row_values(row_index) != baseline_rows[row_index - 1]:
-            raise ValueError("重构范围之前的单元格发生变化")
-    shift = len(rows) - removed
-    for old_row in range(end + 1, len(baseline_rows) + 1):
-        new_row = old_row + shift
-        if row_values(new_row) != baseline_rows[old_row - 1]:
-            raise ValueError("重构范围之后的单元格发生变化")
-    reopened.close()
+        # 被替换范围之外，前缀原样不动，后缀仅允许因行数变化整体平移。
+        for row_index in range(1, start):
+            if row_values(row_index) != baseline_rows[row_index - 1]:
+                raise ValueError("重构范围之前的单元格发生变化")
+        shift = len(rows) - removed
+        for old_row in range(end + 1, len(baseline_rows) + 1):
+            new_row = old_row + shift
+            if row_values(new_row) != baseline_rows[old_row - 1]:
+                raise ValueError("重构范围之后的单元格发生变化")
+    finally:
+        reopened.close()
+
     if sha256(baseline) != plan["baseline_sha256"]:
         raise ValueError("写入后基准工作簿发生变化")
     return {

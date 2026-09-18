@@ -141,7 +141,8 @@ node --test .\wulou-question-curation-assistant\tests\userscript\userscript.test
 - 新三级、四级目录只能作为候选提出，必须通过数量、旧目录对照、语义审核和人工确认。
 - Excel 写入必须生成新版本，不能覆盖基准工作簿。
 - **知识点编号是署名制：谁建的目录谁定编号。** 任何人都可以用自己的“字母+数字”串编号，没有全局统一格式。`ZCSQG<YYYYMMDD>SF<NN>` 是本机主人的署名写法（`SF` 是主人的署名），只在主人自己或替主人干活的 Skill **新发**编号时使用；只有通过审核的新增知识实体才能占用编号。别人建的编号用他们自己的字母加数字即可，同样合法。
-- **编号格式不做校验，也不该加校验。** 因为编号是署名制，目录里现存的 E 列编号必然有多种前缀和写法（实测 `ZCSQG`、`ZCSZKH`、`ZCSZKHcwj`、`ZCSQGLQ`、`ZCSQGCYLZ`、`CSZSDCF` 等，同一前缀下日期段和序号段也不统一），这些全是合法编号，不是“不规范”。本机一律按 **E 列原值等值反查**（`taxonomy.resolve_knowledge_point_id`）。`excel_sync.SF_PATTERN` 只服务于给当天新发、署名为 `SF` 的编号查重避号，**不是“某目录是否已有编号”的判据**，别拿它去筛目录。任何新增的格式校验都会让现在能用的合法编号突然失效。
+- **编号格式不做校验，也不该加校验。** 因为编号是署名制，目录里现存的 E 列编号必然有多种前缀和写法（实测 `ZCSQG`、`ZCSZKH`、`ZCSZKHcwj`、`ZCSQGLQ`、`ZCSQGCYLZ`、`CSZSDCF` 等，同一前缀下日期段和序号段也不统一），这些全是合法编号，不是“不规范”。本机一律按 **E 列原值等值反查**（`taxonomy.resolve_knowledge_point_id`）。任何新增的格式校验都会让现在能用的合法编号突然失效。
+- 曾用于给当天新发 `SF` 编号查重避号的 `excel_sync.next_sf_number()` / `SF_PATTERN` 已于 2026-09-17 删除（全仓无调用方，且是唯一打开 `read_only=True` 却遗漏 `close()` 的路径）。以后若要发新编号，直接扫 E 列原值去重即可，**不要再引入格式正则当判据**。
 
 ## Excel 目录预检
 

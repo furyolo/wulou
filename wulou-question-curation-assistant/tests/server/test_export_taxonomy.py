@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,29 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError("无法加载目录导出脚本")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+# ⚠️ openpyxl 3.1.5 写的是 `<pageMargins ... footer="0.5" />`——`/` 前面有空格。
+#    以前这里按没有空格的串做字面替换，永远匹配不上，于是"空边距"用例其实一直在读
+#    一个完全正常的文件、根本没走到兼容副本分支。改成按元素整体替换。
+_PAGE_MARGINS = re.compile(rb"<pageMargins[^>]*/>")
+_BLANK_PAGE_MARGINS = (
+    b'<pageMargins left="" right="" top="" bottom="" header="0.3" footer="0.3"/>'
+)
+
+
+def blank_out_page_margins(workbook_path: Path) -> bool:
+    """把工作簿里的页边距改写成空值，模拟题湖导出器的写法。返回是否真的改到了。"""
+    rewritten = workbook_path.with_name("rewritten-" + workbook_path.name)
+    changed = False
+    with ZipFile(workbook_path) as source, ZipFile(rewritten, "w", ZIP_DEFLATED) as destination:
+        for member in source.infolist():
+            content = source.read(member.filename)
+            if member.filename == "xl/worksheets/sheet1.xml":
+                content, count = _PAGE_MARGINS.subn(_BLANK_PAGE_MARGINS, content)
+                changed = changed or count > 0
+            destination.writestr(member, content)
+    rewritten.replace(workbook_path)
+    return changed
 
 
 class ExportTaxonomyTests(unittest.TestCase):
@@ -93,21 +117,74 @@ class ExportTaxonomyTests(unittest.TestCase):
             book.save(workbook_path)
             book.close()
 
-            temporary_path = Path(directory) / "rewritten.xlsx"
-            with ZipFile(workbook_path) as source, ZipFile(temporary_path, "w", ZIP_DEFLATED) as destination:
-                for member in source.infolist():
-                    content = source.read(member.filename)
-                    if member.filename == "xl/worksheets/sheet1.xml":
-                        content = content.replace(
-                            b"<pageMargins left=\"0.75\" right=\"0.75\" top=\"1\" bottom=\"1\" header=\"0.5\" footer=\"0.5\"/>",
-                            b"<pageMargins left=\"\" right=\"\" top=\"\" bottom=\"\" header=\"0.3\" footer=\"0.3\"/>",
-                        )
-                    destination.writestr(member, content)
-            temporary_path.replace(workbook_path)
+            self.assertTrue(blank_out_page_margins(workbook_path), "空边距没写进去，用例会失去意义")
 
             exported = MODULE.export_taxonomy(workbook_path, "目录")
 
+            # ⚠️ 兼容副本分支不能把原工作簿的句柄漏着：Windows 上会把文件锁死，
+            #    工作簿随后改不了名、删不掉、Excel 里也打不开。
+            workbook_path.unlink()
+            self.assertFalse(workbook_path.exists())
+
         self.assertEqual(exported["topics"][0]["level2"][0]["level3"][0]["title"], "实数运算")
+
+    def test_compatible_copy_also_covers_plain_value_error_from_openpyxl(self) -> None:
+        """兼容副本分支必须同时捕 TypeError 和 ValueError。
+
+        openpyxl 3.1.5 把 `float('')` 的 ValueError 包成 TypeError 抛出来，
+        所以历史上只写 `except TypeError` 也能跑；但那是它的内部包装行为，
+        换版本改成直接抛 ValueError 就会让服务端启动直接崩。这条护栏钉住两者都捕。
+        """
+        from unittest import mock
+
+        from server import taxonomy_export as export_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            workbook_path = Path(directory) / "taxonomy.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "目录"
+            sheet.cell(1, 1).value = "专题1：实数"
+            sheet.cell(2, 2).value = "【大题】"
+            sheet.cell(3, 3).value = "实数运算"
+            book.save(workbook_path)
+            book.close()
+            self.assertTrue(blank_out_page_margins(workbook_path))
+
+            real_load_workbook = export_module.load_workbook
+            calls = {"count": 0}
+
+            def raise_value_error_once(path, *args, **kwargs):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise ValueError("could not convert string to float: ''")
+                return real_load_workbook(path, *args, **kwargs)
+
+            with mock.patch.object(export_module, "load_workbook", raise_value_error_once):
+                exported = MODULE.export_taxonomy(workbook_path, "目录")
+
+        self.assertEqual(calls["count"], 2, "应当先失败一次，再读剥过边距的临时副本")
+        self.assertEqual(exported["topics"][0]["level2"][0]["level3"][0]["title"], "实数运算")
+
+    def test_unreadable_workbook_still_raises_when_no_margin_repair_applies(self) -> None:
+        """捕得宽不等于吞异常：不是空边距引起的问题，必须原样抛出。"""
+        from unittest import mock
+
+        from server import taxonomy_export as export_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            workbook_path = Path(directory) / "taxonomy.xlsx"
+            book = Workbook()
+            book.active.title = "目录"
+            book.save(workbook_path)
+            book.close()
+
+            # 文件本身没有空页边距 ⇒ 兼容副本不做任何改动 ⇒ 原异常必须照旧抛出。
+            with mock.patch.object(
+                export_module, "load_workbook", side_effect=ValueError("unrelated failure")
+            ):
+                with self.assertRaises(ValueError):
+                    export_module.export_taxonomy(workbook_path, "目录")
 
 
 if __name__ == "__main__":

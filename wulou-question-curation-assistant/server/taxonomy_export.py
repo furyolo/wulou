@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
 import tempfile
@@ -90,25 +91,48 @@ def _compatible_workbook_copy(workbook_path: Path) -> Path | None:
 
 
 def _load_workbook(workbook_path: Path):
+    """打开目录工作簿；空页边距导致读不了时改读一份剥掉空边距的临时副本。
+
+    ⚠️ 一律先把字节读进内存再交给 openpyxl，不把手柄递给它。原因有二：
+
+    1. **锁文件。** `load_workbook(路径)` 解析到一半抛异常时，它已经打开的
+       文件句柄**不会被关掉**，会在 Windows 上一直占着这个工作簿——表现为
+       工作簿改不了名、删不掉、Excel 里打不开。而这条失败路径恰好就是
+       "目录工作簿带空边距"的情形，也就是题湖系统导出的常态，躲不开。
+       先 `read_bytes()` 再喂 `BytesIO`，磁盘句柄在读完那一刻就关了。
+    2. **异常类型。** openpyxl 3.1.5 把 `float('')` 的 `ValueError` 包成
+       `TypeError('expected <class 'float'>')` 抛出来，所以历史上只捕
+       `TypeError` 也能跑；但那是它的内部包装行为，换版本就可能直接抛
+       `ValueError`。两个都捕，才不会哪天服务端启动直接崩。
+
+    捕得宽不等于吞异常：副本里没做任何改动时 `_compatible_workbook_copy`
+    返回 ``None``，原异常照旧向上抛。
+
+    返回的就是工作簿本身，不把临时副本交给调用方去清理：``read_only=False``
+    的 openpyxl 在 ``read()`` 里一次性读完全部内容，副本的字节早已进内存，
+    留在磁盘上再删只是徒增一条"调用方忘了删"的路径。读完即删，只有一处
+    负责释放。
+    """
     try:
-        return load_workbook(workbook_path, read_only=False, data_only=False), None
-    except TypeError:
+        return load_workbook(io.BytesIO(workbook_path.read_bytes()),
+                             read_only=False, data_only=False)
+    except (TypeError, ValueError):
         compatible_path = _compatible_workbook_copy(workbook_path)
         if compatible_path is None:
             raise
         try:
-            book = load_workbook(compatible_path, read_only=False, data_only=False)
-        except Exception:
+            book = load_workbook(io.BytesIO(compatible_path.read_bytes()),
+                                 read_only=False, data_only=False)
+        finally:
             compatible_path.unlink(missing_ok=True)
-            raise
         LOGGER.warning("目录工作簿含空白页边距，已使用临时兼容副本读取：%s", workbook_path)
-        return book, compatible_path
+        return book
 
 
 def export_taxonomy(workbook_path: Path, sheet_name: str) -> dict[str, Any]:
     """只读提取 A、B、C、D、E、N 列定义的目录及其分类边界。"""
     source_path = workbook_path.resolve()
-    book, compatible_path = _load_workbook(source_path)
+    book = _load_workbook(source_path)
     try:
         sheet = book[sheet_name]
         topic_rows: list[tuple[int, str, int]] = []
@@ -173,8 +197,6 @@ def export_taxonomy(workbook_path: Path, sheet_name: str) -> dict[str, Any]:
                 })
     finally:
         book.close()
-        if compatible_path:
-            compatible_path.unlink(missing_ok=True)
 
     if not topics:
         raise ValueError("未从工作簿 A 列专题范围内提取到任何【大题】目录")
