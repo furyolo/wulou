@@ -9,6 +9,7 @@ const {
   stableCodeFromText,
   runPool,
   chunkItems,
+  concurrencyFromSettings,
   classificationPayload,
   answerPreviewData,
   answerPreviewContent,
@@ -174,6 +175,23 @@ test('有限并发保留输入顺序', async () => {
   });
   assert.equal(peak, 2);
   assert.deepEqual(result.map(item => item.value), [2, 4, 6, 8]);
+});
+
+test('浏览器端请求池跟随前端全局并发量设置，缺失或越界时退回兜底值', () => {
+  // 前端「同时处理的请求」保存为 pipeline.max_concurrent_requests，是全局并发量。
+  assert.equal(concurrencyFromSettings({ pipeline: { max_concurrent_requests: 5 } }, 3), 5);
+  assert.equal(concurrencyFromSettings({ pipeline: { max_concurrent_requests: '4' } }, 3), 4);
+  // 兼容旧字段位置。
+  assert.equal(concurrencyFromSettings({ max_concurrent_requests: 2 }, 3), 2);
+  // 设置尚未载入、字段缺失、非正数：一律用兜底值，不能把并发降到 0。
+  assert.equal(concurrencyFromSettings(null, 3), 3);
+  assert.equal(concurrencyFromSettings(undefined, 3), 3);
+  assert.equal(concurrencyFromSettings({ pipeline: {} }, 3), 3);
+  assert.equal(concurrencyFromSettings({ pipeline: { max_concurrent_requests: 0 } }, 3), 3);
+  assert.equal(concurrencyFromSettings({ pipeline: { max_concurrent_requests: -1 } }, 3), 3);
+  assert.equal(concurrencyFromSettings({ pipeline: { max_concurrent_requests: 'abc' } }, 3), 3);
+  // 服务端只接受 1~5，超出上限要封顶而不是照单全收。
+  assert.equal(concurrencyFromSettings({ pipeline: { max_concurrent_requests: 9 } }, 3), 5);
 });
 
 test('整页题目按六题分块', () => {

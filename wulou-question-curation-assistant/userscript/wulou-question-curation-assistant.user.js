@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         题湖题库数学题分类助手
 // @namespace    https://www.wulouai.com/
-// @version      0.16.27
+// @version      0.16.29
 // @description  采集当前题目页，显示分类建议，并可将确认后的建议写入题湖可视化分类。
 // @match        https://www.wulouai.com/user-center/exercise-part/*
 // @grant        GM_xmlhttpRequest
@@ -18,6 +18,8 @@
   const ATTRIBUTE_SELECTOR = '.attributes_modify[data-url]';
   const PANEL_ID = 'wulou-question-curation-panel';
   const BADGE_CLASS = 'wulou-curation-badge';
+  // 下面是各请求池的**兜底值**：前端「处理速度 → 同时处理的请求」是全局设置，
+  // 运行时会覆盖它（见 globalConcurrency）。仅在设置尚未载入时使用这些默认。
   // 全量目录分析会跨分页读取属性；并发受限以减少站点限流，同时避免顺序等待。
   const PAGE_FETCH_CONCURRENCY = 4;
   const ATTRIBUTE_CONCURRENCY = 6;
@@ -227,6 +229,23 @@
   function classificationProgressText({ scopeLabel, stage, completed, total, failed = 0, jobIndex = 1, jobCount = 1 }) {
     const jobPrefix = jobCount > 1 ? `第 ${jobIndex}/${jobCount} 个作业，` : '';
     return `${scopeLabel}：正在${stage}（${jobPrefix}${completed}/${total} 道已完成）${failed ? `，${failed} 道请求失败` : ''}`;
+  }
+
+  // 前端「处理速度 → 同时处理的请求」是整个前端项目的全局并发量，服务端持久化为
+  // pipeline.max_concurrent_requests（合法范围 1~5，见 server/main.py:597/612）。
+  // 浏览器端请求池一律以它为准；设置尚未载入或值非法时退回各自的兜底常量，
+  // 避免"界面上写着 5、实际只跑 3"这种表里不一。
+  // 取值逻辑做成纯函数，便于在无 DOM 的测试环境里直接断言。
+  function concurrencyFromSettings(cloudSettings, fallback) {
+    const cloud = cloudSettings || {};
+    const raw = (cloud.pipeline || {}).max_concurrent_requests ?? cloud.max_concurrent_requests;
+    const value = Math.floor(Number(raw));
+    if (!Number.isFinite(value) || value < 1) return fallback;
+    return Math.min(value, 5);
+  }
+
+  function globalConcurrency(fallback) {
+    return concurrencyFromSettings(state.cloudSettings, fallback);
   }
 
   async function runPool(items, concurrency, worker) {
@@ -551,7 +570,7 @@
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
-      normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems,
+      normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems, concurrencyFromSettings,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
@@ -2770,6 +2789,11 @@
     if (!focus) return { restored: false, reason: '未选中可汇总的当前目录' };
     const restoreId = ++state.cacheRestoreId;
     setBusy(true);
+    // ⚠️ 汇总期间按钮上的数字只反映内存里已有的结果——往往只有首页那一页，
+    //    看上去像是“只能采纳本页”。改成一个明确的进行中字样，避免使用者据此
+    //    误判作用域；真实数量由 finally 里的 setBusy(false) 交回
+    //    updateAcceptAllAction 写回。
+    elements.acceptAll.textContent = '正在汇总当前目录…';
     try {
       const collected = await collectAllFocusPages({ purpose: 'acceptance' });
       if (restoreId !== state.cacheRestoreId) return { restored: false, cancelled: true };
@@ -2791,6 +2815,7 @@
         const lookup = await request('POST', '/api/v1/cache/classifications/lookup', { questions: chunk });
         if (restoreId !== state.cacheRestoreId) return { restored: false, cancelled: true };
         cachedResults.push(...(lookup.results || []));
+        elements.acceptAll.textContent = `正在汇总当前目录…已取回 ${cachedResults.length} 道`;
       }
       for (const rawResult of cachedResults) {
         const result = withAcceptanceState(normalizeClassificationResult(rawResult));
@@ -2855,7 +2880,7 @@
     }
     setStatus(`正在采纳${scopeLabel} ${candidates.length} 道题：${localCount} 道跳过，${moveCount} 道并发移动…`);
     try {
-      const outcomes = await runPool(candidates, ACCEPTANCE_CONCURRENCY,
+      const outcomes = await runPool(candidates, globalConcurrency(ACCEPTANCE_CONCURRENCY),
         ({ exerciseId }) => acceptSuggestion(exerciseId, { announce: false }));
       const completed = outcomes.map(item => item.status === 'fulfilled' ? item.value : {
         accepted: false,
