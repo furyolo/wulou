@@ -26,13 +26,15 @@ from typing import Any
 
 from openpyxl import load_workbook
 
+from server.taxonomy_export import load_catalogue_workbook
+
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def inspect_workbook(path: Path, topic_title: str) -> dict[str, Any]:
-    book = load_workbook(path, read_only=False, data_only=False)
+    book = load_catalogue_workbook(path)
     try:
         matches: list[dict[str, Any]] = []
         for sheet in book.worksheets:
@@ -54,7 +56,7 @@ def write_approved_plan(baseline: Path, output: Path, plan_path: Path) -> dict[s
     if plan.get("status") != "approved": raise ValueError("Excel 方案必须先人工审核为 approved")
     if sha256(baseline) != plan.get("baseline_sha256"): raise ValueError("基准工作簿已变化，拒绝写入")
     if output.exists(): raise ValueError("目标文件已存在，拒绝覆盖")
-    book = load_workbook(baseline, data_only=False)
+    book = load_catalogue_workbook(baseline)
     try:
         sheet = book[plan["sheet"]]
         insert_at = int(plan["insert_at_row"]); rows = plan.get("rows") or []
@@ -80,11 +82,25 @@ def write_approved_plan(baseline: Path, output: Path, plan_path: Path) -> dict[s
     return {"output": str(output), "baseline_sha256": plan["baseline_sha256"], "inserted_rows": len(rows)}
 
 
+def _as_catalog_id(value: Any) -> Any:
+    """目录 ID 在基准工作簿里是数字。纯数字串按数字写回，避免类型漂移。"""
+    text = str(value).strip()
+    return int(text) if text.isdigit() else text
+
+
 def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> dict[str, Any]:
     """重建一个已锚定的三级目录范围，并证明范围外单元格未改变。
 
     方案必须由人工在审核页补全 ``replace_start_row``、``replace_end_row`` 和
     ``rows``。该函数不猜测 Excel 行号，不接受二级容器行，也不覆盖基准文件。
+
+    目录 ID（P 列）继承
+    --------------------------------------------------------------------------
+    语义沿用、改名或移动的**既有**实体必须继承原 P 列目录 ID，行里写
+    ``catalog_id``；实际新增的实体**不要**写 ``catalog_id``，P 列留空由题湖
+    导入时生成。这是硬规矩：清空或改写既有实体的目录 ID 会让系统把老节点当
+    新节点，题目归属断链。本函数只接受基准工作簿里**已存在**的 ``catalog_id``
+    （即只准继承、不准编造），且同一方案里不得重复。
     """
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if plan.get("status") != "approved":
@@ -101,8 +117,11 @@ def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> di
         raise ValueError("重构方案缺少工作表、明确替换范围或目录行")
     if any(not isinstance(row, dict) or row.get("level") not in {3, 4} for row in rows):
         raise ValueError("重构方案只能写入三级或四级目录行")
+    inherited = [_as_catalog_id(row["catalog_id"]) for row in rows if str(row.get("catalog_id") or "").strip()]
+    if len(inherited) != len(set(inherited)):
+        raise ValueError("重构方案里要继承的目录 ID 有重复")
 
-    baseline_book = load_workbook(baseline, data_only=False)
+    baseline_book = load_catalogue_workbook(baseline)
     try:
         if sheet_name not in baseline_book.sheetnames:
             raise ValueError("重构方案引用的工作表不存在")
@@ -117,7 +136,13 @@ def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> di
     finally:
         baseline_book.close()
 
-    book = load_workbook(baseline, data_only=False)
+    # 只准继承、不准编造：方案里的目录 ID 必须能在基准工作簿里找到原值。
+    baseline_ids = {str(row[15]) for row in baseline_rows if row[15] not in (None, "")}
+    unknown = [str(item) for item in inherited if str(item) not in baseline_ids]
+    if unknown:
+        raise ValueError("方案要继承的目录 ID 在基准工作簿中不存在：%s" % ",".join(unknown))
+
+    book = load_catalogue_workbook(baseline)
     try:
         sheet = book[sheet_name]
         removed = end - start + 1
@@ -138,11 +163,13 @@ def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> di
                 sheet.cell(row_index, 14).value = str(item["reason"])
             if item.get("question_count") is not None:
                 sheet.cell(row_index, 19).value = int(item["question_count"])
+            if str(item.get("catalog_id") or "").strip():
+                sheet.cell(row_index, 16).value = _as_catalog_id(item["catalog_id"])
         book.save(output)
     finally:
         book.close()
 
-    reopened = load_workbook(output, data_only=False)
+    reopened = load_catalogue_workbook(output)
     try:
         output_sheet = reopened[sheet_name]
         def row_values(row_index: int) -> tuple[Any, ...]:
@@ -157,6 +184,18 @@ def write_approved_refactor(baseline: Path, output: Path, plan_path: Path) -> di
             new_row = old_row + shift
             if row_values(new_row) != baseline_rows[old_row - 1]:
                 raise ValueError("重构范围之后的单元格发生变化")
+
+        # 替换范围之外已有的编号，不得被新行重复占用（基准自身的历史重复不在此列）。
+        written_end = start + len(rows) - 1
+        outside_codes = {
+            str(output_sheet.cell(index, 5).value)
+            for index in range(2, output_sheet.max_row + 1)
+            if not (start <= index <= written_end) and output_sheet.cell(index, 5).value not in (None, "")
+        }
+        for index in range(start, written_end + 1):
+            code = output_sheet.cell(index, 5).value
+            if code not in (None, "") and str(code) in outside_codes:
+                raise ValueError("新行的知识点编号与替换范围之外的编号撞号：%s" % code)
     finally:
         reopened.close()
 

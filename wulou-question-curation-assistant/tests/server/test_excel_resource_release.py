@@ -23,10 +23,16 @@ from server.excel_sync import (  # noqa: E402
 
 
 class WorkbookCloseSpy:
-    """记录 excel_sync 每次打开的工作簿，并在实例上挂钩 close 以观察是否真被调用。"""
+    """记录 excel_sync 每次打开的工作簿，并在实例上挂钩 close 以观察是否真被调用。
+
+    挂钩点是 ``excel_sync.load_catalogue_workbook``（不是 openpyxl 的
+    ``load_workbook``）：excel_sync 读基准工作簿一律走这个包装，由它处理空页边距
+    兼容副本。``write_approved_plan`` 末尾那个 ``read_only=True`` 的 probe 仍直接
+    调 openpyxl，本 spy 覆盖不到它 —— 那条路径由用例末尾真实的 ``os.replace`` 兜底。
+    """
 
     def __init__(self) -> None:
-        self.real = excel_sync.load_workbook
+        self.real = excel_sync.load_catalogue_workbook
         self.records: list[dict] = []
 
     def __call__(self, *args, **kwargs):
@@ -43,7 +49,7 @@ class WorkbookCloseSpy:
         return book
 
     def install(self):
-        patcher = mock.patch.object(excel_sync, "load_workbook", self)
+        patcher = mock.patch.object(excel_sync, "load_catalogue_workbook", self)
         patcher.start()
         return patcher
 

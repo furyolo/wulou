@@ -90,7 +90,7 @@ def _compatible_workbook_copy(workbook_path: Path) -> Path | None:
     return temporary_path
 
 
-def _load_workbook(workbook_path: Path):
+def load_catalogue_workbook(workbook_path: Path):
     """打开目录工作簿；空页边距导致读不了时改读一份剥掉空边距的临时副本。
 
     ⚠️ 一律先把字节读进内存再交给 openpyxl，不把手柄递给它。原因有二：
@@ -129,10 +129,14 @@ def _load_workbook(workbook_path: Path):
         return book
 
 
+# 旧名保留：历史上临时诊断脚本按 `_load_workbook` 调用过，改名不再让它报错。
+_load_workbook = load_catalogue_workbook
+
+
 def export_taxonomy(workbook_path: Path, sheet_name: str) -> dict[str, Any]:
     """只读提取 A、B、C、D、E、N 列定义的目录及其分类边界。"""
     source_path = workbook_path.resolve()
-    book = _load_workbook(source_path)
+    book = load_catalogue_workbook(source_path)
     try:
         sheet = book[sheet_name]
         topic_rows: list[tuple[int, str, int]] = []
