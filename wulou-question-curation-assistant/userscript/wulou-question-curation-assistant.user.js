@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         题湖题库数学题分类助手
+// @name         AI分类助手
 // @namespace    https://www.wulouai.com/
-// @version      0.16.29
-// @description  采集当前题目页，显示分类建议，并可将确认后的建议写入题湖可视化分类。
+// @version      0.19.2
+// @description  采集当前题目页、按已配置的 AI 模型给出分类建议，并可一键采纳写入题湖可视化分类，或导入本地 AI Agent 产出的归类结果。
 // @match        https://www.wulouai.com/user-center/exercise-part/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
@@ -31,6 +31,9 @@
   const SKILL_IMPORT_TIMEOUT_MS = 120000;
   // 连接测试只读取模型详情，不触发模型生成；超过 15 秒可视为未能快速连通。
   const CONNECTION_TEST_TIMEOUT_MS = 15000;
+  // 目录来源的「选择文件夹 / 选择 Excel」要在本机弹系统窗口，用户翻目录要时间。
+  // 窗口没关掉之前这一轮只会拿到「还开着」，所以给足 5 分钟，不做成失败。
+  const DIRECTORY_PICKER_TIMEOUT_MS = 300000;
   const CONNECTION_TEST_POLL_INTERVAL_MS = 300;
   const CLASSIFICATION_JOB_POLL_INTERVAL_MS = 2000;
   // 服务端单作业上限。800 题级当前目录范围会作为一个总作业持续流水化；
@@ -568,13 +571,88 @@
     return destructive ? 'danger' : 'primary';
   }
 
+  // 目录来源那个框里只写「哪个文件夹 · 哪一版」。工作簿全名又长又重复
+  // （★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx），整段塞进去会把面板顶出
+  // 横向滚动条；而版本信息就写在文件名尾巴上，靠 CSS 截尾又会把最要紧的那段切掉，所以这里自己缩。
+  function shortenDirectoryLabel(value, maximum = 30) {
+    const segments = String(value || '').split(/[\\/]+/).filter(Boolean);
+    if (!segments.length) return '';
+    const fileName = segments[segments.length - 1];
+    const folder = segments.length > 1 ? segments[segments.length - 2] : '';
+    // 版本号只写在文件名尾巴上（…-2026-09-18 v3.xlsx），丢了就分不清用的是哪一版，必须留；
+    // 认不出这个格式就退回完整文件名，再靠下面的总长度兜底。
+    const stamp = (fileName.match(/\d{4}-\d{2}-\d{2}\s+v\d+(?=\.xlsx$)/i) || [fileName])[0];
+    // 同一个文件夹里可能放着好几组工作簿，这时文件名里的课程 ID 是唯一能分辨的标记。但它一是给机器
+    // 看的，二是长；所以只在还剩地方的时候带上，绝不能为了它去切版本号或文件夹名。
+    const family = (fileName.match(/\bID-\d+/i) || [''])[0];
+    const folderLabel = folder.length > 14 ? `${folder.slice(0, 13)}…` : folder;
+    const join = (...parts) => parts.filter(Boolean).join(' · ');
+    const full = join(folderLabel, family, stamp);
+    if (full.length <= maximum) return full;
+    const lean = join(folderLabel, stamp);
+    if (lean.length <= maximum) return lean;
+    return `${lean.slice(0, maximum - 1)}…`;
+  }
+
+  // 设置面板里「目录来源」只有一个框，所以这里只算三件事：框里显示什么、鼠标停住时
+  // 提示什么、出错时旁边写什么。正常时旁边不写字——框里已经是当前生效的那一份了。
+  function describeDirectorySource(source) {
+    if (!source || typeof source !== 'object') {
+      return {
+        label: '暂时读不到目录来源', placeholder: true, title: '',
+        message: '暂时读不到目录来源列表，请确认本地服务在运行。', tone: 'warning',
+      };
+    }
+    const anchor = String(source.anchor || '');
+    const active = String(source.active || '');
+    if (!anchor) {
+      return {
+        label: '还没选目录来源', placeholder: true, title: '',
+        message: '还没有选目录来源，当前目录可能不是最新的。', tone: 'error',
+      };
+    }
+    if (!source.anchor_valid) {
+      return {
+        label: shortenDirectoryLabel(anchor), placeholder: false, title: anchor,
+        message: `当前目录来源已失效：${source.error || shortenDirectoryLabel(anchor)}`, tone: 'error',
+      };
+    }
+    return {
+      label: shortenDirectoryLabel(active || anchor), placeholder: false,
+      title: active || anchor, message: '', tone: 'success',
+    };
+  }
+
+  // 用户在「手动指定路径」里选了文件夹、而里面有好几组命名不同的目录工作簿时，
+  // 服务端不会替他猜，只把候选回给前端。这里算清每一条怎么显示，DOM 层只管铺开。
+  function describeFolderWorkbookChoices(families) {
+    return (Array.isArray(families) ? families : [])
+      .map(item => {
+        const path = String(item?.path || '');
+        if (!path) return null;
+        // 缺文件名时退化成路径最后一段：这里要的是「哪一份工作簿」，不是缩略路径。
+        const name = String(item?.file_name || '') || path.split(/[\\/]/).filter(Boolean).pop() || path;
+        // 用户刚点过这个文件夹，所以这里的主语是「哪一组命名 + 最新是哪一份」。
+        // 前缀末尾多半是分隔符（题湖导出的工作是「名称,ID-3777-」这种写法），去掉再显示。
+        const prefix = String(item?.prefix || '').replace(/[\s,，-]+$/, '') || '未命名分组';
+        return {
+          value: path,
+          name,
+          meta: `${prefix} · 同组 ${Number(item?.version_count || 0)} 个版本`,
+          title: path,
+        };
+      })
+      .filter(Boolean);
+  }
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       normalizeWhitespace, formatChinaTime, chinaDate, stableCodeFromText, runPool, chunkItems, concurrencyFromSettings,
       classificationPayload, answerPreviewData, answerPreviewContent, focusSnapshotMatches, normalizeClassificationResult, reviewReasonLabels, canAcceptClassification, resolveCataloguePath,
       serializeSuccessfulControls, buildCatalogueMovePayload, navigationPathFromTreeRows, buildHistoryReportHtml, compactHistoryPath,
       sourceTextWithoutAssistant, pendingAcceptanceItems, acceptanceModeForCatalogueIds, completionStateForTarget, paginationUrlsFromDocument,
-      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, needsDirectoryReview, skillImportBody, confirmAcceptClass, CLASSIFICATION_JOB_MAX_QUESTIONS,
+      reviewFirstItems, pageSlice, classificationProgressText, focusScopeForNavigationPath, acceptAllActionMode, manualSelectionPayload, historyRangePreviewEnd, needsDirectoryReview, skillImportBody, confirmAcceptClass,
+      describeDirectorySource, shortenDirectoryLabel, describeFolderWorkbookChoices, CLASSIFICATION_JOB_MAX_QUESTIONS,
     };
     return;
   }
@@ -594,6 +672,7 @@
     cloudConfigured: false,
     cloudProfiles: [],
     cloudSettings: null,
+    directorySource: null,
     profileNameSave: Promise.resolve(),
     profileDrag: null,
     suppressProfileClickUntil: 0,
@@ -628,7 +707,7 @@
       button:active { transform: translateY(1px); }
       button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #9bd0bf; outline-offset: 2px; }
       button:disabled { opacity: .52; cursor: default; transform: none; }
-      .tab { position: fixed; right: 0; top: 44%; z-index: 2147483000; display: grid; gap: 2px; justify-items: center; width: 50px; padding: 12px 6px; border-radius: 12px 0 0 12px; background: #126b5c; border-color: #126b5c; color: #fff; box-shadow: 0 10px 28px rgb(18 107 92 / .24); }
+      .tab { position: fixed; right: 0; top: 44%; z-index: 2147483000; display: grid; gap: 2px; justify-items: center; width: 56px; padding: 12px 6px; border-radius: 12px 0 0 12px; background: #126b5c; border-color: #126b5c; color: #fff; box-shadow: 0 10px 28px rgb(18 107 92 / .24); }
       .tab:hover { background: #0c5649; border-color: #0c5649; }
       .tab-arrow { font: 22px/1 sans-serif; }
       .tab-text { font-size: 11px; font-weight: 700; letter-spacing: .08em; }
@@ -687,9 +766,29 @@
       .profile-name-editor { width: 100%; min-height: 36px; border: 0; border-radius: 9px; background: #fff; color: #29453d; font-size: 12px; font-weight: 650; padding: 7px 9px; }
       .cloud-profile-name { display: none; }
       .profile-add { min-height: 36px; border-style: dashed; color: #526660; font-size: 12px; padding: 5px 9px; }
-      .model-settings { display: grid; gap: 8px; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
+      .model-settings { display: grid; gap: 8px; min-width: 0; padding: 10px; border: 1px solid #dce7e3; border-radius: 10px; background: #fff; }
       .model-settings h4 { margin: 0; color: #29453d; font-size: 12px; }
       .model-settings p { margin: -2px 0 0; color: #687a74; font-size: 11px; }
+      .directory-workbook-status { word-break: break-all; }
+      .directory-workbook-status:empty { display: none; }
+      .directory-workbook-status.warning { color: #8a5a1c; }
+      .directory-workbook-status.error { color: #9a3430; }
+      .directory-workbook-status.success { color: #28704d; }
+      /* 目录来源就一个框：长得跟别的输入框一样，点它就弹本机选择窗口，
+         选完直接应用到这个框里。不给多余的按钮和说明文字。
+         ⚠️ min-width:0 是必须的：flex/grid 子项默认最小宽度是内容宽度，长路径会把
+         面板顶出横向滚动条；这里允许收缩，超出部分由 CSS 省略号兜底。 */
+      .directory-source-field { display: flex; align-items: center; width: 100%; min-width: 0; overflow: hidden; justify-content: space-between; gap: 8px; min-height: 36px; border-color: #cfdad5; border-radius: 8px; padding: 7px 9px; }
+      .directory-source-field:hover { border-color: #78a99a; background: #f5fbf8; }
+      .directory-source-path { flex: 1 1 auto; min-width: 0; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+      .directory-source-path.placeholder { color: #8a9a94; }
+      .directory-source-hint { flex: 0 0 auto; color: #687a74; font-size: 11px; }
+      /* 只有「这个文件夹里有多组工作簿」时才出现，平时不占地方。 */
+      .directory-folder-choices { display: grid; gap: 6px; min-width: 0; margin-top: 2px; }
+      .directory-folder-choices[hidden] { display: none; }
+      .directory-folder-choice { display: grid; gap: 2px; min-width: 0; justify-items: start; text-align: left; }
+      .directory-folder-choice .choice-name { font-size: 12px; font-weight: 650; word-break: break-all; }
+      .directory-folder-choice .choice-meta { color: #687a74; font-size: 11px; word-break: break-all; }
       .profile-actions, .settings-actions, .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
       .profile-actions { justify-content: flex-start; }
       .test-cloud-connection { min-height: 30px; padding: 4px 9px; font-size: 12px; }
@@ -758,14 +857,14 @@
       @media (max-width: 480px) { .panel { right: 10px; width: calc(100vw - 20px); padding: 15px; } .history-date-dialog { width: calc(100vw - 20px); } .cloud-profile-name { width: 98px; } .history-header { flex-wrap: wrap; } .history-date-range { order: 3; margin-left: 0; } .history-export-actions { margin-left: auto; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
     </style>
-    <button class="tab" type="button" aria-label="展开题目分类助手" aria-expanded="false">
+    <button class="tab" type="button" aria-label="展开AI分类助手" aria-expanded="false">
       <span class="tab-arrow" aria-hidden="true">‹</span>
-      <span class="tab-text">分类</span>
+      <span class="tab-text">AI分类</span>
       <span class="tab-status" aria-hidden="true"></span>
     </button>
-      <section class="panel" role="region" aria-label="题目分类助手" inert>
-      <section class="main-view" aria-label="分类助手主界面">
-      <div class="header"><h2>题目分类助手</h2><div class="header-actions"><button class="settings" type="button" aria-expanded="false">设置</button><button class="close" type="button" aria-label="收起面板">›</button></div></div>
+      <section class="panel" role="region" aria-label="AI分类助手" inert>
+      <section class="main-view" aria-label="AI分类助手主界面">
+      <div class="header"><h2>AI分类助手</h2><div class="header-actions"><button class="settings" type="button" aria-expanded="false">设置</button><button class="close" type="button" aria-label="收起面板">›</button></div></div>
       <div class="actions"><button class="primary classify" type="button" disabled>识别当前页</button></div>
       <div class="actions"><button class="primary classify-focus" type="button" disabled>识别当前目录全部题目</button></div>
       <div class="actions"><button class="restore-focus" type="button" hidden disabled>恢复上次审核队列</button></div>
@@ -786,6 +885,7 @@
         <section class="profile-bar" aria-label="模型方案"><select class="cloud-profile-select" hidden aria-hidden="true"></select><div class="profile-tabs" role="tablist" aria-label="选择模型方案"><button class="create-cloud-profile profile-add" type="button">＋ 新建方案</button></div><input class="cloud-profile-name" type="text" maxlength="40" autocomplete="off" aria-hidden="true" tabindex="-1"></section>
          <div class="form">
            <section class="model-settings"><h4>连接信息</h4><label>协议<select class="cloud-protocol"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option><option value="anthropic_messages">Claude Messages</option></select></label><label>接口地址<input class="cloud-base-url" type="url" autocomplete="off" placeholder="https://api.openai.com"></label><label>API 密钥<input class="cloud-api-key" type="password" autocomplete="new-password" placeholder="留空则保留已保存的密钥"></label><details class="advanced-connection"><summary>高级连接选项</summary><div class="advanced-connection-fields"><label>请求兼容方式<select class="request-compatibility"><option value="standard">标准（默认）</option><option value="go_http">兼容模式</option></select></label><p class="custom-header-hint">仅当接口拒绝标准连接时，才改用兼容模式。</p><label>自定义请求头（可选）<textarea class="custom-headers" autocomplete="off" spellcheck="false" placeholder="每行：名称: 值"></textarea></label><p class="custom-header-hint custom-header-status"></p><label class="clear-custom-headers-row"><input class="clear-custom-headers" type="checkbox">移除已保存的自定义请求头</label></div></details><div class="profile-actions"><button class="test-cloud-connection" type="button">测试连接</button></div><div class="connection-test-status" role="status" aria-live="polite"></div></section>
+           <section class="model-settings"><h4>目录来源</h4><button class="directory-source-field" type="button"><span class="directory-source-path placeholder">正在读取…</span><span class="directory-source-hint">选择文件夹</span></button><p class="directory-workbook-status" role="status" aria-live="polite"></p><div class="directory-folder-choices" role="group" aria-label="这个文件夹里的目录工作簿" hidden></div></section>
            <section class="model-settings"><h4>目录分类</h4><label>模型<span class="cloud-model-control"></span></label><label>思考强度<select class="classification-reasoning-effort"><option value="none">无</option><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最高</option></select></label></section>
            <section class="model-settings"><h4>专题选择</h4><p>留空时使用上面的模型。</p><label>模型（可选）<span class="routing-model-control"></span></label><label>思考强度<select class="routing-reasoning-effort"><option value="none">无</option><option value="low">低</option><option value="medium" selected>中</option><option value="high">高</option><option value="xhigh">很高</option><option value="max">最高</option></select></label></section>
            <section class="model-settings"><h4>处理速度</h4><p>所有方案共用。请求过多时调低。</p><label>同时处理的请求<select class="max-concurrent-requests"><option value="1">1</option><option value="2">2</option><option value="3" selected>3（推荐）</option><option value="4">4</option><option value="5">5</option></select></label></section>
@@ -813,6 +913,7 @@
   const elements = {
     panel: shadow.querySelector('.panel'), tab: shadow.querySelector('.tab'), tabStatus: shadow.querySelector('.tab-status'), close: shadow.querySelector('.close'), mainView: shadow.querySelector('.main-view'), settings: shadow.querySelector('.settings'), settingsDrawer: shadow.querySelector('.settings-drawer'), backSettings: shadow.querySelector('.back-settings'),
      cloudProfileSelect: shadow.querySelector('.cloud-profile-select'), cloudProfileName: shadow.querySelector('.cloud-profile-name'), profileTabs: shadow.querySelector('.profile-tabs'), createCloudProfile: shadow.querySelector('.create-cloud-profile'), cloudModelControl: shadow.querySelector('.cloud-model-control'), routingModelControl: shadow.querySelector('.routing-model-control'), cloudModel: null, routingModel: null, classificationReasoningEffort: shadow.querySelector('.classification-reasoning-effort'), routingReasoningEffort: shadow.querySelector('.routing-reasoning-effort'), maxConcurrentRequests: shadow.querySelector('.max-concurrent-requests'), cloudProtocol: shadow.querySelector('.cloud-protocol'), cloudBaseUrl: shadow.querySelector('.cloud-base-url'), cloudApiKey: shadow.querySelector('.cloud-api-key'), requestCompatibility: shadow.querySelector('.request-compatibility'), customHeaders: shadow.querySelector('.custom-headers'), customHeaderStatus: shadow.querySelector('.custom-header-status'), clearCustomHeaders: shadow.querySelector('.clear-custom-headers'), testCloudConnection: shadow.querySelector('.test-cloud-connection'), connectionTestStatus: shadow.querySelector('.connection-test-status'), saveCloud: shadow.querySelector('.save-cloud'),
+    directorySourceField: shadow.querySelector('.directory-source-field'), directorySourcePath: shadow.querySelector('.directory-source-path'), directoryWorkbookStatus: shadow.querySelector('.directory-workbook-status'), directoryFolderChoices: shadow.querySelector('.directory-folder-choices'),
     cancelSettings: shadow.querySelector('.cancel-settings'), classify: shadow.querySelector('.classify'), classifyFocus: shadow.querySelector('.classify-focus'), restoreFocus: shadow.querySelector('.restore-focus'), exportAllQuestions: shadow.querySelector('.export-all-questions'), skillImport: shadow.querySelector('.import-skill-results'), skillImportFile: shadow.querySelector('.import-skill-results-file'), acceptAll: shadow.querySelector('.accept-all'), history: shadow.querySelector('.history'), historyView: shadow.querySelector('.history-view'), backHistory: shadow.querySelector('.back-history'), historyDateRange: shadow.querySelector('.history-date-range'), historyDateSheet: shadow.querySelector('.history-date-sheet'), historyDateBackdrop: shadow.querySelector('.history-date-backdrop'), historyMonthPrev: shadow.querySelector('.history-month-prev'), historyMonthNext: shadow.querySelector('.history-month-next'), historyMonthTitle: shadow.querySelector('.history-month-title'), historyCalendarGrid: shadow.querySelector('.history-calendar-grid'), historyDateHint: shadow.querySelector('.history-date-hint'), exportHistory: shadow.querySelector('.export-history'), historySummary: shadow.querySelector('.history-summary'), historyTopics: shadow.querySelector('.history-topics'), historyList: shadow.querySelector('.history-list'), clearCache: shadow.querySelector('.clear-cache'), exportBatch: shadow.querySelector('.export-batch'), submitBatch: shadow.querySelector('.submit-batch'), syncBatch: shadow.querySelector('.sync-batch'), status: shadow.querySelector('.status'),
     legend: shadow.querySelector('.legend'), legendList: shadow.querySelector('.legend ul'),
     confirmOverlay: shadow.querySelector('.confirm-overlay'), confirmTitle: shadow.querySelector('#confirm-title'), confirmMessage: shadow.querySelector('#confirm-message'), confirmCancel: shadow.querySelector('.confirm-cancel'), confirmAccept: shadow.querySelector('.confirm-accept'), confirmCheckbox: shadow.querySelector('.confirm-checkbox'), confirmCheckboxInput: shadow.querySelector('.confirm-checkbox input'), confirmCheckboxLabel: shadow.querySelector('.confirm-checkbox span'),
@@ -970,6 +1071,8 @@
     elements.customHeaders.disabled = busy;
     elements.clearCustomHeaders.disabled = busy;
     elements.testCloudConnection.disabled = busy;
+    elements.directorySourceField.disabled = busy;
+    elements.directoryFolderChoices.querySelectorAll('button').forEach(button => { button.disabled = busy; });
     elements.classify.disabled = busy || !state.taxonomy;
     elements.classifyFocus.disabled = busy || !state.taxonomy;
     updateFocusRestoreAction();
@@ -1246,7 +1349,12 @@
           try { parsed = JSON.parse(response.responseText); }
           catch { reject(new Error('本地服务未返回 JSON')); return; }
           if (response.status < 200 || response.status >= 300) {
-            reject(new Error(parsed.message || parsed.error || `本地服务返回 HTTP ${response.status}`));
+            const error = new Error(parsed.message || parsed.error || `本地服务返回 HTTP ${response.status}`);
+            // 有些接口的拒绝是「需要用户再挑一下」（比如目录来源文件夹里有多组工作簿），
+            // 结构化字段要能带到界面上，不能只留一句 message。
+            error.payload = parsed;
+            error.status = response.status;
+            reject(error);
             return;
           }
           resolve(parsed);
@@ -1286,14 +1394,20 @@
     const restoreId = ++state.cacheRestoreId;
     setBusy(true);
     try {
-      const [health, taxonomy, cloud] = await Promise.all([
+      const [health, taxonomy, cloud, directorySource] = await Promise.all([
         request('GET', '/health'),
         request('GET', '/api/v1/taxonomy'),
         request('GET', '/api/v1/settings/cloud'),
+        // 目录来源只影响设置面板的显示，取不到不该拖垮整条连接链路。
+        request('GET', '/api/v1/directory-workbooks').catch(() => null),
       ]);
       state.taxonomy = taxonomy;
       state.cloudConfigured = Boolean(health.cloud_configured);
       renderCloudSettings(cloud);
+      renderDirectoryWorkbooks(directorySource);
+      if (health.taxonomy_sync_status === 'failed') {
+        setDirectoryWorkbookStatus(`目录来源读取失败：${health.taxonomy_sync_error || '未知原因'}`, 'error');
+      }
       const pageScope = detectPageScope(state.taxonomy);
       if (!pageScope) {
         state.scope = { topic_id: '', level2_id: '' };
@@ -1322,6 +1436,93 @@
       state.taxonomy = null;
       setStatus(error.message, true);
       elements.tabStatus.textContent = '!';
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setDirectoryWorkbookStatus(message = '', tone = 'normal') {
+    elements.directoryWorkbookStatus.textContent = message;
+    for (const name of ['success', 'warning', 'error']) {
+      elements.directoryWorkbookStatus.classList.toggle(name, tone === name);
+    }
+  }
+
+  function renderDirectoryWorkbooks(source) {
+    const described = describeDirectorySource(source);
+    state.directorySource = source && typeof source === 'object' ? source : null;
+    // 换过一次目录来源之后，上一次那个文件夹的候选清单就作废了，别留在界面上误导人。
+    renderFolderWorkbookChoices([]);
+    elements.directorySourcePath.textContent = described.label;
+    elements.directorySourcePath.classList.toggle('placeholder', Boolean(described.placeholder));
+    elements.directorySourceField.title = described.title;
+    setDirectoryWorkbookStatus(described.message, described.tone);
+  }
+
+  // 文件夹里有多组目录工作簿时，就地摊开候选；点哪一条就应用哪一条。
+  function renderFolderWorkbookChoices(families) {
+    const items = describeFolderWorkbookChoices(families);
+    elements.directoryFolderChoices.replaceChildren(...items.map(item => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'directory-folder-choice';
+      button.title = item.title;
+      const name = document.createElement('span');
+      name.className = 'choice-name';
+      name.textContent = item.name;
+      const meta = document.createElement('span');
+      meta.className = 'choice-meta';
+      meta.textContent = item.meta;
+      button.append(name, meta);
+      button.addEventListener('click', () => applyFolderChoice(item.value));
+      return button;
+    }));
+    elements.directoryFolderChoices.hidden = !items.length;
+    return items.length;
+  }
+
+  // 提交并应用一个新的目录来源。失败时统一提示；选到的文件夹里不止一组工作簿时，
+  // 服务端只报告候选、不替用户猜，所以这里把候选就地列出来让人点一份。
+  async function applyDirectorySource(path) {
+    try {
+      const source = await request('POST', '/api/v1/settings/directory-workbook', { path: String(path || '') });
+      // 目录换了，taxonomy、页面范围和已缓存建议都得跟着重算。
+      await connectService();
+      renderDirectoryWorkbooks(source);
+      setStatus('目录来源已更新');
+    } catch (error) {
+      const families = error.payload?.families;
+      const listed = Array.isArray(families) ? renderFolderWorkbookChoices(families) : 0;
+      setDirectoryWorkbookStatus(error.message, listed ? 'warning' : 'error');
+      setStatus(error.message, true);
+    }
+  }
+
+  async function applyFolderChoice(path) {
+    setBusy(true);
+    try {
+      await applyDirectorySource(path);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // 点目录来源那个框：让本机服务开系统窗口（浏览器自己开不了），选完直接应用。
+  // 用户翻文件夹要时间，超时给得比普通接口长得多；窗口没关只算这一轮没结果，不是取消。
+  async function chooseDirectorySource() {
+    setBusy(true);
+    setDirectoryWorkbookStatus('请在弹出的窗口里选择文件夹…');
+    try {
+      // 只开「选择文件夹」窗口，请求体是空的：服务端没有别的可挑。
+      const picked = await request('POST', '/api/v1/settings/directory-picker', {}, { timeoutMs: DIRECTORY_PICKER_TIMEOUT_MS });
+      if (!picked.path) {
+        setDirectoryWorkbookStatus(picked.message || '没有选择任何文件夹。', picked.timed_out || picked.busy ? 'warning' : 'normal');
+        return;
+      }
+      await applyDirectorySource(picked.path);
+    } catch (error) {
+      setDirectoryWorkbookStatus(error.message, 'error');
+      setStatus(error.message, true);
     } finally {
       setBusy(false);
     }
@@ -3292,6 +3493,8 @@
     else if (elements.panel.classList.contains('open')) setOpen(false);
   });
   elements.saveCloud.addEventListener('click', saveCloudSettings);
+  // 目录来源只有一个框，点它就等于「换目录」：开本机选择窗口，选完直接应用。
+  elements.directorySourceField.addEventListener('click', () => chooseDirectorySource());
   elements.profileTabs.addEventListener('pointerdown', startProfileDragCandidate);
   elements.profileTabs.addEventListener('pointermove', moveProfileDragCandidate);
   elements.profileTabs.addEventListener('pointerup', endProfileDragCandidate);

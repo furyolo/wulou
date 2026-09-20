@@ -38,6 +38,9 @@ const {
   needsDirectoryReview,
   skillImportBody,
   confirmAcceptClass,
+  describeDirectorySource,
+  shortenDirectoryLabel,
+  describeFolderWorkbookChoices,
   CLASSIFICATION_JOB_MAX_QUESTIONS,
 } = require('../../userscript/wulou-question-curation-assistant.user.js');
 
@@ -468,4 +471,136 @@ test('导出所有题库与导入归类结果同处一行、同一类按钮样�
   }
   // 隐藏的 file input 留在 .actions 外面：非按钮子元素会干扰「独占一行就铺满」的宽度规则。
   assert.ok(!pair[0].includes('import-skill-results-file'), 'file input 不该塞进这一行');
+});
+
+test('目录来源失效时就地报警，而不是假装正常', () => {
+  // 任务B 把工作簿挪进子目录后，配置里的旧路径就解析不到了。这时必须显示红色原因，
+  // 不能让用户以为还在用最新的目录。
+  const broken = describeDirectorySource({
+    anchor: 'D:////materials////中考数学分类汇编////★全国中考数学-导出目录,ID-3777-2026-09-18 v1.xlsx',
+    active: '',
+    anchor_valid: false,
+    error: '未找到目录工作簿：D:////materials////中考数学分类汇编',
+  });
+  assert.equal(broken.tone, 'error');
+  assert.ok(broken.message.includes('未找到目录工作簿'), broken.message);
+  // 框里退回显示配置里那个锚点（缩略成「文件夹 · 哪一版」），让人一眼看出挂的是哪个旧位置。
+  assert.equal(broken.label, '中考数学分类汇编 · 2026-09-18 v1');
+  assert.equal(broken.placeholder, false);
+});
+
+test('目录来源正常时框里只写当前生效的那一份', () => {
+  const ok = describeDirectorySource({
+    anchor: 'D:////materials////导出目录////★全国中考数学-导出目录,ID-3777-2026-09-18 v1.xlsx',
+    active: 'D:////materials////导出目录////★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx',
+    anchor_valid: true,
+    error: '',
+  });
+  // 框里只留「文件夹 · 哪一版」，长前缀一律省掉；完整路径挂在 title 上，鼠标停住能看到。
+  assert.equal(ok.label, '导出目录 · ID-3777 · 2026-09-18 v2');
+  assert.equal(ok.title, 'D:////materials////导出目录////★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx');
+  // 正常时旁边不写字：框里已经是当前生效的那一份了，再写一遍就是废话。
+  assert.equal(ok.message, '');
+  assert.equal(ok.tone, 'success');
+});
+
+test('目录来源还没设置时提示为空，且接口取不到只降级不报错', () => {
+  const empty = describeDirectorySource({ anchor: '', active: '', anchor_valid: false, error: '' });
+  assert.equal(empty.tone, 'error');
+  assert.ok(empty.message.includes('还没有选目录来源'));
+  assert.equal(empty.label, '还没选目录来源');
+  assert.equal(empty.placeholder, true);
+  // 接口整体取不到（服务没起来）时同样是空，但提示语气要更轻。
+  const unreachable = describeDirectorySource(null);
+  assert.equal(unreachable.tone, 'warning');
+  assert.equal(unreachable.placeholder, true);
+});
+
+test('目录来源框里的文字按「文件夹 · 哪一版」缩略，不塞完整路径', () => {
+  // 完整路径太长，塞进框里会把整个面板顶出横向滚动条；而工作簿的版本信息写在文件名
+  // 尾巴上（日期 + vN），所以前面那串又长又重复的前缀（★全国中考数学-导出目录,）必须省掉，
+  // 尾巴一定要留着。文件名里的 ID-3777 也留着——同一文件夹放多组工作簿时全靠它分辨。
+  assert.equal(
+    shortenDirectoryLabel('D:////materials////导出目录////★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx'),
+    '导出目录 · ID-3777 · 2026-09-18 v2',
+  );
+  assert.equal(shortenDirectoryLabel('D:/a/b/c.xlsx'), 'b · c.xlsx');
+  assert.equal(shortenDirectoryLabel('c.xlsx'), 'c.xlsx');
+  assert.equal(shortenDirectoryLabel(''), '');
+  assert.equal(shortenDirectoryLabel(null), '');
+
+  // 文件夹名本身就长，只留头部，别让一行撑爆；位置不够就先丢课程 ID，绝不切版本号。
+  const longFolder = shortenDirectoryLabel(
+    'D:////m////★全国中考数学-导出目录,ID-3777-导出目录////★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx',
+  );
+  assert.ok(longFolder.length <= 30, longFolder);
+  assert.equal(longFolder, '★全国中考数学-导出目录,… · 2026-09-18 v2');
+
+  // 文件夹名不长、但加上课程 ID 就超了，同样舍 ID 保版本。
+  const tight = shortenDirectoryLabel(
+    'D:////m////中考数学分类汇编////★全国中考数学-导出目录,ID-3777-2026-09-18 v1.xlsx',
+  );
+  assert.equal(tight, '中考数学分类汇编 · 2026-09-18 v1');
+
+  // 文件名不符合命名规则时退回完整文件名，再靠总长度兜底，绝不放任它无限长。
+  const odd = shortenDirectoryLabel(`D:////m////${'很长的名字'.repeat(8)}.xlsx`);
+  assert.ok(odd.length <= 30, odd);
+  assert.ok(odd.endsWith('…'), odd);
+});
+
+test('文件夹里有多组工作簿时，每一条候选都点得出是哪一组', () => {
+  // 用户选的是文件夹，服务端不会替他猜是哪一族，所以界面上必须能分清：
+  // 文件名是「最新那一份」，前缀是「哪一组目录」，版本数是「这一组有几版」。
+  const choices = describeFolderWorkbookChoices([
+    {
+      path: 'D:/导出目录/★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx',
+      file_name: '★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx',
+      prefix: '★全国中考数学-导出目录,ID-3777-', version_count: 31,
+    },
+    {
+      path: 'D:/导出目录/别的族,ID-9-2026-01-01 v1.xlsx',
+      file_name: '别的族,ID-9-2026-01-01 v1.xlsx',
+      prefix: '别的族,ID-9-', version_count: 2,
+    },
+  ]);
+  assert.equal(choices.length, 2);
+  assert.equal(choices[0].value, 'D:/导出目录/★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx');
+  assert.equal(choices[0].name, '★全国中考数学-导出目录,ID-3777-2026-09-18 v2.xlsx');
+  // 前缀末尾的分隔符要去掉，显示成「哪一组」而不是带个孤零零的逗号。
+  assert.equal(choices[0].meta, '★全国中考数学-导出目录,ID-3777 · 同组 31 个版本');
+  assert.equal(choices[1].meta, '别的族,ID-9 · 同组 2 个版本');
+  assert.equal(choices[0].title, choices[0].value);
+});
+
+test('候选清单缺字段或缺路径时不渲染空行', () => {
+  assert.deepEqual(describeFolderWorkbookChoices(undefined), []);
+  assert.deepEqual(describeFolderWorkbookChoices(null), []);
+  const partial = describeFolderWorkbookChoices([
+    { path: '', file_name: '没有路径.xlsx', version_count: 1 },
+    { path: 'D:/只有路径.xlsx' },
+  ]);
+  // 没有 path 的条目点不动，直接丢掉；缺文件名时退化成路径末两段。
+  assert.equal(partial.length, 1);
+  assert.equal(partial[0].name, '只有路径.xlsx');
+  assert.equal(partial[0].meta, '未命名分组 · 同组 0 个版本');
+});
+
+test('目录来源只有一个框，点它就能换文件夹', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'userscript', 'wulou-question-curation-assistant.user.js'),
+    'utf8',
+  );
+  const section = source.slice(source.indexOf('<h4>目录来源</h4>'));
+  const block = section.slice(0, section.indexOf('</section>'));
+  // 极简：一个框 + 出错时才出现的一行提示 + 出错时才出现的候选区。
+  // 没有下拉框、没有第二个输入框、没有「应用」按钮、也没有大段说明。
+  assert.equal((block.match(/<button/g) || []).length, 1, '目录来源只该有一个可点节点');
+  assert.ok(block.includes('class="directory-source-field"'), '那个框应当是 directory-source-field');
+  assert.ok(block.includes('选择文件夹'), '框里要写清点它做什么');
+  assert.ok(!block.includes('<select'), '不该再有目录工作簿下拉框');
+  assert.ok(!block.includes('<input'), '不该再有完整路径输入框');
+  assert.ok(!block.includes('<details'), '不该再有折叠的「指定路径」区');
+  assert.ok(!block.includes('手动指定路径') && !block.includes('手工指定路径'), '不该再有指定路径的小节标题');
+  // 候选区平时不占地方，只有「这个文件夹里有多组工作簿」时才由脚本铺开。
+  assert.ok(/class="directory-folder-choices"[^>]*hidden/.test(block), '候选区默认应当隐藏');
 });

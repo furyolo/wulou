@@ -35,7 +35,16 @@ try:
     from .directory_refactor import prepare_refactor_context
     from .directory_exports import write_directory_export
     from .skill_classifications import build_import_plan
-    from .taxonomy_sync import synchronize_taxonomy
+    from .directory_picker import DirectoryPickerError, pick_path
+    from .taxonomy_sync import (
+        AmbiguousWorkbookFolder,
+        EmptyWorkbookFolder,
+        TaxonomySyncResult,
+        describe_workbook_families,
+        resolve_workbook_anchor,
+        summarize_directory_sources,
+        synchronize_taxonomy,
+    )
 except ImportError:  # 支持直接运行 python server/main.py。
     from cache import ResultCache
     from classifier import classify, content_hash, validate_model_decision
@@ -49,10 +58,23 @@ except ImportError:  # 支持直接运行 python server/main.py。
     from directory_refactor import prepare_refactor_context
     from directory_exports import write_directory_export
     from skill_classifications import build_import_plan
-    from taxonomy_sync import synchronize_taxonomy
+    from directory_picker import DirectoryPickerError, pick_path
+    from taxonomy_sync import (
+        AmbiguousWorkbookFolder,
+        EmptyWorkbookFolder,
+        TaxonomySyncResult,
+        describe_workbook_families,
+        resolve_workbook_anchor,
+        summarize_directory_sources,
+        synchronize_taxonomy,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 目录来源候选默认从项目旁边的 local-materials 里找；可在 settings.local.yaml
+# 的 directory_workbook.search_roots 里追加其它位置。
+DEFAULT_DIRECTORY_SOURCE_ROOT = PROJECT_ROOT.parent / "local-materials"
+DIRECTORY_SOURCE_SCAN_DEPTH = 3
 MAX_INTERACTIVE_CLASSIFICATION_QUESTIONS = 1000
 MAX_TOPIC_REROUTES_PER_QUESTION = 2
 ROUTING_PIPELINE_VERSION = 2
@@ -102,13 +124,24 @@ def resolve_path(config_path: Path, raw_path: str) -> Path:
 
 
 class ServiceState:
-    def __init__(self, config_path: Path) -> None:
+    def __init__(self, config_path: Path, *, directory_picker: Callable[..., dict[str, Any]] | None = None) -> None:
         self.config_path = config_path.resolve()
         self.settings = load_settings(self.config_path)
         self._taxonomy_refresh_lock = threading.Lock()
-        self.taxonomy_path = self._taxonomy_snapshot_path()
-        sync_result = self._synchronize_taxonomy()
+        self.taxonomy_path, bootstrap_source = self._taxonomy_snapshot_plan()
+        self.taxonomy_sync_error = ""
+        self.active_workbook_path = ""
+        # 目录来源的选择框必须在真实桌面上弹窗，测试里注入替代实现，免得挂住。
+        self.directory_picker = directory_picker or pick_path
+        # 必须先铺兜底快照，再跑同步：一方面全新机器上 .local-data 里空空如也，不铺这份
+        # 服务就直接起不来；另一方面同步失败时正是拿它当退路，铺晚了就没得退。
+        self._bootstrap_taxonomy_snapshot(bootstrap_source)
+        sync_result = self._safe_synchronize_taxonomy()
         self.taxonomy_sync_status = sync_result.status
+        if not self.taxonomy_path.is_file():
+            # 走到这里说明用户把 taxonomy_path 指到了别处而那里没有文件——直说比抛
+            # FileNotFoundError 强，至少看得出是配置问题而不是程序坏了。
+            raise TaxonomyError(f"目录快照不存在：{self.taxonomy_path}")
         self.taxonomy = Taxonomy.from_file(self.taxonomy_path)
         rules_path = resolve_path(self.config_path, str(self.settings["rules_path"]))
         with rules_path.open("r", encoding="utf-8") as file:
@@ -138,15 +171,39 @@ class ServiceState:
         proposal_minimum = int((self.rules.get("rules") or {}).get("proposal_minimum_distinct_questions", 3))
         self.proposals = ProposalStore(cache_path.with_name("directory-proposals.sqlite3"), proposal_minimum)
 
-    def _taxonomy_snapshot_path(self) -> Path:
-        """返回本机运行时实际使用的 taxonomy 快照位置。"""
+    def _taxonomy_snapshot_plan(self) -> tuple[Path, Path | None]:
+        """返回「实际使用的快照位置」和「首次运行可从哪里铺一份」。
+
+        本机配置沿用示例路径时，快照固定写进 Git 忽略的 .local-data——这个位置出厂时
+        并不存在，所以第二个返回值告诉调用方可以从示例文件铺一份出来。用户自己把
+        taxonomy_path 指到别处时第二个返回 None：那种路径缺失属于配置错误，该报错就报错。
+        """
         taxonomy_path = resolve_path(self.config_path, str(self.settings["taxonomy_path"]))
         generated_taxonomy = PROJECT_ROOT / ".local-data" / "taxonomy.yaml"
         example_taxonomy = (PROJECT_ROOT / "config" / "taxonomy.example.yaml").resolve()
         # 本机配置沿用示例路径时，目录快照固定写入 Git 忽略的 .local-data。
         if self.config_path.name in {"settings.example.yaml", "settings.local.yaml"} and taxonomy_path == example_taxonomy:
-            return generated_taxonomy
-        return taxonomy_path
+            return generated_taxonomy, example_taxonomy
+        return taxonomy_path, None
+
+    def _bootstrap_taxonomy_snapshot(self, source: Path | None) -> None:
+        """快照还不存在时，先用示例文件把运行位置铺出来。
+
+        没有这一步，全新机器上 Taxonomy.from_file 会直接 FileNotFoundError——服务根本
+        起不来，用户连「进设置里选个目录来源」的机会都没有。
+        """
+        if source is None or self.taxonomy_path.is_file():
+            return
+        if not source.is_file():
+            raise TaxonomyError(f"找不到目录示例文件，无法初始化目录快照：{source}")
+        self.taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
+        # 原子替换：写一半被打断也不会留下一个半截的目录文件。
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", dir=self.taxonomy_path.parent, delete=False,
+        ) as file:
+            file.write(source.read_text(encoding="utf-8"))
+            temporary_path = Path(file.name)
+        temporary_path.replace(self.taxonomy_path)
 
     def _synchronize_taxonomy(self):
         sync_result = synchronize_taxonomy(
@@ -155,14 +212,33 @@ class ServiceState:
             output_path=self.taxonomy_path,
         )
         if sync_result.workbook_path:
-            # 目录重构等后续流程必须使用与当前 taxonomy 同一版本的工作簿。
-            self.settings.setdefault("directory_workbook", {})["path"] = str(sync_result.workbook_path)
+            # 只记在内存里，不回写 settings：settings 里的 path 是用户在设置面板选的锚点，
+            # 自动发现到的具体版本不该把它顶掉，否则界面上显示的和磁盘上存的会不一致。
+            self.active_workbook_path = str(sync_result.workbook_path)
         return sync_result
+
+    def _safe_synchronize_taxonomy(self):
+        """目录来源坏了也不能让服务起不来：否则用户没机会在前端把路径改回来。
+
+        捕获面覆盖 OSError：工作簿被占用、权限不够、网络盘掉线之类都会以 OSError 上来
+        （FileNotFoundError 也是其中一种）。原本只兜 ValueError，等于只防住了「路径解析
+        不出来」，没防住「文件读不了」——而后者在真机上更常见。
+        注意 TaxonomyError 本身就是 ValueError 的子类，所以这里不必再单列。
+        """
+        try:
+            self.taxonomy_sync_error = ""
+            return self._synchronize_taxonomy()
+        except (ValueError, OSError) as error:
+            self.taxonomy_sync_error = str(error)
+            self.active_workbook_path = ""
+            if not self.taxonomy_path.is_file():
+                raise
+            return TaxonomySyncResult(None, self.taxonomy_path, "failed")
 
     def refresh_taxonomy(self) -> bool:
         """在页面读取目录或提交分类前，原子切换到新发现的目录工作簿快照。"""
         with self._taxonomy_refresh_lock:
-            sync_result = self._synchronize_taxonomy()
+            sync_result = self._safe_synchronize_taxonomy()
             self.taxonomy_sync_status = sync_result.status
             if sync_result.status != "updated":
                 return False
@@ -172,6 +248,96 @@ class ServiceState:
             self.taxonomy = refreshed
             return True
 
+    def directory_source_roots(self) -> list[Path]:
+        """目录来源候选的扫描根：配置里声明的位置，或默认位置，再加当前锚点所在文件夹。"""
+        workbook_settings = self.settings.get("directory_workbook") or {}
+        raw_roots = workbook_settings.get("search_roots")
+        if isinstance(raw_roots, str):
+            declared = [item for item in (raw_roots,) if item.strip()]
+        elif isinstance(raw_roots, (list, tuple)):
+            declared = [item for item in raw_roots if str(item or "").strip()]
+        else:
+            declared = []
+        # 配了 search_roots 就以它为准：否则候选清单会受机器上其它目录影响，不可预期。
+        roots = (
+            [resolve_path(self.config_path, str(item)) for item in declared]
+            if declared else [DEFAULT_DIRECTORY_SOURCE_ROOT]
+        )
+        anchor = str(workbook_settings.get("path") or "").strip()
+        if anchor:
+            roots.append(resolve_path(self.config_path, anchor).parent)
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(root)
+        return unique
+
+    def active_directory_workbook(self) -> str:
+        """当前实际生效的目录工作簿绝对路径；解析不到时是空串。"""
+        return self.active_workbook_path
+
+    def directory_source_summary(self) -> dict[str, Any]:
+        """当前目录来源 + 可选项，供前端设置面板一次选定后固定。"""
+        workbook_settings = self.settings.get("directory_workbook") or {}
+        anchor = str(workbook_settings.get("path") or "").strip()
+        configured_path = resolve_path(self.config_path, anchor) if anchor else None
+        summary = summarize_directory_sources(
+            configured_path, self.directory_source_roots(), maximum_depth=DIRECTORY_SOURCE_SCAN_DEPTH,
+        )
+        summary["sheet"] = str(workbook_settings.get("sheet") or "目录")
+        summary["sync_status"] = self.taxonomy_sync_status
+        summary["taxonomy_version"] = self.taxonomy.version
+        return summary
+
+    def update_directory_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """把用户选定的目录来源固化到本机配置，并立即切换目录快照。
+
+        `path` 可以是某一份目录工作簿，也可以是存放它们的文件夹：文件夹里只有
+        一组命名前缀时用它的最新版本，有多组时抛 AmbiguousWorkbookFolder 让
+        用户自己挑——猜错了就是静默换掉整套目录。
+
+        先试跑一次同步；只有导出成功后配置才落盘，避免把一个打不开的路径
+        写进 config 让服务下次启动直接起不来。
+        """
+        anchor = resolve_workbook_anchor(payload.get("path"))
+        workbook_settings = self.settings.setdefault("directory_workbook", {})
+        sheet = str(workbook_settings.get("sheet") or "目录")
+        sync_result = synchronize_taxonomy(
+            config_path=self.config_path,
+            workbook_settings={"path": str(anchor), "sheet": sheet},
+            output_path=self.taxonomy_path,
+        )
+        # 落盘的是用户选的锚点，不是解析到的最新版本：锚点稳定，自动跟随由 discover 负责。
+        workbook_settings["path"] = str(anchor)
+        self._persist_settings()
+        self.taxonomy_sync_status = sync_result.status
+        self.taxonomy_sync_error = ""
+        self.active_workbook_path = str(sync_result.workbook_path or "")
+        refreshed = Taxonomy.from_file(self.taxonomy_path)
+        self.taxonomy = refreshed
+        summary = self.directory_source_summary()
+        summary["changed"] = True
+        return summary
+
+    def pick_directory_path(self) -> dict[str, Any]:
+        """在本机弹出系统的「选择文件夹」窗口，把用户选中的路径回给前端。
+
+        前端不能直接打开本机对话框，也拿不到真实的本机绝对路径，所以由服务端开框；
+        开框位置默认落在当前生效工作簿的文件夹，用户要连着换版本时少点几层。
+        """
+        initial_dir = ""
+        anchor = str((self.settings.get("directory_workbook") or {}).get("path") or "").strip()
+        if anchor:
+            candidate = resolve_path(self.config_path, anchor).parent
+            if candidate.is_dir():
+                initial_dir = str(candidate)
+        if not initial_dir:
+            initial_dir = next((str(root) for root in self.directory_source_roots() if root.is_dir()), "")
+        return self.directory_picker(initial_dir=initial_dir)
     def cache_key(self, question: dict[str, Any]) -> str:
         cloud_settings = self.active_cloud_settings()
         profile = self.active_cloud_profile()
@@ -486,12 +652,16 @@ class ServiceState:
             headers[name] = header_value
         return headers
 
-    def _persist_cloud_settings(self) -> None:
+    def _persist_settings(self) -> None:
+        """原子写入本机配置；示例配置一律改写到 settings.local.yaml。"""
         target_config = self.config_path
         if target_config.name == "settings.example.yaml":
             target_config = target_config.with_name("settings.local.yaml")
         save_settings(target_config, self.settings)
         self.config_path = target_config
+
+    def _persist_cloud_settings(self) -> None:
+        self._persist_settings()
         self._refresh_cloud_provider()
         with self._llm_slot_condition:
             self._llm_slot_condition.notify_all()
@@ -1074,11 +1244,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "port": self.server.server_port, "taxonomy_version": self.server.state.taxonomy.version,
                 "rule_version": self.server.state.rule_version, "rule_hash": self.server.state.rule_hash,
                 "cloud_configured": bool(self.server.state.cloud and self.server.state.cloud.configured),
+                "taxonomy_sync_status": self.server.state.taxonomy_sync_status,
+                "taxonomy_sync_error": self.server.state.taxonomy_sync_error,
+                "directory_workbook": str((self.server.state.settings.get("directory_workbook") or {}).get("path") or ""),
+                "directory_workbook_active": self.server.state.active_directory_workbook(),
             })
             return
         if self.path == "/api/v1/taxonomy":
             self._send_json(HTTPStatus.OK, self.server.state.taxonomy.summary())
             return
+        if self.path == "/api/v1/directory-workbooks":
+            self._send_json(HTTPStatus.OK, self.server.state.directory_source_summary()); return
         if self.path == "/api/v1/settings/cloud":
             self._send_json(HTTPStatus.OK, self.server.state.cloud_summary()); return
         if request_url.path.startswith("/api/v1/settings/cloud/test/"):
@@ -1115,7 +1291,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/skill-classifications", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/settings/cloud/test", "/api/v1/settings/cloud/test/start", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
+        if self.path not in {"/api/v1/classify", "/api/v1/classify/batch", "/api/v1/classification-jobs", "/api/v1/skill-classifications", "/api/v1/directory-exports", "/api/v1/batches", "/api/v1/batches/submit", "/api/v1/batches/refresh", "/api/v1/batches/import", "/api/v1/settings/cloud", "/api/v1/settings/cloud/test", "/api/v1/settings/cloud/test/start", "/api/v1/settings/directory-workbook", "/api/v1/settings/directory-picker", "/api/v1/cache/classifications/delete", "/api/v1/cache/classifications/lookup", "/api/v1/manual-classifications", "/api/v1/history/catalogue-moves"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         try:
@@ -1128,6 +1304,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.server.state.refresh_taxonomy()
             if self.path == "/api/v1/settings/cloud":
                 self._send_json(HTTPStatus.OK, self.server.state.update_cloud_settings(payload))
+            elif self.path == "/api/v1/settings/directory-workbook":
+                self._send_json(HTTPStatus.OK, self.server.state.update_directory_source(payload))
+            elif self.path == "/api/v1/settings/directory-picker":
+                # 这一条会挂着等用户慢慢翻文件夹，所以复用默认的长读超时；请求体是空的。
+                self._send_json(HTTPStatus.OK, self.server.state.pick_directory_path())
             elif self.path == "/api/v1/settings/cloud/test/start":
                 self._send_json(HTTPStatus.ACCEPTED, self.server.state.start_cloud_connection_test(payload))
             elif self.path == "/api/v1/settings/cloud/test":
@@ -1231,6 +1412,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         except CloudProviderError as error:
             log_cloud_error("HTTP 分类请求失败", error)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "message": public_cloud_error_message(error)})
+        except AmbiguousWorkbookFolder as error:
+            # 指到了有多组工作簿的文件夹。不猜：把候选原样回给前端，让用户点一份。
+            self._send_json(HTTPStatus.CONFLICT, {
+                "error": "ambiguous_folder", "message": str(error),
+                "folder": str(error.folder), "families": describe_workbook_families(error.families),
+            })
+        except EmptyWorkbookFolder as error:
+            self._send_json(HTTPStatus.CONFLICT, {"error": "empty_folder", "message": str(error)})
+        except DirectoryPickerError as error:
+            # 本机开不了选择窗口（没有图形会话、Tk 起不来）时说清原因，不要让它掉进 500。
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "picker_error", "message": str(error)})
         except (ValueError, TaxonomyError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "message": str(error)})
         except Exception as error:
